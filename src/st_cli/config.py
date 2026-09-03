@@ -5,6 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -33,8 +34,8 @@ class Settings(BaseSettings):
     )
 
     client_id: str
-    client_secret: str
-    app_key: str
+    client_secret: str = Field(repr=False)
+    app_key: str = Field(repr=False)
     tenant_id: int
     environment: Environment = Environment.PRODUCTION
 

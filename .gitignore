@@ -16,3 +16,8 @@ htmlcov/
 .coverage
 FOR_UTKU.md
 .claude/settings.local.json
+
+# ServiceTitan / Google service-account credentials — never committed.
+service-account*.json
+credentials.json
+gcp-sa-*.json

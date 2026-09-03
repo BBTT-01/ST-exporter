@@ -13,6 +13,8 @@ dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "fastmcp>=2.0.0",
+    "gspread>=6.0",
+    "google-auth>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -28,9 +30,10 @@ dev = [
 [project.scripts]
 st = "st_cli.main:cli"
 st-mcp = "st_cli.mcp_server:main"
+st-export = "st_exporter.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/st_cli"]
+packages = ["src/st_cli", "src/st_exporter"]
 
 [tool.ruff]
 line-length = 100
