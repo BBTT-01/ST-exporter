@@ -73,29 +73,29 @@ def test_with_token_does_not_mutate_original() -> None:
 
 def test_build_meta_grid_has_header_and_is_sorted_by_feed() -> None:
     rows = [
-        MetaRow(feed="technicians", last_run_at="t2", row_count=4, exporter_version="0.2.0"),
+        MetaRow(feed="technicians", last_run_at="t2", row_count=4, exporter_version="0.1.0"),
         MetaRow(
-            feed="jobs", last_run_at="t1", last_cursor="{}", row_count=10, exporter_version="0.2.0"
+            feed="jobs", last_run_at="t1", last_cursor="{}", row_count=10, exporter_version="0.1.0"
         ),
     ]
     grid = build_meta_grid(rows)
     assert grid[0] == list(META_COLUMNS)
     assert grid[1][0] == "jobs"
     assert grid[2][0] == "technicians"
-    assert grid[1] == ["jobs", "t1", "{}", "10", "0.2.0"]
+    assert grid[1] == ["jobs", "t1", "{}", "10", "0.1.0"]
 
 
 def test_parse_meta_grid_round_trips_build_meta_grid() -> None:
     rows = [
         MetaRow(
-            feed="jobs", last_run_at="t1", last_cursor="{}", row_count=10, exporter_version="0.2.0"
+            feed="jobs", last_run_at="t1", last_cursor="{}", row_count=10, exporter_version="0.1.0"
         )
     ]
     grid = build_meta_grid(rows)
     parsed = parse_meta_grid(grid)
     assert parsed["jobs"].row_count == 10
     assert parsed["jobs"].last_cursor == "{}"
-    assert parsed["jobs"].exporter_version == "0.2.0"
+    assert parsed["jobs"].exporter_version == "0.1.0"
 
 
 def test_parse_meta_grid_of_empty_grid_is_empty() -> None:
@@ -110,11 +110,11 @@ def test_parse_meta_grid_skips_blank_rows() -> None:
 def test_parse_meta_grid_tolerates_non_numeric_row_count() -> None:
     # A hand-edited or corrupted _meta cell must not crash the run before any
     # work happens — mirrors CursorBundle.decode's tolerance of bad data.
-    grid = [list(META_COLUMNS), ["jobs", "t1", "{}", "N/A", "0.2.0"]]
+    grid = [list(META_COLUMNS), ["jobs", "t1", "{}", "N/A", "0.1.0"]]
     parsed = parse_meta_grid(grid)
     assert parsed["jobs"].row_count == 0
 
 
 def test_parse_meta_grid_row_count_blank_cell_is_zero() -> None:
-    grid = [list(META_COLUMNS), ["jobs", "t1", "{}", "", "0.2.0"]]
+    grid = [list(META_COLUMNS), ["jobs", "t1", "{}", "", "0.1.0"]]
     assert parse_meta_grid(grid)["jobs"].row_count == 0
