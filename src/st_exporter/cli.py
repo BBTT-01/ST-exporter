@@ -82,8 +82,10 @@ def _drain_outbox(
     exporter_settings: ExporterSettings,
     traderated_settings: TradeRatedSettings,
 ) -> DrainSummary:
-    assert traderated_settings.machine_token is not None
-    assert traderated_settings.outbox_base_url is not None
+    # Truthiness, not `is not None`, to match `configured` exactly — an empty
+    # string is a value pydantic will happily load and httpx will not accept.
+    assert traderated_settings.machine_token
+    assert traderated_settings.outbox_base_url
 
     gc = get_gspread_client(exporter_settings.service_account_json)
     raw_cache_store = SheetsClient.open(gc, exporter_settings.raw_cache_sheet_id)
