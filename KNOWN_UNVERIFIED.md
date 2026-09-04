@@ -90,3 +90,43 @@ real tenant — see the PR #1 review's finding #6.
 The contract describes `modified_on` only as "for drift debugging" without
 specifying which entity's timestamp it should reflect. This mapping is a
 reasonable guess, not a confirmed requirement.
+
+## CRM Outbox response envelope
+
+`src/st_exporter/outbox/client.py`, `TradeRatedOutboxClient.claim`
+
+Assumes `GET /crm-outbox` wraps its items as `{"items": [...]}`. The spec names
+the per-item shape (`id`, `idempotency_key`, `kind`, `payload`) but not the
+envelope around the list. If TradeRated's real response differs (e.g. a bare
+array, or a different key), this is the one function to fix.
+
+## CRM Outbox claim limit
+
+`src/st_exporter/outbox/drain.py`, `_DEFAULT_CLAIM_LIMIT`
+
+Defaults to 10 pending items per drain. The spec says "up to N pending items"
+without naming N. Unverified against a real deployment; adjust once ticket 07's
+real outbox endpoint is live and its actual behavior/limits are known.
+
+## `technician_rating` has no known ServiceTitan write
+
+`src/st_exporter/outbox/actions.py`, `perform_item`
+
+The Outbox contract names two kinds — `referral_lead` and `technician_rating` —
+but this CLI's registry has no ServiceTitan endpoint that resembles "post a
+rating for a technician." `perform_item` raises `UnsupportedOutboxKindError` for
+this kind rather than guessing (a job note? a custom field? something else?).
+Every `technician_rating` item will be reported back to TradeRated as `failed`
+until this is resolved with the spec owner — raised explicitly in this ticket's
+report, not silently worked around.
+
+## `referral_lead` payload passed through unmapped
+
+`src/st_exporter/outbox/actions.py`, `_perform_referral_lead`
+
+`item.payload` is sent as-is to `POST /crm/v2/tenant/{id}/leads` — this repo
+doesn't own the payload's shape (that's TradeRated's issue 04), so it's assumed
+to already match ServiceTitan's lead-creation body rather than remapped
+field-by-field. Whether ServiceTitan's real Lead-creation endpoint accepts
+exactly TradeRated's queued fields (and what a rejection looks like) is
+unconfirmed until a real end-to-end run exists.
