@@ -44,7 +44,15 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ inputs.target == 'sheets' }}
     steps:
+      # A reusable (workflow_call) workflow runs in the CALLER's context, so a
+      # bare checkout would fetch the caller's repo (which has no pyproject.toml)
+      # and `pip install -e .` would fail. Pin this repo explicitly, at the same
+      # tag this workflow file is published under — when a new tag is cut, this
+      # ref is bumped in the same commit, before re-tagging.
       - uses: actions/checkout@v4
+        with:
+          repository: BBTT-01/ST-exporter
+          ref: exporter-v0.2.0
 
       - uses: actions/setup-python@v5
         with:
