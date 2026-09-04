@@ -14,6 +14,7 @@ from typing import Any
 
 from st_cli.client import ServiceTitanClient
 from st_cli.config import Settings
+from st_cli.exceptions import ConfigError
 from st_exporter import EXPORTER_VERSION
 from st_exporter.config import ExporterSettings
 from st_exporter.denormalize import build_job_rows
@@ -40,6 +41,26 @@ _RAW_LOCATIONS = "_raw_locations"
 _RAW_JOBS = "_raw_jobs"
 _RAW_APPOINTMENTS = "_raw_appointments"
 _RAW_ASSIGNMENTS = "_raw_assignments"
+
+_VALID_FEEDS = frozenset({"jobs", "technicians"})
+DEFAULT_FEEDS = frozenset({"jobs", "technicians"})
+
+
+def parse_feeds(value: str) -> frozenset[str]:
+    """Parse a comma-separated --feeds value into a validated set.
+
+    Blank segments are dropped so "jobs," or " jobs , technicians " both work —
+    the reusable workflow's `feeds` input is free-text, not a strict enum.
+    """
+    feeds = frozenset(part.strip() for part in value.split(",") if part.strip())
+    if not feeds:
+        raise ConfigError("--feeds must name at least one of: jobs, technicians.")
+    unknown = feeds - _VALID_FEEDS
+    if unknown:
+        raise ConfigError(
+            f"unknown feed(s): {', '.join(sorted(unknown))}. Valid feeds: jobs, technicians."
+        )
+    return feeds
 
 
 @dataclass
