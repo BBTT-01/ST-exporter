@@ -1,0 +1,103 @@
+"""Tests for the `st-export` CLI entrypoint: flag wiring and error handling.
+
+``main()`` wraps ``typer.run(run_once)``, which parses ``sys.argv`` directly and
+always raises ``SystemExit`` (click's standalone mode) — even on success — so
+every test patches ``sys.argv`` and calls ``main()`` directly rather than going
+through Typer's ``CliRunner`` (which expects a Click/Typer app object, not a
+plain wrapper function).
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pydantic
+import pytest
+
+from st_cli.exceptions import ConfigError
+from st_exporter.cli import main
+from st_exporter.run import ExportSummary
+
+_ARGV0 = "st-export"
+
+
+def _summary(**overrides) -> ExportSummary:
+    defaults = dict(jobs_row_count=3, technicians_row_count=2, skipped_no_job=0, dry_run=False)
+    defaults.update(overrides)
+    return ExportSummary(**defaults)
+
+
+class TestSuccessPath:
+    def test_echoes_summary_and_exits_zero(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="fake-st-settings"),
+            patch("st_exporter.cli.ExporterSettings", return_value="fake-exporter-settings"),
+            patch("st_exporter.cli.run_export", return_value=_summary()) as mock_run,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 0
+        assert "jobs=3 technicians=2 skipped_no_job=0 dry_run=False" in capsys.readouterr().out
+        mock_run.assert_called_once_with(
+            "fake-st-settings", "fake-exporter-settings", pricebook=False, dry_run=False
+        )
+
+    def test_dry_run_flag_is_passed_through(self, monkeypatch) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--dry-run"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.run_export", return_value=_summary(dry_run=True)) as mock_run,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 0
+        mock_run.assert_called_once_with("s", "e", pricebook=False, dry_run=True)
+
+    def test_pricebook_flag_is_passed_through(self, monkeypatch) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--pricebook"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.run_export", return_value=_summary()) as mock_run,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 0
+        mock_run.assert_called_once_with("s", "e", pricebook=True, dry_run=False)
+
+
+class TestErrorHandling:
+    def test_st_cli_error_from_run_export_prints_clean_error_and_exits_one(
+        self, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.run_export", side_effect=ConfigError("bad config")),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 1
+        assert "Error: bad config" in capsys.readouterr().err
+
+    def test_validation_error_from_exporter_settings_exits_one_not_a_traceback(
+        self, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0])
+        validation_error = pydantic.ValidationError.from_exception_data("ExporterSettings", [])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", side_effect=validation_error),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 1
+        assert "Error:" in capsys.readouterr().err
