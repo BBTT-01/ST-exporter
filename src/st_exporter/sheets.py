@@ -69,9 +69,16 @@ class SheetsClient:
         A naive clear-then-write is exactly the partial-write state "full replace"
         is meant to avoid — an external reader could see an empty tab between the
         two calls. Instead this issues a single ``batchUpdate``: one range for the
-        new grid, plus (only if the new grid is shorter) a second range blanking
-        the now-stale trailing rows — so there is never a visible intermediate
-        empty-tab state, and no leftover rows from a previous, longer run.
+        new grid, plus (only if the new grid is smaller) ranges blanking the now-
+        stale trailing rows and/or columns — so there is never a visible
+        intermediate empty-tab state, and no leftover cell from a previous, larger
+        run survives anywhere in the sheet.
+
+        Note: ``grid`` must have at least one row (a header row, at minimum) —
+        every caller in this package guarantees that. An empty grid raises from
+        ``rowcol_to_a1(0, ...)`` rather than silently writing nothing; that's
+        intentional (a would-be-empty-tab write is far more likely a bug upstream
+        than a real "zero rows" case) and is covered by a regression test.
         """
         new_row_count = len(grid)
         new_col_count = max((len(row) for row in grid), default=1)
@@ -79,12 +86,11 @@ class SheetsClient:
         worksheet = self._get_or_create_worksheet(tab_name, new_row_count, new_col_count)
         old_row_count = worksheet.row_count
         old_col_count = worksheet.col_count
+        max_row_count = max(old_row_count, new_row_count)
+        max_col_count = max(old_col_count, new_col_count)
 
         if old_row_count < new_row_count or old_col_count < new_col_count:
-            worksheet.resize(
-                rows=max(old_row_count, new_row_count),
-                cols=max(old_col_count, new_col_count),
-            )
+            worksheet.resize(rows=max_row_count, cols=max_col_count)
 
         updates: list[dict[str, Any]] = [
             {
@@ -93,10 +99,22 @@ class SheetsClient:
             }
         ]
         if old_row_count > new_row_count:
-            blank_rows = old_row_count - new_row_count
-            blank_grid = [[""] * new_col_count for _ in range(blank_rows)]
+            # Stale trailing rows from a previous, longer run — blank across the
+            # full old width so no stale cell survives in a row the new grid no
+            # longer has.
+            blank_rows = max_row_count - new_row_count
+            blank_grid = [[""] * max_col_count for _ in range(blank_rows)]
             start_a1 = rowcol_to_a1(new_row_count + 1, 1)
-            end_a1 = rowcol_to_a1(old_row_count, new_col_count)
+            end_a1 = rowcol_to_a1(max_row_count, max_col_count)
+            updates.append({"range": f"{start_a1}:{end_a1}", "values": blank_grid})
+        if old_col_count > new_col_count and new_row_count > 0:
+            # Stale trailing columns from a previous, wider run — blank within the
+            # rows the new grid actually has (rows beyond that are already fully
+            # blanked, full old width, by the row branch above).
+            blank_cols = max_col_count - new_col_count
+            blank_grid = [[""] * blank_cols for _ in range(new_row_count)]
+            start_a1 = rowcol_to_a1(1, new_col_count + 1)
+            end_a1 = rowcol_to_a1(new_row_count, max_col_count)
             updates.append({"range": f"{start_a1}:{end_a1}", "values": blank_grid})
 
         worksheet.batch_update(updates, raw=True)

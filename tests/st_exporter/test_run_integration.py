@@ -17,7 +17,7 @@ from unittest.mock import patch
 import respx
 
 from st_exporter.meta import CursorBundle, parse_meta_grid
-from st_exporter.run import run_export
+from st_exporter.run import _apply_window, run_export
 from st_exporter.sheets import InMemorySheetsStore
 from tests.st_exporter.conftest import mock_auth_token
 from tests.st_exporter.fixtures import tenant_run1, tenant_run2
@@ -92,8 +92,102 @@ def test_two_runs_incremental_fetch_and_byte_identical_unchanged_rows(
 
 
 @respx.mock
+def test_dry_run_reads_real_state_and_writes_nothing(st_settings, exporter_settings) -> None:
+    api_base = st_settings.api_base
+    today_iso = FIXED_TODAY.isoformat()
+    far_past_iso = (FIXED_TODAY - timedelta(days=200)).isoformat()
+
+    export_store = InMemorySheetsStore()
+    raw_cache_store = InMemorySheetsStore()
+    mock_auth_token(st_settings.auth_url)
+
+    # Run 1, for real, to populate cursor/raw-cache state to preview against.
+    tenant_run1.register(api_base, today_iso=today_iso, far_past_iso=far_past_iso)
+    with _frozen_now():
+        run_export(
+            st_settings,
+            exporter_settings,
+            export_store=export_store,
+            raw_cache_store=raw_cache_store,
+        )
+    snapshot = {name: [row[:] for row in grid] for name, grid in export_store.tabs.items()}
+    raw_snapshot = {name: [row[:] for row in grid] for name, grid in raw_cache_store.tabs.items()}
+
+    # Dry run against the SAME real stores. tenant_run2's routes only accept
+    # exactly run 1's cursor (asserted inside the fixture itself) — if dry-run
+    # had reset to first-run/empty-cache behavior instead of reading real state,
+    # this would fail with a cursor mismatch, not just a wrong count.
+    tenant_run2.register(api_base, today_iso=today_iso)
+    with _frozen_now():
+        summary = run_export(
+            st_settings,
+            exporter_settings,
+            export_store=export_store,
+            raw_cache_store=raw_cache_store,
+            dry_run=True,
+        )
+
+    # Job 2's appointment was rescheduled into the window in tenant_run2 — an
+    # accurate preview of the next real run reports both jobs, not a first-run 1.
+    assert summary.jobs_row_count == 2
+    assert summary.dry_run is True
+
+    # Nothing was written: both stores are byte-identical to the pre-dry-run snapshot.
+    assert export_store.tabs == snapshot
+    assert raw_cache_store.tabs == raw_snapshot
+
+
+def test_apply_window_counts_missing_start_separately_from_out_of_window() -> None:
+    # Distinct from a genuinely out-of-window row (expected, not counted) and
+    # from an unparsable one (window.in_window's own concern) — a live
+    # appointment with literally no start value is unusual enough to surface.
+    rows = [
+        {"appointment_start": "2026-09-03T09:00:00-05:00"},  # in window
+        {"appointment_start": ""},  # missing
+        {"appointment_start": None},  # missing
+        {"appointment_start": "2020-01-01T00:00:00-05:00"},  # genuinely out of window
+    ]
+    kept, skipped_no_start, skipped_bad_timestamp = _apply_window(
+        rows, today=FIXED_TODAY, window_days=90
+    )
+    assert len(kept) == 1
+    assert skipped_no_start == 2
+    assert skipped_bad_timestamp == 0
+
+
+def test_apply_window_counts_bad_timestamp_separately_from_missing() -> None:
+    rows = [{"appointment_start": "not-a-real-timestamp"}]
+    kept, skipped_no_start, skipped_bad_timestamp = _apply_window(
+        rows, today=FIXED_TODAY, window_days=90
+    )
+    assert kept == []
+    assert skipped_no_start == 0
+    assert skipped_bad_timestamp == 1
+
+
+class _ListHandler(logging.Handler):
+    """Captures records directly off a specific logger.
+
+    Not pytest's ``caplog`` — since ``configure_logging()`` (D1) deliberately sets
+    ``st_exporter``'s logger to ``propagate = False`` (so it can't double up with
+    root handlers a hosting environment might add), caplog's root-attached
+    handler never sees its records, even via ``caplog.set_level(logger=...)``
+    (verified: that call only adjusts the named logger's level, it does not
+    attach caplog's handler to it). This is what actually lets that INFO-level
+    output be inspected.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records_captured: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records_captured.append(record)
+
+
+@respx.mock
 def test_no_secret_leaks_even_with_root_logger_forced_to_debug(
-    st_settings, exporter_settings, caplog
+    st_settings, exporter_settings
 ) -> None:
     today_iso = FIXED_TODAY.isoformat()
     far_past_iso = (FIXED_TODAY - timedelta(days=200)).isoformat()
@@ -106,17 +200,26 @@ def test_no_secret_leaks_even_with_root_logger_forced_to_debug(
         update={"client_secret": sentinel_secret, "app_key": sentinel_app_key}
     )
 
-    caplog.set_level(logging.DEBUG)
-    with _frozen_now(), patch("logging.basicConfig"):
-        logging.getLogger().setLevel(logging.DEBUG)
-        run_export(
-            leaky_settings,
-            exporter_settings,
-            export_store=InMemorySheetsStore(),
-            raw_cache_store=InMemorySheetsStore(),
-        )
+    st_exporter_logger = logging.getLogger("st_exporter")
+    list_handler = _ListHandler()
+    st_exporter_logger.addHandler(list_handler)
+    try:
+        with _frozen_now(), patch("logging.basicConfig"):
+            logging.getLogger().setLevel(logging.DEBUG)
+            run_export(
+                leaky_settings,
+                exporter_settings,
+                export_store=InMemorySheetsStore(),
+                raw_cache_store=InMemorySheetsStore(),
+            )
+    finally:
+        st_exporter_logger.removeHandler(list_handler)
 
-    captured = "\n".join(record.getMessage() for record in caplog.records)
+    # D1 gives st_exporter its own INFO-level output in production — confirm this
+    # test actually captured something, not just that an empty list is secret-free.
+    assert list_handler.records_captured, "expected INFO-level run.py logging to fire"
+
+    captured = "\n".join(record.getMessage() for record in list_handler.records_captured)
     assert sentinel_secret not in captured
     assert sentinel_app_key not in captured
     assert sentinel_secret not in repr(leaky_settings)

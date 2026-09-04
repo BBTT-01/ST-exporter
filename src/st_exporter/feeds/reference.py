@@ -18,8 +18,17 @@ _PAGE_SIZE = 200
 
 
 def fetch_technicians(client: ServiceTitanClient) -> list[dict[str, Any]]:
-    """Full list from ``settings/v2/tenant/{id}/technicians``."""
-    return list(fetch_all(client, "settings", "technicians", page_size=_PAGE_SIZE))
+    """Full list from ``settings/v2/tenant/{id}/technicians``.
+
+    Passes ``active=Any`` — ServiceTitan settings list endpoints conventionally
+    default to active-only, which would make a deactivated technician silently
+    disappear from the tab instead of showing up with ``active=false``. The exact
+    parameter name/values aren't confirmed against a real tenant — see
+    KNOWN_UNVERIFIED.md.
+    """
+    return list(
+        fetch_all(client, "settings", "technicians", params={"active": "Any"}, page_size=_PAGE_SIZE)
+    )
 
 
 def fetch_job_types(client: ServiceTitanClient) -> dict[str, dict[str, Any]]:

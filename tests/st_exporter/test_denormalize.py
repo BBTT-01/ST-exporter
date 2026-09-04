@@ -245,6 +245,62 @@ def test_rows_are_sorted_by_job_id_then_appointment_id() -> None:
     assert ordering == [(1, 100), (1, 101), (2, 200)]
 
 
+def test_cancelled_job_is_excluded_from_output() -> None:
+    jobs = _cache({"id": 1, "jobStatus": "Canceled"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows == []
+
+
+def test_cancelled_job_status_is_matched_case_insensitively() -> None:
+    jobs = _cache({"id": 1, "jobStatus": "CANCELLED"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows == []
+
+
+def test_non_cancelled_status_is_not_excluded() -> None:
+    jobs = _cache({"id": 1, "jobStatus": "InProgress"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert len(result.rows) == 1
+
+
+def test_technician_resolution_compares_assignedon_by_real_time_not_string() -> None:
+    # A +02:00 timestamp can sort greater than a -05:00 timestamp lexicographically
+    # even though the -05:00 one is chronologically later. Tech 20's event here is
+    # 5 real hours after tech 10's, despite "…T10:00:00+02:00" > "…T08:00:00-05:00"
+    # as raw strings.
+    jobs = _cache({"id": 1})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+    assignments = _cache(
+        {
+            "id": 1,
+            "appointmentId": 100,
+            "technicianId": 10,
+            "status": "Active",
+            "assignedOn": "2026-09-02T10:00:00+02:00",  # 08:00 UTC
+        },
+        {
+            "id": 2,
+            "appointmentId": 100,
+            "technicianId": 20,
+            "status": "Active",
+            "assignedOn": "2026-09-02T08:00:00-05:00",  # 13:00 UTC — actually later
+        },
+    )
+
+    result = build_job_rows(jobs, appointments, assignments, _cache(), _cache())
+
+    assert result.rows[0]["st_technician_id"] == "20"
+
+
 def test_unrelated_run_untouched_appointment_formats_identically() -> None:
     # Denormalisation itself is deterministic given identical raw input — this is
     # the guarantee run.py's "byte-identical unchanged rows" acceptance criterion

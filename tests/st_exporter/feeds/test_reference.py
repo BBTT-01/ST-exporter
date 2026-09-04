@@ -20,7 +20,7 @@ def test_fetch_technicians_hits_settings_technicians(mock_client) -> None:
     technicians = fetch_technicians(mock_client)
     assert technicians == [{"id": 1, "name": "Jane", "email": "jane@example.com", "active": True}]
     mock_client.get.assert_called_once_with(
-        "settings", "technicians", params={"page": 1, "pageSize": 200}
+        "settings", "technicians", params={"active": "Any", "page": 1, "pageSize": 200}
     )
 
 

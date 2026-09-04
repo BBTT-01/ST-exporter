@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import typer
+from pydantic import ValidationError
 
 from st_cli.config import load_settings
 from st_cli.exceptions import STCLIError
@@ -33,6 +34,19 @@ def main() -> None:
     """Entry point for the `st-export` command."""
     try:
         typer.run(run_once)
-    except STCLIError as exc:
+    except (STCLIError, ValidationError) as exc:
+        # ValidationError covers a missing/malformed env var surfacing from
+        # load_settings()/ExporterSettings() — those aren't STCLIError subclasses,
+        # so without this a bad Actions secret prints a raw pydantic traceback
+        # instead of the same clean Error: ... + exit-1 path.
+        #
+        # Deliberately SystemExit, not typer.Exit: this except block runs after
+        # typer.run(run_once) has already returned control to us, outside any
+        # Click/Typer dispatch loop, so nothing would translate a typer.Exit into
+        # an actual clean process exit here — it would just be an uncaught
+        # exception (Python prints a traceback and exits 1 anyway, but with a
+        # traceback dumped on top of the "Error: ..." line, defeating the point).
+        # SystemExit is what Python's interpreter itself treats specially: a
+        # clean exit with no traceback.
         typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        raise SystemExit(1) from exc

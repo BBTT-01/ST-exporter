@@ -28,9 +28,16 @@ def in_window(
     """True if ``appointment_start`` (ISO 8601, with offset) belongs in the Sheet.
 
     ``today`` is threaded in rather than computed here so every row evaluated in
-    one run shares exactly the same cutoff.
+    one run shares exactly the same cutoff. A malformed/unparsable timestamp is
+    treated as excluded rather than raised — one bad upstream record must not be
+    able to abort the whole run (the crash would happen before any write, so the
+    next run would re-fetch and re-crash on the same record forever). The caller
+    (``run.py``) is responsible for counting/logging rows dropped this way.
     """
-    start_date = _parse_utc_date(appointment_start)
+    try:
+        start_date = _parse_utc_date(appointment_start)
+    except (ValueError, TypeError):
+        return False
     return start_date >= today - timedelta(days=window_days)
 
 

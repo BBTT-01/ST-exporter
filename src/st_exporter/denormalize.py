@@ -10,16 +10,40 @@ A few field mappings here are marked as assumptions because they can't be confir
 without a real ServiceTitan tenant (see ``KNOWN_UNVERIFIED.md``): the exact
 `appointment-assignments` status values that mean "removed", whether `jobTypeName`/
 `businessUnitName` are present directly on job records or need a reference-table
-join, and the exact JSON path for a location's coordinates.
+join, the exact JSON path for a location's coordinates, and the exact `jobStatus`
+values that mean "cancelled/deleted" (see `_EXCLUDED_JOB_STATUSES` below).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from st_exporter.feeds.raw_cache import RawCache
 from st_exporter.format import build_service_address
+
+_EARLIEST = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _parse_utc_datetime(value: str | None) -> datetime:
+    """Parse an ISO 8601 timestamp to a UTC-aware datetime for sort comparisons.
+
+    Missing or unparsable values sort as the earliest possible instant, so they
+    never win a "most recent" comparison against a real timestamp. Mirrors
+    ``window._parse_utc_date``'s UTC-conversion approach, reimplemented locally
+    (not imported) since that one returns a ``date``, not a ``datetime``, and is
+    private to its own module.
+    """
+    if not value:
+        return _EARLIEST
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return _EARLIEST
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 @dataclass
@@ -31,6 +55,13 @@ class DenormalizeResult:
 # Assignment statuses treated as "no longer assigned". Unconfirmed against real
 # ServiceTitan data — see KNOWN_UNVERIFIED.md. Compared case-insensitively.
 _REMOVED_ASSIGNMENT_STATUSES = {"unassigned", "removed", "cancelled", "canceled"}
+
+# job_status values that mean the job is cancelled/deleted and must not keep being
+# re-written to the jobs tab forever. Unconfirmed against real ServiceTitan data —
+# see KNOWN_UNVERIFIED.md. Compared case-insensitively. Without this, a cancelled
+# job with a future-dated appointment would pass in_window() indefinitely, since
+# nothing else in this pipeline ever removes a record once seen.
+_EXCLUDED_JOB_STATUSES = {"canceled", "cancelled"}
 
 
 def _first_present(*sources: dict[str, Any] | None, keys: tuple[str, ...]) -> Any:
@@ -83,8 +114,8 @@ def _active_technician_id(assignments: list[dict[str, Any]]) -> str | None:
     if not active:
         return None
 
-    def sort_key(a: dict[str, Any]) -> tuple[str, int]:
-        assigned_on = a.get("assignedOn") or ""
+    def sort_key(a: dict[str, Any]) -> tuple[datetime, int]:
+        assigned_on = _parse_utc_datetime(a.get("assignedOn"))
         technician_id = a.get("technicianId")
         if technician_id is None:
             tech_id_int = 0
@@ -165,6 +196,12 @@ def build_job_rows(
             # the appointment before the job). Idempotent design: skip for now,
             # picked up automatically once the jobs feed's delta includes it.
             skipped_no_job += 1
+            continue
+
+        if str(job.get("jobStatus", "")).strip().lower() in _EXCLUDED_JOB_STATUSES:
+            # Cancelled/deleted: must not keep being re-written to the jobs tab.
+            # Idempotent design, same as skipped_no_job — if ServiceTitan ever
+            # un-cancels the job, the next jobStatus delta un-excludes it too.
             continue
 
         customer = raw_customers.get(job.get("customerId"))

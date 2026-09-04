@@ -62,3 +62,15 @@ def test_offset_is_converted_to_utc_before_taking_the_date() -> None:
 
 def test_naive_timestamp_without_offset_is_treated_as_utc() -> None:
     assert in_window("2026-09-03T00:00:00", today=_TODAY) is True
+
+
+def test_malformed_timestamp_is_excluded_not_raised() -> None:
+    # A single bad appointment_start must not be able to crash the whole run —
+    # see run.py's _apply_window, which relies on this returning False rather
+    # than raising so one poison record can't abort every other row.
+    assert in_window("not-a-real-timestamp", today=_TODAY) is False
+
+
+def test_wrong_type_timestamp_is_excluded_not_raised() -> None:
+    assert in_window(12345, today=_TODAY) is False  # type: ignore[arg-type]
+    assert in_window(None, today=_TODAY) is False  # type: ignore[arg-type]

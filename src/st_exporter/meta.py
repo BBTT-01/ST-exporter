@@ -67,8 +67,14 @@ class CursorBundle:
         if not raw:
             return cls({feed: None for feed in JOBS_CURSOR_FEEDS})
         try:
-            data: dict[str, Any] = json.loads(raw)
+            data: Any = json.loads(raw)
         except json.JSONDecodeError:
+            return cls({feed: None for feed in JOBS_CURSOR_FEEDS})
+        if not isinstance(data, dict):
+            # Valid JSON but not an object (e.g. a list, string, or number) — a
+            # hand-edited or partially-written cell. Same fallback as bad JSON:
+            # treat as "no prior cursor" rather than crashing at the top of every
+            # run, which would be a permanent, self-inflicted outage.
             return cls({feed: None for feed in JOBS_CURSOR_FEEDS})
         return cls({feed: data.get(feed) for feed in JOBS_CURSOR_FEEDS})
 
@@ -93,10 +99,20 @@ def parse_meta_grid(grid: list[list[str]]) -> dict[str, MetaRow]:
             feed=feed,
             last_run_at=cell("last_run_at"),
             last_cursor=cell("last_cursor"),
-            row_count=int(cell("row_count") or 0),
+            row_count=_parse_row_count(cell("row_count")),
             exporter_version=cell("exporter_version"),
         )
     return rows
+
+
+def _parse_row_count(raw: str) -> int:
+    """Defensive int parse — a hand-edited or corrupted ``_meta`` cell must not
+    crash the run before any work happens, matching ``CursorBundle.decode`` and
+    ``RawCache.from_grid``'s tolerance of bad data elsewhere in this module."""
+    try:
+        return int(raw or 0)
+    except ValueError:
+        return 0
 
 
 def build_meta_grid(rows: list[MetaRow]) -> list[list[str]]:

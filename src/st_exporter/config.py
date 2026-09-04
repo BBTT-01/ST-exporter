@@ -29,4 +29,7 @@ class ExporterSettings(BaseSettings):
     raw_cache_sheet_id: str
 
     # Not GOOGLE_-prefixed; bypasses the class prefix via validation_alias.
-    window_days: int = Field(default=90, validation_alias="EXPORTER_WINDOW_DAYS")
+    # ge=1: a zero or negative window would silently empty the jobs tab rather
+    # than error — the exact silent-failure mode this package treats as its
+    # highest-stakes risk (see window.py's module docstring).
+    window_days: int = Field(default=90, ge=1, validation_alias="EXPORTER_WINDOW_DAYS")

@@ -36,6 +36,13 @@ class RawCache:
     def values(self) -> list[dict[str, Any]]:
         return list(self.records.values())
 
+    def keep(self, ids: set[str]) -> None:
+        """Drop every record not in ``ids``, bounding the cache to what's currently
+        relevant instead of growing forever. Safe: if a dropped record changes
+        again later, ServiceTitan's change feed resends it in a future delta and
+        ``merge()`` re-adds it — nothing already retained is permanently lost."""
+        self.records = {rid: r for rid, r in self.records.items() if rid in ids}
+
     def to_grid(self) -> list[list[str]]:
         grid: list[list[str]] = [list(RAW_CACHE_COLUMNS)]
         for record_id in sorted(self.records):
