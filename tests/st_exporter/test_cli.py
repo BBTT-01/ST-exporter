@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pydantic
 import pytest
 
@@ -173,6 +174,51 @@ class TestOutboxDrain:
         ):
             main()
         mock_drain.assert_not_called()
+
+    def test_outbox_failure_does_not_fail_the_run_or_print_a_traceback(
+        self, monkeypatch, capsys
+    ) -> None:
+        """The export's Sheets writes are already committed by the time the drain
+        runs, so an outbox error must exit 0 with the export summary — not a raw
+        httpx traceback (which main()'s STCLIError/ValidationError handler would
+        not catch)."""
+        monkeypatch.setattr("sys.argv", [_ARGV0])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=True)),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            patch(
+                "st_exporter.cli._drain_outbox",
+                side_effect=httpx.ConnectError("outbox unreachable"),
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "jobs=3 technicians=2" in captured.out
+        assert "outbox_claimed" not in captured.out
+        assert "Traceback" not in captured.err
+
+    def test_outbox_keyboard_interrupt_is_not_swallowed(self, monkeypatch, capsys) -> None:
+        """`except Exception` must let KeyboardInterrupt/SystemExit through — it
+        reaches click, which turns it into its standard abort exit code 130, not
+        the exit-0-with-a-summary of the swallowed-error path."""
+        monkeypatch.setattr("sys.argv", [_ARGV0])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=True)),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            patch("st_exporter.cli._drain_outbox", side_effect=KeyboardInterrupt),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 130
+        assert "jobs=3" not in capsys.readouterr().out
 
     def test_skips_outbox_drain_on_dry_run_even_if_configured(self, monkeypatch) -> None:
         monkeypatch.setattr("sys.argv", [_ARGV0, "--dry-run"])

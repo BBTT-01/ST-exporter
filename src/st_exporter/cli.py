@@ -47,7 +47,19 @@ def run_once(
 
     outbox_summary: DrainSummary | None = None
     if not dry_run and traderated_settings.configured:
-        outbox_summary = _drain_outbox(st_settings, exporter_settings, traderated_settings)
+        try:
+            outbox_summary = _drain_outbox(st_settings, exporter_settings, traderated_settings)
+        except Exception as exc:
+            # The export half already succeeded and committed its Sheets writes
+            # by now, so an outbox problem must not fail the whole run — and an
+            # httpx error escaping drain_outbox (e.g. claim() itself failing) is
+            # neither STCLIError nor ValidationError, so main()'s handler would
+            # not catch it and the run would end in a raw traceback. Leaving
+            # outbox_summary as None just omits the outbox fields from the echoed
+            # line, exactly like the not-configured and dry-run paths.
+            # `Exception`, not bare `except`: SystemExit/KeyboardInterrupt must
+            # still propagate.
+            logger.warning("outbox drain failed; export results are unaffected: %s", exc)
     elif not traderated_settings.configured:
         # Expected until ticket 07 issues the machine token/outbox URL — not an
         # error, so this is INFO, not WARNING.
