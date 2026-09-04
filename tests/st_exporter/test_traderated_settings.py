@@ -24,6 +24,22 @@ class TestTradeRatedSettings:
         settings = TradeRatedSettings()
         assert settings.configured is False
 
+    def test_empty_string_secrets_are_not_configured(self, monkeypatch) -> None:
+        """GitHub Actions maps an ``env:`` entry for an unset secret to the empty
+        string, not to nothing — so pydantic loads ``""`` (non-None) for both.
+        An ``is not None`` check would call that configured and the drain would
+        then build an httpx client on an empty base URL and crash the run."""
+        monkeypatch.setenv("TRADERATED_MACHINE_TOKEN", "")
+        monkeypatch.setenv("TRADERATED_OUTBOX_BASE_URL", "")
+        settings = TradeRatedSettings()
+        assert settings.configured is False
+
+    def test_empty_string_for_only_one_secret_is_not_configured(self, monkeypatch) -> None:
+        monkeypatch.setenv("TRADERATED_MACHINE_TOKEN", "tok")
+        monkeypatch.setenv("TRADERATED_OUTBOX_BASE_URL", "")
+        settings = TradeRatedSettings()
+        assert settings.configured is False
+
     def test_machine_token_not_in_repr(self, monkeypatch) -> None:
         monkeypatch.setenv("TRADERATED_MACHINE_TOKEN", "super-secret-token")
         settings = TradeRatedSettings()

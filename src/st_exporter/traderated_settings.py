@@ -23,4 +23,14 @@ class TradeRatedSettings(BaseSettings):
 
     @property
     def configured(self) -> bool:
-        return self.machine_token is not None and self.outbox_base_url is not None
+        """True only when BOTH values are present *and* non-empty.
+
+        Must be a truthiness check, not ``is not None``: GitHub Actions sets an
+        ``env:`` entry mapped to an unset secret to the EMPTY STRING, not to
+        nothing at all. Pydantic then loads ``machine_token=""`` /
+        ``outbox_base_url=""`` — both non-None — and an ``is not None`` check
+        would report the outbox as configured, so the drain would build a client
+        against the empty base URL and crash with ``httpx.UnsupportedProtocol``
+        on every scheduled run until ticket 07 issues real secrets.
+        """
+        return bool(self.machine_token) and bool(self.outbox_base_url)
