@@ -43,6 +43,22 @@ jobs:
   export:
     runs-on: ubuntu-latest
     if: ${{ inputs.target == 'sheets' }}
+    # The jobs feed runs every 5 minutes and technicians every 30, and a large
+    # tenant's first full drain can exceed 5 minutes — so runs really can
+    # overlap. Both write the same `_meta` grid and may drain the same
+    # `_outbox_ledger` tab, each via read-then-full-replace, so an overlapping
+    # run can read stale state and silently roll back the other's cursor/ledger
+    # writes. Serialize instead. `github.repository` is the CALLING repo, so
+    # each customer gets their own group: a customer never collides with
+    # themselves, and different customers never block each other.
+    # cancel-in-progress: false — killing a run mid-drain is exactly the
+    # crash the ledger has to recover from; better to just queue.
+    concurrency:
+      group: st-export-${{ github.repository }}
+      cancel-in-progress: false
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       # A reusable (workflow_call) workflow runs in the CALLER's context, so a
       # bare checkout would fetch the caller's repo (which has no pyproject.toml)
