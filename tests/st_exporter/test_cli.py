@@ -16,7 +16,7 @@ import pytest
 
 from st_cli.exceptions import ConfigError
 from st_exporter.cli import main
-from st_exporter.run import ExportSummary
+from st_exporter.run import DEFAULT_FEEDS, ExportSummary
 
 _ARGV0 = "st-export"
 
@@ -41,7 +41,11 @@ class TestSuccessPath:
         assert exc_info.value.code == 0
         assert "jobs=3 technicians=2 skipped_no_job=0 dry_run=False" in capsys.readouterr().out
         mock_run.assert_called_once_with(
-            "fake-st-settings", "fake-exporter-settings", pricebook=False, dry_run=False
+            "fake-st-settings",
+            "fake-exporter-settings",
+            feeds=DEFAULT_FEEDS,
+            pricebook=False,
+            dry_run=False,
         )
 
     def test_dry_run_flag_is_passed_through(self, monkeypatch) -> None:
@@ -55,7 +59,9 @@ class TestSuccessPath:
             main()
 
         assert exc_info.value.code == 0
-        mock_run.assert_called_once_with("s", "e", pricebook=False, dry_run=True)
+        mock_run.assert_called_once_with(
+            "s", "e", feeds=DEFAULT_FEEDS, pricebook=False, dry_run=True
+        )
 
     def test_pricebook_flag_is_passed_through(self, monkeypatch) -> None:
         monkeypatch.setattr("sys.argv", [_ARGV0, "--pricebook"])
@@ -68,7 +74,40 @@ class TestSuccessPath:
             main()
 
         assert exc_info.value.code == 0
-        mock_run.assert_called_once_with("s", "e", pricebook=True, dry_run=False)
+        mock_run.assert_called_once_with(
+            "s", "e", feeds=DEFAULT_FEEDS, pricebook=True, dry_run=False
+        )
+
+
+class TestFeedsFlag:
+    def test_feeds_flag_is_parsed_and_passed_through(self, monkeypatch) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "jobs"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.run_export", return_value=_summary()) as mock_run,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 0
+        mock_run.assert_called_once_with(
+            "s", "e", feeds=frozenset({"jobs"}), pricebook=False, dry_run=False
+        )
+
+    def test_invalid_feeds_value_prints_clean_error_and_exits_one(
+        self, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "not-a-feed"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 1
+        assert "Error:" in capsys.readouterr().err
 
 
 class TestErrorHandling:
