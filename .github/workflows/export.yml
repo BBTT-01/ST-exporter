@@ -65,5 +65,11 @@ jobs:
           EXPORTER_WINDOW_DAYS: ${{ inputs.window }}
           TRADERATED_MACHINE_TOKEN: ${{ secrets.TRADERATED_MACHINE_TOKEN }}
           TRADERATED_OUTBOX_BASE_URL: ${{ secrets.TRADERATED_OUTBOX_BASE_URL }}
+          FEEDS: ${{ inputs.feeds }}
+          PRICEBOOK_FLAG: ${{ inputs.pricebook && '--pricebook' || '' }}
         run: |
-          st-export --feeds "${{ inputs.feeds }}" ${{ inputs.pricebook && '--pricebook' || '' }}
+          case "$FEEDS" in
+            jobs|technicians|jobs,technicians) ;;
+            *) echo "::error::invalid feeds input: $FEEDS" >&2; exit 1 ;;
+          esac
+          st-export --feeds "$FEEDS" $PRICEBOOK_FLAG
