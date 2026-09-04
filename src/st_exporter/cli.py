@@ -5,10 +5,17 @@ from __future__ import annotations
 import typer
 from pydantic import ValidationError
 
-from st_cli.config import load_settings
+from st_cli.client import ServiceTitanClient
+from st_cli.config import Settings, load_settings
 from st_cli.exceptions import STCLIError
 from st_exporter.config import ExporterSettings
+from st_exporter.logging_setup import logger
+from st_exporter.outbox.client import TradeRatedOutboxClient
+from st_exporter.outbox.drain import DrainSummary, drain_outbox
+from st_exporter.outbox.ledger import OutboxLedger
 from st_exporter.run import parse_feeds, run_export
+from st_exporter.sheets import SheetsClient, get_gspread_client
+from st_exporter.traderated_settings import TradeRatedSettings
 
 
 def run_once(
@@ -25,9 +32,11 @@ def run_once(
         False, "--dry-run", help="Compute the run but don't write to Google Sheets."
     ),
 ) -> None:
-    """Run one ServiceTitan -> Export Store export pass."""
+    """Run one ServiceTitan -> Export Store export pass, then drain the CRM Outbox."""
     st_settings = load_settings()
     exporter_settings = ExporterSettings()  # type: ignore[call-arg]
+    traderated_settings = TradeRatedSettings()
+
     summary = run_export(
         st_settings,
         exporter_settings,
@@ -35,10 +44,48 @@ def run_once(
         pricebook=pricebook,
         dry_run=dry_run,
     )
-    typer.echo(
+
+    outbox_summary: DrainSummary | None = None
+    if not dry_run and traderated_settings.configured:
+        outbox_summary = _drain_outbox(st_settings, exporter_settings, traderated_settings)
+    elif not traderated_settings.configured:
+        # Expected until ticket 07 issues the machine token/outbox URL — not an
+        # error, so this is INFO, not WARNING.
+        logger.info("TRADERATED_MACHINE_TOKEN/OUTBOX_BASE_URL not set; skipping outbox drain")
+
+    message = (
         f"jobs={summary.jobs_row_count} technicians={summary.technicians_row_count} "
         f"skipped_no_job={summary.skipped_no_job} dry_run={summary.dry_run}"
     )
+    if outbox_summary is not None:
+        message += (
+            f" outbox_claimed={outbox_summary.claimed} outbox_succeeded={outbox_summary.succeeded} "
+            f"outbox_failed={outbox_summary.failed} outbox_replayed={outbox_summary.replayed}"
+        )
+    typer.echo(message)
+
+
+def _drain_outbox(
+    st_settings: Settings,
+    exporter_settings: ExporterSettings,
+    traderated_settings: TradeRatedSettings,
+) -> DrainSummary:
+    assert traderated_settings.machine_token is not None
+    assert traderated_settings.outbox_base_url is not None
+
+    gc = get_gspread_client(exporter_settings.service_account_json)
+    raw_cache_store = SheetsClient.open(gc, exporter_settings.raw_cache_sheet_id)
+    ledger = OutboxLedger(raw_cache_store)
+
+    client = ServiceTitanClient(st_settings)
+    outbox_client = TradeRatedOutboxClient(
+        traderated_settings.outbox_base_url, traderated_settings.machine_token
+    )
+    try:
+        return drain_outbox(client, outbox_client, ledger)
+    finally:
+        client.close()
+        outbox_client.close()
 
 
 def main() -> None:
