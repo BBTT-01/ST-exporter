@@ -297,6 +297,7 @@ def test_technicians_only_run_preserves_existing_jobs_tab_and_meta(
         )
     jobs_tab_after_run1 = export_store.tabs["jobs"]
     jobs_meta_after_run1 = parse_meta_grid(export_store.tabs["_meta"])["jobs"]
+    raw_cache_snapshot = {k: [row[:] for row in v] for k, v in raw_cache_store.tabs.items()}
 
     # Run 2: technicians-only. No new ServiceTitan routes are registered for the
     # jobs-side feeds (customers/locations/jobs/appointments/assignments) — if
@@ -330,3 +331,7 @@ def test_technicians_only_run_preserves_existing_jobs_tab_and_meta(
         "untouched feed's _meta row must be carried forward"
     )
     assert meta["technicians"].row_count == 1
+
+    assert raw_cache_store.tabs == raw_cache_snapshot, (
+        "a technicians-only run must not touch the raw-cache sheet"
+    )
