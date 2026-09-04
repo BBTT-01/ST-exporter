@@ -40,9 +40,7 @@ class TestTechnicianRating:
     def test_raises_unsupported_kind(self, st_settings: Settings) -> None:
         client = ServiceTitanClient(st_settings)
         try:
-            item = OutboxItem(
-                id="2", idempotency_key="key-2", kind="technician_rating", payload={}
-            )
+            item = OutboxItem(id="2", idempotency_key="key-2", kind="technician_rating", payload={})
             with pytest.raises(UnsupportedOutboxKindError, match="technician_rating"):
                 perform_item(client, item)
         finally:

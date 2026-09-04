@@ -66,9 +66,7 @@ class TestClaim:
         assert request.url.params["limit"] == "7"
 
     @respx.mock
-    def test_claim_empty_items_defaults_to_empty_list(
-        self, client: TradeRatedOutboxClient
-    ) -> None:
+    def test_claim_empty_items_defaults_to_empty_list(self, client: TradeRatedOutboxClient) -> None:
         respx.get(f"{BASE_URL}/crm-outbox").mock(return_value=httpx.Response(200, json={}))
         assert client.claim() == []
 
