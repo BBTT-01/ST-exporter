@@ -79,7 +79,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: BBTT-01/ST-exporter
-          ref: exporter-v0.2.4
+          ref: exporter-v0.2.5
 
       - uses: actions/setup-python@v5
         with:
@@ -96,7 +96,7 @@ jobs:
       # Sheet itself records which exporter wrote it.
       - name: Verify the checked-out exporter matches the pinned tag
         env:
-          EXPECTED_EXPORTER_VERSION: "0.2.4"
+          EXPECTED_EXPORTER_VERSION: "0.2.5"
         run: |
           actual="$(python -c 'from st_exporter import EXPORTER_VERSION; print(EXPORTER_VERSION)')"
           if [ "$actual" != "$EXPECTED_EXPORTER_VERSION" ]; then

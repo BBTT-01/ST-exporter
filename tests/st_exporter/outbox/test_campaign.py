@@ -119,16 +119,13 @@ class TestFirstRun:
     @respx.mock
     def test_creates_the_campaign_when_absent(self, st_settings: Settings) -> None:
         mock_auth_token(st_settings.auth_url)
+        # The existing campaign donates the categoryId; `marketing/categories` is not
+        # granted on a real tenant, so it must not be needed here.
         respx.get(_campaigns_url(st_settings)).mock(
-            return_value=httpx.Response(
-                200, json={"data": [{"id": 1, "name": "Truck Wraps"}], "hasMore": False}
-            )
+            return_value=_page([{"id": 1, "name": "Truck Wraps", "categoryId": 31}])
         )
         respx.get(_units_url(st_settings)).mock(
             return_value=_page([{"id": 9, "active": True}, {"id": 4, "active": True}])
-        )
-        respx.get(_categories_url(st_settings)).mock(
-            return_value=_page([{"id": 31, "active": True}, {"id": 77, "active": True}])
         )
         created = respx.post(_campaigns_url(st_settings)).mock(
             return_value=httpx.Response(200, json={"id": 500})
@@ -339,3 +336,123 @@ class TestRequiredIdResolution:
                 ReferralCampaign(client).campaign_id()
         finally:
             client.close()
+
+
+class TestCategoryWithoutTheCategoriesScope:
+    """`GET marketing/categories` 403s on a real tenant — the app is not granted it.
+
+    Asking for that scope would send every already-onboarded customer back into their
+    Developer Portal for a value their own campaigns already carry, so the category is
+    borrowed from an existing campaign instead.
+    """
+
+    @respx.mock
+    def test_borrows_the_category_from_an_existing_campaign(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(_campaigns_url(st_settings)).mock(
+            return_value=_page(
+                [
+                    {"id": 1, "name": "Truck Wraps", "categoryId": 40},
+                    {"id": 2, "name": "GMB - Inwood WV", "categoryId": 12},
+                ]
+            )
+        )
+        respx.get(_units_url(st_settings)).mock(return_value=_page([{"id": 5}]))
+        categories = respx.get(_categories_url(st_settings))
+        created = respx.post(_campaigns_url(st_settings)).mock(
+            return_value=httpx.Response(200, json={"id": 900})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            assert ReferralCampaign(client).campaign_id() == 900
+        finally:
+            client.close()
+
+        assert json.loads(created.calls.last.request.content)["categoryId"] == 12
+        assert not categories.called, "the un-granted endpoint must not be needed"
+
+    @respx.mock
+    def test_reads_a_nested_category_object_too(self, st_settings: Settings) -> None:
+        # Whether the list returns `categoryId` or a nested `category: {id}` is not
+        # confirmed, so both shapes are accepted rather than guessing one.
+        mock_auth_token(st_settings.auth_url)
+        respx.get(_campaigns_url(st_settings)).mock(
+            return_value=_page([{"id": 1, "name": "Truck Wraps", "category": {"id": 77}}])
+        )
+        respx.get(_units_url(st_settings)).mock(return_value=_page([{"id": 5}]))
+        created = respx.post(_campaigns_url(st_settings)).mock(
+            return_value=httpx.Response(200, json={"id": 901})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            ReferralCampaign(client).campaign_id()
+        finally:
+            client.close()
+
+        assert json.loads(created.calls.last.request.content)["categoryId"] == 77
+
+    @respx.mock
+    def test_inactive_campaigns_do_not_donate_their_category(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(_campaigns_url(st_settings)).mock(
+            return_value=_page(
+                [
+                    {"id": 1, "name": "Retired", "categoryId": 2, "active": False},
+                    {"id": 2, "name": "Live", "categoryId": 9, "active": True},
+                ]
+            )
+        )
+        respx.get(_units_url(st_settings)).mock(return_value=_page([{"id": 5}]))
+        created = respx.post(_campaigns_url(st_settings)).mock(
+            return_value=httpx.Response(200, json={"id": 902})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            ReferralCampaign(client).campaign_id()
+        finally:
+            client.close()
+
+        assert json.loads(created.calls.last.request.content)["categoryId"] == 9
+
+    @respx.mock
+    def test_a_403_on_categories_is_not_reported_as_the_cause(self, st_settings: Settings) -> None:
+        # A tenant with no campaigns AND no categories scope must fail naming the pin,
+        # not naming a scope the design deliberately does not require.
+        mock_auth_token(st_settings.auth_url)
+        respx.get(_campaigns_url(st_settings)).mock(return_value=_page([]))
+        respx.get(_units_url(st_settings)).mock(return_value=_page([{"id": 5}]))
+        respx.get(_categories_url(st_settings)).mock(
+            return_value=httpx.Response(403, json={"title": "Scope validation failed."})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(CampaignResolutionError, match="TRADERATED_CAMPAIGN_CATEGORY_ID"):
+                ReferralCampaign(client).campaign_id()
+        finally:
+            client.close()
+
+    @respx.mock
+    def test_a_pinned_category_needs_neither_endpoint(
+        self, st_settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRADERATED_CAMPAIGN_CATEGORY_ID", "555")
+        mock_auth_token(st_settings.auth_url)
+        respx.get(_campaigns_url(st_settings)).mock(return_value=_page([]))
+        respx.get(_units_url(st_settings)).mock(return_value=_page([{"id": 5}]))
+        categories = respx.get(_categories_url(st_settings))
+        created = respx.post(_campaigns_url(st_settings)).mock(
+            return_value=httpx.Response(200, json={"id": 903})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            ReferralCampaign(client).campaign_id()
+        finally:
+            client.close()
+
+        assert json.loads(created.calls.last.request.content)["categoryId"] == 555
+        assert not categories.called
