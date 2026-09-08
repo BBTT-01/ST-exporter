@@ -20,6 +20,7 @@ from typing import Any, Literal
 from st_cli.client import ServiceTitanClient
 from st_exporter.logging_setup import logger
 from st_exporter.outbox.actions import UnsupportedOutboxKindError, perform_item
+from st_exporter.outbox.campaign import ReferralCampaign
 from st_exporter.outbox.client import TradeRatedOutboxClient
 from st_exporter.outbox.ledger import LedgerEntry, OutboxLedger
 
@@ -76,6 +77,10 @@ def drain_outbox(
 ) -> DrainSummary:
     items = outbox_client.claim(limit=limit)
     succeeded = failed = replayed = 0
+    # One resolver for the whole batch: the referral campaign cannot change mid-run, so
+    # ten referrals cost one campaign lookup instead of ten. Constructed unconditionally
+    # but resolved lazily, so a batch with no referral leads makes no marketing call.
+    campaign = ReferralCampaign(client)
 
     for item in items:
         existing = ledger.get(item.idempotency_key)
@@ -86,7 +91,7 @@ def drain_outbox(
             continue
 
         try:
-            st_id = perform_item(client, item)
+            st_id = perform_item(client, item, campaign)
         except UnsupportedOutboxKindError as exc:
             failed += 1
             logger.warning("outbox item %s (%s) not performed: %s", item.id, item.kind, exc)
