@@ -120,13 +120,42 @@ Every `technician_rating` item will be reported back to TradeRated as `failed`
 until this is resolved with the spec owner — raised explicitly in this ticket's
 report, not silently worked around.
 
-## `referral_lead` payload passed through unmapped
+## ~~`referral_lead` payload passed through unmapped~~ — RESOLVED 2026-09-08
 
 `src/st_exporter/outbox/actions.py`, `_perform_referral_lead`
 
-`item.payload` is sent as-is to `POST /crm/v2/tenant/{id}/leads` — this repo
-doesn't own the payload's shape (that's TradeRated's issue 04), so it's assumed
-to already match ServiceTitan's lead-creation body rather than remapped
-field-by-field. Whether ServiceTitan's real Lead-creation endpoint accepts
-exactly TradeRated's queued fields (and what a rejection looks like) is
-unconfirmed until a real end-to-end run exists.
+**No longer a guess: it was tested against a real tenant and the assumption was
+wrong.** The first live attempt (Door Serv Pro, 2026-09-08) returned:
+
+```
+ServiceTitan 400: campaignId and summary required
+```
+
+TradeRated's payload is its own snake_case shape (`name`, `phone`, `address`,
+`referred_by`, `notes`) and carries neither required field, so a pass-through can
+never succeed. The exporter now supplies both — `campaignId` from the referral
+campaign resolver, `summary` derived from the payload — and forwards everything
+else untouched. Only absent keys are filled, so a `campaignId` TradeRated later
+chooses to send still wins.
+
+Still unconfirmed: whether ServiceTitan **ignores** the remaining snake_case keys
+or has other required fields it did not mention in that first rejection. It
+reported only these two, which suggests the rest of the body is tolerated — but
+the error may simply be reporting the first failing validation. If a second 400
+appears naming different fields, the payload needs a real field-by-field mapping
+and that mapping's ownership (this repo vs TradeRated) has to be settled.
+
+## Referral campaign creation body
+
+`src/st_exporter/outbox/campaign.py`, `ReferralCampaign._create`
+
+`POST /marketing/v2/tenant/{id}/campaigns` is sent `{"name": ..., "active": true}`.
+Whether ServiceTitan accepts a campaign that minimal — or additionally requires a
+business unit, a category, or a DNIS — is unconfirmed; no campaign has been created
+through this path yet. A rejection raises `CampaignResolutionError` naming the
+campaign, so the drain reports a cause rather than the opaque 400 it replaces.
+
+Also unconfirmed: whether the campaign list endpoint supports a server-side `name`
+filter. `_find` deliberately lists all campaigns and matches locally instead, because
+a filter ServiceTitan silently ignored would return page one of every campaign and
+could match the wrong row.

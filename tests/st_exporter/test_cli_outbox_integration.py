@@ -49,6 +49,16 @@ def test_drain_outbox_wires_real_clients_and_ledger_end_to_end(
     raw_cache_store = InMemorySheetsStore()
 
     mock_auth_token(st_settings.auth_url)
+    # A referral lead cannot be created without a campaignId, so the real wiring now
+    # resolves the referral campaign before posting the lead.
+    campaign_route = respx.get(
+        f"{st_settings.api_base}/marketing/v2/tenant/{st_settings.tenant_id}/campaigns"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"id": 31, "name": "TradeRated Referrals"}], "hasMore": False},
+        )
+    )
     lead_route = respx.post(
         f"{st_settings.api_base}/crm/v2/tenant/{st_settings.tenant_id}/leads"
     ).mock(return_value=httpx.Response(200, json={"id": 4242}))
@@ -95,7 +105,14 @@ def test_drain_outbox_wires_real_clients_and_ledger_end_to_end(
 
     assert claim_route.called
     assert claim_route.calls.last.request.headers["Authorization"] == f"Bearer {MACHINE_TOKEN}"
-    assert json.loads(lead_route.calls.last.request.content) == {"name": "Jane Doe"}
+    assert campaign_route.called, "the referral campaign must be resolved before the lead"
+    assert json.loads(lead_route.calls.last.request.content) == {
+        "name": "Jane Doe",
+        # Supplied by the exporter, not TradeRated: ServiceTitan rejects a lead without
+        # either field, and TradeRated's payload carries neither.
+        "campaignId": 31,
+        "summary": "Referral from TradeRated for Jane Doe",
+    }
 
     reports = {
         call.request.url.path: json.loads(call.request.content) for call in report_route.calls

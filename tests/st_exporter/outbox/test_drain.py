@@ -43,7 +43,9 @@ class TestDrainOutbox:
     def test_successful_referral_lead_is_recorded_and_reported(self, monkeypatch) -> None:
         item = OutboxItem(id="1", idempotency_key="key-1", kind="referral_lead", payload={})
         outbox_client = _outbox_client([item])
-        monkeypatch.setattr("st_exporter.outbox.drain.perform_item", lambda client, item: "st-999")
+        monkeypatch.setattr(
+            "st_exporter.outbox.drain.perform_item", lambda client, item, campaign=None: "st-999"
+        )
         ledger = OutboxLedger(InMemorySheetsStore())
 
         summary = drain_outbox(MagicMock(), outbox_client, ledger)
@@ -56,7 +58,7 @@ class TestDrainOutbox:
         item = OutboxItem(id="2", idempotency_key="key-2", kind="technician_rating", payload={})
         outbox_client = _outbox_client([item])
 
-        def _raise(client, item):
+        def _raise(client, item, campaign=None):
             raise UnsupportedOutboxKindError("technician_rating not supported")
 
         monkeypatch.setattr("st_exporter.outbox.drain.perform_item", _raise)
@@ -75,7 +77,7 @@ class TestDrainOutbox:
         bad = OutboxItem(id="2", idempotency_key="key-2", kind="referral_lead", payload={})
         outbox_client = _outbox_client([bad, good])
 
-        def _perform(client, item):
+        def _perform(client, item, campaign=None):
             if item.id == "2":
                 raise RuntimeError("network blip")
             return "st-1"
@@ -97,7 +99,8 @@ class TestDrainOutbox:
         ]
         outbox_client = _outbox_client(items)
         monkeypatch.setattr(
-            "st_exporter.outbox.drain.perform_item", lambda client, item: f"st-{item.id}"
+            "st_exporter.outbox.drain.perform_item",
+            lambda client, item, campaign=None: f"st-{item.id}",
         )
 
         store = _RecordingStore()
@@ -125,7 +128,8 @@ class TestDrainOutbox:
 
         outbox_client.report_result.side_effect = _report
         monkeypatch.setattr(
-            "st_exporter.outbox.drain.perform_item", lambda client, item: f"st-{item.id}"
+            "st_exporter.outbox.drain.perform_item",
+            lambda client, item, campaign=None: f"st-{item.id}",
         )
         store = InMemorySheetsStore()
 
@@ -149,7 +153,7 @@ class TestDrainOutbox:
         outbox_client = _outbox_client([bad, good])
         outbox_client.report_result.side_effect = [httpx.ConnectError("down"), None]
 
-        def _perform(client, item):
+        def _perform(client, item, campaign=None):
             if item.kind == "technician_rating":
                 raise UnsupportedOutboxKindError("technician_rating not supported")
             return "st-2"
@@ -174,7 +178,7 @@ class TestDrainOutbox:
         calls = []
         monkeypatch.setattr(
             "st_exporter.outbox.drain.perform_item",
-            lambda client, item: calls.append(item.id) or "st-999",
+            lambda client, item, campaign=None: calls.append(item.id) or "st-999",
         )
         drain_outbox(MagicMock(), outbox_client, ledger)
         assert calls == ["1"]
