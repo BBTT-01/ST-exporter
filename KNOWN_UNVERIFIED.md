@@ -173,9 +173,15 @@ Still unconfirmed:
   reproducible, not correct: campaign is the dimension ServiceTitan reports revenue
   by, so a customer with several business units may see referral revenue attributed
   to the wrong one. The pin exists for that, but nothing prompts them to set it.
-- Whether `marketing/categories` is the correct resource for a campaign's
-  `categoryId` — the CLI registry exposes it under the same module, which is
-  suggestive rather than confirmed.
+- ~~Whether `marketing/categories` is the correct resource for a campaign's
+  `categoryId`~~ — moot. Asking for it returned `403 Scope validation failed`: the
+  app is not granted that endpoint, and requesting the scope would send every
+  already-onboarded customer back to their Developer Portal. The category is now
+  borrowed from an existing campaign's own `categoryId` (campaigns read is already
+  granted), and `marketing/categories` remains only as a fallback whose 403 is
+  swallowed. **Unverified:** whether the campaigns list returns `categoryId`, a
+  nested `category: {id}`, or neither — all three are handled, the last by raising
+  and naming the pin.
 
 Also unconfirmed: whether the campaign list endpoint supports a server-side `name`
 filter. `_find` deliberately lists all campaigns and matches locally instead, because

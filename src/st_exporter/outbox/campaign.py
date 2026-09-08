@@ -143,21 +143,64 @@ class ReferralCampaign:
     def _resolve_category(self) -> int:
         """The marketing category the campaign is filed under.
 
-        Same rule and same escape hatch as the business unit. Categories are not created
-        here: creating one would need its own set of required fields, which is another
-        unverified guess, and every tenant ServiceTitan provisions already has some.
+        Read from an EXISTING campaign first, deliberately. The obvious source is
+        `marketing/categories`, but asking for it returned:
+
+            HTTP 403: Scope validation failed. Access token does not have permission
+            to access 'GET /tenant/{id}/categories'
+
+        Adding that scope would mean every Hosted customer, including ones already
+        onboarded, has to go back into their Developer Portal and grant one more box —
+        for a value their existing campaigns already carry. Campaigns read is a scope we
+        already hold, so the category is borrowed from a campaign that is already filed
+        under one.
+
+        The categories endpoint is still tried as a fallback for a tenant with no
+        campaigns at all, and its 403 is swallowed rather than raised: a missing optional
+        scope must not be reported as the reason the campaign could not be created.
         """
         override = self._override(_ENV_CATEGORY)
         if override is not None:
             return override
-        chosen = self._lowest_active_id("marketing", "categories")
+
+        borrowed = self._category_from_existing_campaign()
+        if borrowed is not None:
+            logger.info(
+                "referral campaign category resolved to %s (borrowed from an existing campaign)",
+                borrowed,
+            )
+            return borrowed
+
+        try:
+            chosen = self._lowest_active_id("marketing", "categories")
+        except Exception as exc:
+            logger.info("could not list marketing categories (%s); no category available", exc)
+            chosen = None
         if chosen is None:
             raise CampaignResolutionError(
-                f"the {self._name!r} campaign needs a categoryId and this tenant "
-                f"reported no active marketing categories; set {_ENV_CATEGORY} to pin one"
+                f"the {self._name!r} campaign needs a categoryId; this tenant has no "
+                f"campaign to borrow one from and its categories are not readable. Set "
+                f"{_ENV_CATEGORY} to pin one"
             )
         logger.info("referral campaign category resolved to %s", chosen)
         return chosen
+
+    def _category_from_existing_campaign(self) -> int | None:
+        """Lowest categoryId in use by an active campaign, or None if none carry one."""
+        ids: list[int] = []
+        for record in fetch_all(self._client, "marketing", "campaigns", page_size=_PAGE_SIZE):
+            if not record.get("active", True):
+                continue
+            raw = record.get("categoryId")
+            if raw is None and isinstance(record.get("category"), dict):
+                raw = record["category"].get("id")
+            if raw is None:
+                continue
+            try:
+                ids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        return min(ids) if ids else None
 
     @staticmethod
     def _override(env_name: str) -> int | None:
