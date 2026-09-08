@@ -62,13 +62,34 @@ jobs:
     steps:
       # A reusable (workflow_call) workflow runs in the CALLER's context, so a
       # bare checkout would fetch the caller's repo (which has no pyproject.toml)
-      # and `pip install -e .` would fail. Pin this repo explicitly, at the same
-      # tag this workflow file is published under — when a new tag is cut, this
-      # ref is bumped in the same commit, before re-tagging.
+      # and `pip install -e .` would fail. This repo is pinned explicitly.
+      #
+      # The REF is DERIVED, not hardcoded. It used to read `ref: exporter-v0.2.0`,
+      # with a comment instructing whoever cut a tag to bump it in the same commit.
+      # On 2026-09-08 that instruction was missed and the failure was invisible:
+      # exporter-v0.2.1 was cut, the caller repointed, and the run logs read
+      #
+      #     Uses: .../export.yml@refs/tags/exporter-v0.2.1
+      #     HEAD is now at c96d08a   <- v0.2.0's commit
+      #
+      # so the new workflow FILE ran while checking out the OLD code. A fix that
+      # was tagged, pinned and deployed had no effect, and every surface said it
+      # had. Nothing failed; the wrong code simply ran.
+      #
+      # GITHUB_WORKFLOW_REF is `owner/repo/path/to/workflow.yml@<ref>`, so the text
+      # after the last `@` is exactly the ref this file was published under. File
+      # and code can no longer disagree, and cutting a version is now a caller-side
+      # change only. Note `github.ref` would NOT work here — in a reusable workflow
+      # it names the CALLER's ref (`refs/heads/main` of the connector repo), which
+      # does not exist in this repository.
+      - name: Resolve this workflow's own ref
+        id: srcref
+        run: echo "ref=${GITHUB_WORKFLOW_REF##*@}" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
         with:
           repository: BBTT-01/ST-exporter
-          ref: exporter-v0.2.0
+          ref: ${{ steps.srcref.outputs.ref }}
 
       - uses: actions/setup-python@v5
         with:
