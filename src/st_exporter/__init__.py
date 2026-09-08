@@ -10,4 +10,4 @@ assumptions that need confirming once real ServiceTitan credentials exist.
 
 from __future__ import annotations
 
-EXPORTER_VERSION = "0.2.3"
+EXPORTER_VERSION = "0.2.4"

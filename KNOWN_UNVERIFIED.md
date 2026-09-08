@@ -145,15 +145,37 @@ the error may simply be reporting the first failing validation. If a second 400
 appears naming different fields, the payload needs a real field-by-field mapping
 and that mapping's ownership (this repo vs TradeRated) has to be settled.
 
-## Referral campaign creation body
+## ~~Referral campaign creation body~~ — PARTLY RESOLVED 2026-09-08
 
 `src/st_exporter/outbox/campaign.py`, `ReferralCampaign._create`
 
-`POST /marketing/v2/tenant/{id}/campaigns` is sent `{"name": ..., "active": true}`.
-Whether ServiceTitan accepts a campaign that minimal — or additionally requires a
-business unit, a category, or a DNIS — is unconfirmed; no campaign has been created
-through this path yet. A rejection raises `CampaignResolutionError` naming the
-campaign, so the drain reports a cause rather than the opaque 400 it replaces.
+**Tested against a real tenant; a name-only body is refused.** The first create
+attempt returned:
+
+```
+categoryId:     Required property 'categoryId' not found
+businessUnitId: Required property 'businessUnitId' not found
+```
+
+Both are now resolved from the tenant — lowest active id from
+`settings/business-units` and `marketing/categories` respectively — so a new Hosted
+customer's first referral succeeds with nothing configured. Each choice is logged,
+and either can be pinned with `TRADERATED_CAMPAIGN_BUSINESS_UNIT_ID` /
+`TRADERATED_CAMPAIGN_CATEGORY_ID`.
+
+Still unconfirmed:
+
+- **Whether those two are the only additions required.** The same 400 also carried
+  `"request": ["The request field is required."]`, which reads like the ASP.NET model
+  binder naming the root object rather than a real field, but it may not be. `dnis`
+  is a plausible further requirement.
+- **Whether lowest-active-id is the right business unit.** It is deterministic and
+  reproducible, not correct: campaign is the dimension ServiceTitan reports revenue
+  by, so a customer with several business units may see referral revenue attributed
+  to the wrong one. The pin exists for that, but nothing prompts them to set it.
+- Whether `marketing/categories` is the correct resource for a campaign's
+  `categoryId` — the CLI registry exposes it under the same module, which is
+  suggestive rather than confirmed.
 
 Also unconfirmed: whether the campaign list endpoint supports a server-side `name`
 filter. `_find` deliberately lists all campaigns and matches locally instead, because

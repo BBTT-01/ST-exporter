@@ -18,6 +18,7 @@ per run, so a batch of ten referrals costs one campaign lookup rather than ten.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from st_cli.client import ServiceTitanClient
@@ -27,6 +28,12 @@ from st_exporter.logging_setup import logger
 REFERRAL_CAMPAIGN_NAME = "TradeRated Referrals"
 
 _PAGE_SIZE = 200
+
+# Overrides, for correcting attribution without a release. A customer with several
+# business units may want referrals booked against a specific one; ServiceTitan reports
+# revenue by campaign, so that choice is theirs to make and ours to honour.
+_ENV_BUSINESS_UNIT = "TRADERATED_CAMPAIGN_BUSINESS_UNIT_ID"
+_ENV_CATEGORY = "TRADERATED_CAMPAIGN_CATEGORY_ID"
 
 
 class CampaignResolutionError(Exception):
@@ -71,13 +78,33 @@ class ReferralCampaign:
     def _create(self) -> int:
         """Create the campaign. Runs at most once per tenant, on the first referral.
 
-        The request body is a documented guess — see KNOWN_UNVERIFIED.md. If ServiceTitan
-        requires more than a name (a business unit, a category, a DNIS), this raises with
-        ServiceTitan's own message rather than a generic failure, so the drain reports a
-        cause a human can act on instead of the opaque 400 this replaces.
+        ServiceTitan requires more than a name. The first live attempt (2026-09-08) was
+        refused with:
+
+            categoryId:     Required property 'categoryId' not found
+            businessUnitId: Required property 'businessUnitId' not found
+
+        Both are resolved from the tenant rather than asked for at onboarding, so a new
+        Hosted customer's first referral succeeds without anyone having configured
+        anything. Each resolution is logged, because these two ids decide how the
+        customer's own reporting attributes referral revenue — a silent default would be
+        a silent misattribution.
         """
-        body: dict[str, Any] = {"name": self._name, "active": True}
-        logger.info("referral campaign %r not found; creating it", self._name)
+        business_unit_id = self._resolve_business_unit()
+        category_id = self._resolve_category()
+
+        body: dict[str, Any] = {
+            "name": self._name,
+            "active": True,
+            "businessUnitId": business_unit_id,
+            "categoryId": category_id,
+        }
+        logger.info(
+            "creating referral campaign %r (businessUnitId=%s categoryId=%s)",
+            self._name,
+            business_unit_id,
+            category_id,
+        )
         try:
             created = self._client.post("marketing", "campaigns", json_body=body)
         except Exception as exc:
@@ -92,3 +119,70 @@ class ReferralCampaign:
             )
         logger.info("referral campaign %r created with id %s", self._name, campaign_id)
         return int(campaign_id)
+
+    def _resolve_business_unit(self) -> int:
+        """The business unit the campaign is booked against.
+
+        Deterministic by lowest id among active units, so repeated runs and repeated
+        customers behave the same way and the choice is reproducible from the log. A
+        customer who wants a different one sets TRADERATED_CAMPAIGN_BUSINESS_UNIT_ID;
+        nothing here needs changing for that.
+        """
+        override = self._override(_ENV_BUSINESS_UNIT)
+        if override is not None:
+            return override
+        chosen = self._lowest_active_id("settings", "business-units")
+        if chosen is None:
+            raise CampaignResolutionError(
+                f"the {self._name!r} campaign needs a businessUnitId and this tenant "
+                f"reported no active business units; set {_ENV_BUSINESS_UNIT} to pin one"
+            )
+        logger.info("referral campaign business unit resolved to %s", chosen)
+        return chosen
+
+    def _resolve_category(self) -> int:
+        """The marketing category the campaign is filed under.
+
+        Same rule and same escape hatch as the business unit. Categories are not created
+        here: creating one would need its own set of required fields, which is another
+        unverified guess, and every tenant ServiceTitan provisions already has some.
+        """
+        override = self._override(_ENV_CATEGORY)
+        if override is not None:
+            return override
+        chosen = self._lowest_active_id("marketing", "categories")
+        if chosen is None:
+            raise CampaignResolutionError(
+                f"the {self._name!r} campaign needs a categoryId and this tenant "
+                f"reported no active marketing categories; set {_ENV_CATEGORY} to pin one"
+            )
+        logger.info("referral campaign category resolved to %s", chosen)
+        return chosen
+
+    @staticmethod
+    def _override(env_name: str) -> int | None:
+        raw = (os.environ.get(env_name) or "").strip()
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise CampaignResolutionError(
+                f"{env_name} must be a numeric ServiceTitan id, got {raw!r}"
+            ) from exc
+        logger.info("%s pinned to %s by configuration", env_name, value)
+        return value
+
+    def _lowest_active_id(self, module: str, resource: str) -> int | None:
+        """Lowest id among records that are not explicitly inactive.
+
+        `active` absent is treated as active: these list endpoints are not guaranteed to
+        return the field, and excluding a record for a missing flag would be worse than
+        including it — the alternative is failing to create the campaign at all.
+        """
+        ids = [
+            int(record["id"])
+            for record in fetch_all(self._client, module, resource, page_size=_PAGE_SIZE)
+            if "id" in record and record.get("active", True)
+        ]
+        return min(ids) if ids else None
