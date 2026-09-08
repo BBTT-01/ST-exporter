@@ -106,13 +106,13 @@ def test_drain_outbox_wires_real_clients_and_ledger_end_to_end(
     assert claim_route.called
     assert claim_route.calls.last.request.headers["Authorization"] == f"Bearer {MACHINE_TOKEN}"
     assert campaign_route.called, "the referral campaign must be resolved before the lead"
-    assert json.loads(lead_route.calls.last.request.content) == {
-        "name": "Jane Doe",
-        # Supplied by the exporter, not TradeRated: ServiceTitan rejects a lead without
-        # either field, and TradeRated's payload carries neither.
-        "campaignId": 31,
-        "summary": "Referral from TradeRated for Jane Doe",
-    }
+    lead_body = json.loads(lead_route.calls.last.request.content)
+    # Supplied by the exporter, not TradeRated: ServiceTitan rejects a lead without any of
+    # these three, and TradeRated's payload carries none of them.
+    assert lead_body["name"] == "Jane Doe"
+    assert lead_body["campaignId"] == 31
+    assert lead_body["summary"] == "Referral from TradeRated for Jane Doe"
+    assert lead_body["followUpDate"]
 
     reports = {
         call.request.url.path: json.loads(call.request.content) for call in report_route.calls

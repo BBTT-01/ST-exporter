@@ -16,6 +16,7 @@ an open question for the spec owner.
 
 from __future__ import annotations
 
+from datetime import date, datetime, timezone
 from typing import Any
 
 from st_cli.client import ServiceTitanClient
@@ -66,8 +67,17 @@ def _perform_referral_lead(
     TradeRated's payload is its own snake_case shape (`name`, `phone`, `address`,
     `referred_by`) and carries neither required field, so the exporter now supplies both.
 
-    Only ABSENT keys are filled. A `campaignId` or `summary` TradeRated chooses to send
-    wins, so this cannot silently override a future decision made on that side.
+    `followUpDate` is the third field ServiceTitan demands, discovered the same way:
+
+        400: Follow up date or Call Reason ID is required.
+
+    It is an either/or with `callReasonId`, so this sets neither when TradeRated has
+    already sent one of them. `followUpDate` is the half chosen because it needs no
+    further lookup and no further scope — `callReasonId` would require reading
+    `crm/call-reasons`, which is very likely un-granted, exactly like `marketing/categories`.
+
+    Only ABSENT keys are filled. A `campaignId`, `summary` or follow-up TradeRated chooses
+    to send wins, so this cannot silently override a future decision made on that side.
     """
     body = dict(item.payload)
     # Explicit membership tests, NOT `setdefault`: setdefault evaluates its default
@@ -78,9 +88,26 @@ def _perform_referral_lead(
         body["campaignId"] = campaign.campaign_id()
     if "summary" not in body:
         body["summary"] = _summary(item.payload)
+    if "followUpDate" not in body and "callReasonId" not in body:
+        body["followUpDate"] = _today().isoformat()
 
     created = client.post("crm", "leads", json_body=body)
     return str(created["id"])
+
+
+def _today() -> date:
+    """Today in UTC. Separate function so tests can pin it.
+
+    A referral is warmest the moment it arrives, so the follow-up date is today rather
+    than a future date: it lands in the customer's Follow Ups list immediately instead of
+    after someone else has already called the homeowner.
+
+    UTC, not the customer's timezone, because the exporter has no access to it — a
+    referral queued late in the US evening therefore gets tomorrow's date. That shifts
+    the follow-up by one day at worst and is the reason this is a named function rather
+    than an inline call.
+    """
+    return datetime.now(timezone.utc).date()
 
 
 def _summary(payload: dict[str, Any]) -> str:
