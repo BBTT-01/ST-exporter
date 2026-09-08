@@ -62,34 +62,24 @@ jobs:
     steps:
       # A reusable (workflow_call) workflow runs in the CALLER's context, so a
       # bare checkout would fetch the caller's repo (which has no pyproject.toml)
-      # and `pip install -e .` would fail. This repo is pinned explicitly.
+      # and `pip install -e .` would fail. This repo and ref are pinned explicitly.
       #
-      # The REF is DERIVED, not hardcoded. It used to read `ref: exporter-v0.2.0`,
-      # with a comment instructing whoever cut a tag to bump it in the same commit.
-      # On 2026-09-08 that instruction was missed and the failure was invisible:
-      # exporter-v0.2.1 was cut, the caller repointed, and the run logs read
+      # The ref is a LITERAL, and it has to be. There is no GitHub context that
+      # names a called reusable workflow's own ref: `github.ref`, `github.sha` and
+      # `GITHUB_WORKFLOW_REF` all describe the CALLER. Deriving it from
+      # GITHUB_WORKFLOW_REF was tried on 2026-09-08 and resolved to
+      # `refs/heads/main` — the connector repo's branch name — which silently
+      # checked out this repo's `main` and ran an exporter with no `--feeds` flag.
       #
-      #     Uses: .../export.yml@refs/tags/exporter-v0.2.1
-      #     HEAD is now at c96d08a   <- v0.2.0's commit
-      #
-      # so the new workflow FILE ran while checking out the OLD code. A fix that
-      # was tagged, pinned and deployed had no effect, and every surface said it
-      # had. Nothing failed; the wrong code simply ran.
-      #
-      # GITHUB_WORKFLOW_REF is `owner/repo/path/to/workflow.yml@<ref>`, so the text
-      # after the last `@` is exactly the ref this file was published under. File
-      # and code can no longer disagree, and cutting a version is now a caller-side
-      # change only. Note `github.ref` would NOT work here — in a reusable workflow
-      # it names the CALLER's ref (`refs/heads/main` of the connector repo), which
-      # does not exist in this repository.
-      - name: Resolve this workflow's own ref
-        id: srcref
-        run: echo "ref=${GITHUB_WORKFLOW_REF##*@}" >> "$GITHUB_OUTPUT"
-
+      # So: bump this literal in the same commit that a new tag is cut from. The
+      # step below exists because that instruction was already missed once, and
+      # the failure was invisible — v0.2.1 was cut, the caller repointed, and the
+      # run logged `Uses: ...@exporter-v0.2.1` while `HEAD is now at c96d08a`
+      # named v0.2.0's commit. The wrong code ran successfully.
       - uses: actions/checkout@v4
         with:
           repository: BBTT-01/ST-exporter
-          ref: ${{ steps.srcref.outputs.ref }}
+          ref: exporter-v0.2.3
 
       - uses: actions/setup-python@v5
         with:
@@ -97,6 +87,25 @@ jobs:
 
       - name: Install
         run: pip install -e .
+
+      # The pinned tag above and the code it fetches can drift, and when they do
+      # nothing errors — the wrong exporter just runs. This turns that into a hard
+      # failure: EXPORTER_VERSION is bumped in the same commit a tag is cut from,
+      # so a mismatch means `ref:` points somewhere other than this file's own tag.
+      # It is also the version stamped into the Export Store's `_meta` tab, so the
+      # Sheet itself records which exporter wrote it.
+      - name: Verify the checked-out exporter matches the pinned tag
+        env:
+          EXPECTED_EXPORTER_VERSION: "0.2.3"
+        run: |
+          actual="$(python -c 'from st_exporter import EXPORTER_VERSION; print(EXPORTER_VERSION)')"
+          if [ "$actual" != "$EXPECTED_EXPORTER_VERSION" ]; then
+            echo "::error::exporter version mismatch — this workflow expects" \
+                 "$EXPECTED_EXPORTER_VERSION but the checked-out code is $actual." \
+                 "The 'ref:' in the checkout step is pointing at the wrong commit."
+            exit 1
+          fi
+          echo "exporter $actual matches the pinned tag"
 
       - name: Run export
         env:
