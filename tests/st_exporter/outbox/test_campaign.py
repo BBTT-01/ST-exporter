@@ -27,6 +27,26 @@ def _campaigns_url(st_settings: Settings) -> str:
     return f"{st_settings.api_base}/marketing/v2/tenant/{st_settings.tenant_id}/campaigns"
 
 
+def _units_url(st_settings: Settings) -> str:
+    return f"{st_settings.api_base}/settings/v2/tenant/{st_settings.tenant_id}/business-units"
+
+
+def _categories_url(st_settings: Settings) -> str:
+    return f"{st_settings.api_base}/marketing/v2/tenant/{st_settings.tenant_id}/categories"
+
+
+def _page(records: list[dict]) -> httpx.Response:
+    return httpx.Response(200, json={"data": records, "hasMore": False})
+
+
+@pytest.fixture(autouse=True)
+def _no_pinned_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The overrides are read from the process environment, so a value left set by the
+    # host would silently skip the resolution these tests exist to cover.
+    monkeypatch.delenv("TRADERATED_CAMPAIGN_BUSINESS_UNIT_ID", raising=False)
+    monkeypatch.delenv("TRADERATED_CAMPAIGN_CATEGORY_ID", raising=False)
+
+
 class TestExistingCampaign:
     @respx.mock
     def test_finds_the_campaign_by_name(self, st_settings: Settings) -> None:
@@ -104,6 +124,12 @@ class TestFirstRun:
                 200, json={"data": [{"id": 1, "name": "Truck Wraps"}], "hasMore": False}
             )
         )
+        respx.get(_units_url(st_settings)).mock(
+            return_value=_page([{"id": 9, "active": True}, {"id": 4, "active": True}])
+        )
+        respx.get(_categories_url(st_settings)).mock(
+            return_value=_page([{"id": 31, "active": True}, {"id": 77, "active": True}])
+        )
         created = respx.post(_campaigns_url(st_settings)).mock(
             return_value=httpx.Response(200, json={"id": 500})
         )
@@ -114,9 +140,13 @@ class TestFirstRun:
         finally:
             client.close()
 
+        # ServiceTitan refused a name-only body on 2026-09-08 with `categoryId` and
+        # `businessUnitId` both reported missing; both are now resolved from the tenant.
         assert json.loads(created.calls.last.request.content) == {
             "name": REFERRAL_CAMPAIGN_NAME,
             "active": True,
+            "businessUnitId": 4,
+            "categoryId": 31,
         }
 
     @respx.mock
@@ -127,8 +157,10 @@ class TestFirstRun:
         respx.get(_campaigns_url(st_settings)).mock(
             return_value=httpx.Response(200, json={"data": [], "hasMore": False})
         )
+        respx.get(_units_url(st_settings)).mock(return_value=_page([{"id": 1}]))
+        respx.get(_categories_url(st_settings)).mock(return_value=_page([{"id": 2}]))
         respx.post(_campaigns_url(st_settings)).mock(
-            return_value=httpx.Response(400, json={"title": "businessUnitId required"})
+            return_value=httpx.Response(400, json={"title": "dnis required"})
         )
 
         client = ServiceTitanClient(st_settings)
@@ -146,6 +178,8 @@ class TestFirstRun:
         respx.get(_campaigns_url(st_settings)).mock(
             return_value=httpx.Response(200, json={"data": [], "hasMore": False})
         )
+        respx.get(_units_url(st_settings)).mock(return_value=_page([{"id": 1}]))
+        respx.get(_categories_url(st_settings)).mock(return_value=_page([{"id": 2}]))
         respx.post(_campaigns_url(st_settings)).mock(
             return_value=httpx.Response(200, json={"ok": True})
         )
@@ -193,3 +227,115 @@ class TestCaching:
             client.close()
 
         assert not listed.called
+
+
+class TestRequiredIdResolution:
+    @respx.mock
+    def test_inactive_records_are_skipped_and_the_lowest_id_wins(
+        self, st_settings: Settings
+    ) -> None:
+        # Deterministic by lowest active id, so two runs — and two customers — behave the
+        # same way and the choice is reproducible from the run log.
+        mock_auth_token(st_settings.auth_url)
+        respx.get(_campaigns_url(st_settings)).mock(return_value=_page([]))
+        respx.get(_units_url(st_settings)).mock(
+            return_value=_page([{"id": 2, "active": False}, {"id": 8, "active": True}])
+        )
+        respx.get(_categories_url(st_settings)).mock(
+            return_value=_page([{"id": 3, "active": False}, {"id": 5, "active": True}])
+        )
+        created = respx.post(_campaigns_url(st_settings)).mock(
+            return_value=httpx.Response(200, json={"id": 1})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            ReferralCampaign(client).campaign_id()
+        finally:
+            client.close()
+
+        body = json.loads(created.calls.last.request.content)
+        assert body["businessUnitId"] == 8
+        assert body["categoryId"] == 5
+
+    @respx.mock
+    def test_a_missing_active_flag_counts_as_active(self, st_settings: Settings) -> None:
+        # These list endpoints are not guaranteed to return `active`; dropping a record for
+        # a missing flag would fail the campaign outright, which is strictly worse.
+        mock_auth_token(st_settings.auth_url)
+        respx.get(_campaigns_url(st_settings)).mock(return_value=_page([]))
+        respx.get(_units_url(st_settings)).mock(return_value=_page([{"id": 6}]))
+        respx.get(_categories_url(st_settings)).mock(return_value=_page([{"id": 7}]))
+        created = respx.post(_campaigns_url(st_settings)).mock(
+            return_value=httpx.Response(200, json={"id": 1})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            ReferralCampaign(client).campaign_id()
+        finally:
+            client.close()
+
+        body = json.loads(created.calls.last.request.content)
+        assert body["businessUnitId"] == 6
+        assert body["categoryId"] == 7
+
+    @respx.mock
+    def test_pinned_ids_win_and_skip_the_lookups(
+        self, st_settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A customer with several business units decides which one referral revenue lands
+        # against; pinning must need no code change and no API call.
+        monkeypatch.setenv("TRADERATED_CAMPAIGN_BUSINESS_UNIT_ID", "111")
+        monkeypatch.setenv("TRADERATED_CAMPAIGN_CATEGORY_ID", "222")
+        mock_auth_token(st_settings.auth_url)
+        respx.get(_campaigns_url(st_settings)).mock(return_value=_page([]))
+        units = respx.get(_units_url(st_settings))
+        cats = respx.get(_categories_url(st_settings))
+        created = respx.post(_campaigns_url(st_settings)).mock(
+            return_value=httpx.Response(200, json={"id": 1})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            ReferralCampaign(client).campaign_id()
+        finally:
+            client.close()
+
+        body = json.loads(created.calls.last.request.content)
+        assert body["businessUnitId"] == 111
+        assert body["categoryId"] == 222
+        assert not units.called
+        assert not cats.called
+
+    @respx.mock
+    def test_a_non_numeric_pin_is_rejected_by_name(
+        self, st_settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TRADERATED_CAMPAIGN_BUSINESS_UNIT_ID", "the big one")
+        mock_auth_token(st_settings.auth_url)
+        respx.get(_campaigns_url(st_settings)).mock(return_value=_page([]))
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(
+                CampaignResolutionError, match="TRADERATED_CAMPAIGN_BUSINESS_UNIT_ID"
+            ):
+                ReferralCampaign(client).campaign_id()
+        finally:
+            client.close()
+
+    @respx.mock
+    def test_no_business_units_names_the_variable_to_set(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(_campaigns_url(st_settings)).mock(return_value=_page([]))
+        respx.get(_units_url(st_settings)).mock(return_value=_page([]))
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(
+                CampaignResolutionError, match="TRADERATED_CAMPAIGN_BUSINESS_UNIT_ID"
+            ):
+                ReferralCampaign(client).campaign_id()
+        finally:
+            client.close()
