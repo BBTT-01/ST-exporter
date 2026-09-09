@@ -79,7 +79,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: BBTT-01/ST-exporter
-          ref: exporter-v0.2.6
+          ref: exporter-v0.2.7
 
       - uses: actions/setup-python@v5
         with:
