@@ -67,7 +67,7 @@ jobs:
       # checkout ref and the expected version the guard asserts — is derived
       # from this string.
       # ---------------------------------------------------------------------
-      EXPORTER_TAG: exporter-v0.2.7
+      EXPORTER_TAG: exporter-v0.2.8
     steps:
       # A reusable (workflow_call) workflow runs in the CALLER's context, so a
       # bare checkout would fetch the caller's repo (which has no pyproject.toml)

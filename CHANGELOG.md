@@ -4,7 +4,7 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] · One place to bump the version
+## [0.2.8] — 2026-09-09 · One place to bump the version
 
 The version was written in four places — `pyproject.toml`, `EXPORTER_VERSION`,
 the workflow's `EXPECTED_EXPORTER_VERSION`, and the workflow's checkout `ref:`.
