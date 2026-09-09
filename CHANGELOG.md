@@ -4,6 +4,31 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [0.2.7] — 2026-09-09 · Multi-technician jobs reach the whole crew
+
+**The `jobs` tab is now one row per assigned technician, not one per appointment.**
+
+ServiceTitan supports multi-technician appointments — an install crew of three is
+one appointment with three live assignments. The exporter previously resolved a
+single `st_technician_id` per appointment (latest `assignedOn`, ties on lowest id)
+because the contract has one such column, so the rest of the crew silently lost
+the job. Found on job 21465348, a three-technician install where two of the three
+technicians could not see their own work.
+
+- `_active_technician_id` → `_active_technician_ids`, returning every assigned
+  technician; `build_job_rows` emits one row each.
+- Removal is now resolved **per technician**. The assignment feed is append-only,
+  so an unassigned technician still has a live `Active` record in it; only their
+  LATEST event counts. Filtering removal rows alone would have resurrected them.
+- An appointment with no assigned technician still emits one row with a null
+  `st_technician_id`, unchanged.
+
+**Column set is unchanged**, but `st_appointment_id` is no longer unique in the
+tab. Consumers must key on (`st_technician_id`, `st_job_id`). Expect row counts to
+grow with average crew size.
+
+Closes the `KNOWN_UNVERIFIED.md` entry on the multi-tech tie-break rule.
+
 ## [0.2.0] — 2026-06-03 · Full ServiceTitan API coverage
 
 The headline release: `st` and `st-mcp` now span the **entire ServiceTitan REST
