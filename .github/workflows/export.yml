@@ -96,7 +96,7 @@ jobs:
       # Sheet itself records which exporter wrote it.
       - name: Verify the checked-out exporter matches the pinned tag
         env:
-          EXPECTED_EXPORTER_VERSION: "0.2.6"
+          EXPECTED_EXPORTER_VERSION: "0.2.7"
         run: |
           actual="$(python -c 'from st_exporter import EXPORTER_VERSION; print(EXPORTER_VERSION)')"
           if [ "$actual" != "$EXPECTED_EXPORTER_VERSION" ]; then
