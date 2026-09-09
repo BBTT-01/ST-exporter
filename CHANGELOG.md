@@ -4,6 +4,53 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [0.2.8] — 2026-09-09 · One place to bump the version
+
+The version was written in four places — `pyproject.toml`, `EXPORTER_VERSION`,
+the workflow's `EXPECTED_EXPORTER_VERSION`, and the workflow's checkout `ref:`.
+Cutting 0.2.7 missed two of them in a row, and 0.2.1 shipped the wrong code
+because the same bump was missed silently.
+
+Now two, and never edited by hand:
+
+- `EXPORTER_VERSION` reads the installed distribution metadata, so
+  `pyproject.toml` is its single source. The workflow installs the code it just
+  checked out, so it always describes *that* code.
+- The workflow has one literal, `EXPORTER_TAG`. The checkout ref and the guard's
+  expected version are both derived from it, so they cannot disagree. A tag not
+  matching `exporter-vX.Y.Z` now fails the run rather than deriving nonsense.
+- `scripts/release.sh <version>` bumps both files and verifies both landed.
+
+The remaining literal stays because no *proven* GitHub context names a called
+reusable workflow's own ref — `GITHUB_WORKFLOW_REF` was tried and resolved to the
+caller's branch. A diagnostic step now records what `github.job_workflow_ref`
+actually resolves to on a real run, so it can be removed on evidence.
+
+## [0.2.7] — 2026-09-09 · Multi-technician jobs reach the whole crew
+
+**The `jobs` tab is now one row per assigned technician, not one per appointment.**
+
+ServiceTitan supports multi-technician appointments — an install crew of three is
+one appointment with three live assignments. The exporter previously resolved a
+single `st_technician_id` per appointment (latest `assignedOn`, ties on lowest id)
+because the contract has one such column, so the rest of the crew silently lost
+the job. Found on job 21465348, a three-technician install where two of the three
+technicians could not see their own work.
+
+- `_active_technician_id` → `_active_technician_ids`, returning every assigned
+  technician; `build_job_rows` emits one row each.
+- Removal is now resolved **per technician**. The assignment feed is append-only,
+  so an unassigned technician still has a live `Active` record in it; only their
+  LATEST event counts. Filtering removal rows alone would have resurrected them.
+- An appointment with no assigned technician still emits one row with a null
+  `st_technician_id`, unchanged.
+
+**Column set is unchanged**, but `st_appointment_id` is no longer unique in the
+tab. Consumers must key on (`st_technician_id`, `st_job_id`). Expect row counts to
+grow with average crew size.
+
+Closes the `KNOWN_UNVERIFIED.md` entry on the multi-tech tie-break rule.
+
 ## [0.2.0] — 2026-06-03 · Full ServiceTitan API coverage
 
 The headline release: `st` and `st-mcp` now span the **entire ServiceTitan REST

@@ -9,14 +9,15 @@ plain wrapper function).
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import httpx
 import pydantic
 import pytest
 
 from st_cli.exceptions import ConfigError
 from st_exporter.cli import main
-from st_exporter.run import ExportSummary
+from st_exporter.run import DEFAULT_FEEDS, ExportSummary
 
 _ARGV0 = "st-export"
 
@@ -33,6 +34,7 @@ class TestSuccessPath:
         with (
             patch("st_exporter.cli.load_settings", return_value="fake-st-settings"),
             patch("st_exporter.cli.ExporterSettings", return_value="fake-exporter-settings"),
+            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=False)),
             patch("st_exporter.cli.run_export", return_value=_summary()) as mock_run,
             pytest.raises(SystemExit) as exc_info,
         ):
@@ -41,7 +43,11 @@ class TestSuccessPath:
         assert exc_info.value.code == 0
         assert "jobs=3 technicians=2 skipped_no_job=0 dry_run=False" in capsys.readouterr().out
         mock_run.assert_called_once_with(
-            "fake-st-settings", "fake-exporter-settings", pricebook=False, dry_run=False
+            "fake-st-settings",
+            "fake-exporter-settings",
+            feeds=DEFAULT_FEEDS,
+            pricebook=False,
+            dry_run=False,
         )
 
     def test_dry_run_flag_is_passed_through(self, monkeypatch) -> None:
@@ -49,16 +55,37 @@ class TestSuccessPath:
         with (
             patch("st_exporter.cli.load_settings", return_value="s"),
             patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=False)),
             patch("st_exporter.cli.run_export", return_value=_summary(dry_run=True)) as mock_run,
             pytest.raises(SystemExit) as exc_info,
         ):
             main()
 
         assert exc_info.value.code == 0
-        mock_run.assert_called_once_with("s", "e", pricebook=False, dry_run=True)
+        mock_run.assert_called_once_with(
+            "s", "e", feeds=DEFAULT_FEEDS, pricebook=False, dry_run=True
+        )
 
     def test_pricebook_flag_is_passed_through(self, monkeypatch) -> None:
         monkeypatch.setattr("sys.argv", [_ARGV0, "--pricebook"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=False)),
+            patch("st_exporter.cli.run_export", return_value=_summary()) as mock_run,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 0
+        mock_run.assert_called_once_with(
+            "s", "e", feeds=DEFAULT_FEEDS, pricebook=True, dry_run=False
+        )
+
+
+class TestFeedsFlag:
+    def test_feeds_flag_is_parsed_and_passed_through(self, monkeypatch) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "jobs"])
         with (
             patch("st_exporter.cli.load_settings", return_value="s"),
             patch("st_exporter.cli.ExporterSettings", return_value="e"),
@@ -68,7 +95,23 @@ class TestSuccessPath:
             main()
 
         assert exc_info.value.code == 0
-        mock_run.assert_called_once_with("s", "e", pricebook=True, dry_run=False)
+        mock_run.assert_called_once_with(
+            "s", "e", feeds=frozenset({"jobs"}), pricebook=False, dry_run=False
+        )
+
+    def test_invalid_feeds_value_prints_clean_error_and_exits_one(
+        self, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "not-a-feed"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 1
+        assert "Error:" in capsys.readouterr().err
 
 
 class TestErrorHandling:
@@ -101,3 +144,92 @@ class TestErrorHandling:
 
         assert exc_info.value.code == 1
         assert "Error:" in capsys.readouterr().err
+
+
+class TestOutboxDrain:
+    def test_drains_outbox_when_configured_and_not_dry_run(self, monkeypatch) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0])
+        fake_traderated_settings = MagicMock(configured=True)
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.TradeRatedSettings", return_value=fake_traderated_settings),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            patch("st_exporter.cli._drain_outbox") as mock_drain,
+            pytest.raises(SystemExit),
+        ):
+            main()
+        mock_drain.assert_called_once_with("s", "e", fake_traderated_settings)
+
+    def test_skips_outbox_drain_when_not_configured(self, monkeypatch) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0])
+        fake_traderated_settings = MagicMock(configured=False)
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.TradeRatedSettings", return_value=fake_traderated_settings),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            patch("st_exporter.cli._drain_outbox") as mock_drain,
+            pytest.raises(SystemExit),
+        ):
+            main()
+        mock_drain.assert_not_called()
+
+    def test_outbox_failure_does_not_fail_the_run_or_print_a_traceback(
+        self, monkeypatch, capsys
+    ) -> None:
+        """The export's Sheets writes are already committed by the time the drain
+        runs, so an outbox error must exit 0 with the export summary — not a raw
+        httpx traceback (which main()'s STCLIError/ValidationError handler would
+        not catch)."""
+        monkeypatch.setattr("sys.argv", [_ARGV0])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=True)),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            patch(
+                "st_exporter.cli._drain_outbox",
+                side_effect=httpx.ConnectError("outbox unreachable"),
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "jobs=3 technicians=2" in captured.out
+        assert "outbox_claimed" not in captured.out
+        assert "Traceback" not in captured.err
+
+    def test_outbox_keyboard_interrupt_is_not_swallowed(self, monkeypatch, capsys) -> None:
+        """`except Exception` must let KeyboardInterrupt/SystemExit through — it
+        reaches click, which turns it into its standard abort exit code 130, not
+        the exit-0-with-a-summary of the swallowed-error path."""
+        monkeypatch.setattr("sys.argv", [_ARGV0])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=True)),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            patch("st_exporter.cli._drain_outbox", side_effect=KeyboardInterrupt),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 130
+        assert "jobs=3" not in capsys.readouterr().out
+
+    def test_skips_outbox_drain_on_dry_run_even_if_configured(self, monkeypatch) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--dry-run"])
+        fake_traderated_settings = MagicMock(configured=True)
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.TradeRatedSettings", return_value=fake_traderated_settings),
+            patch("st_exporter.cli.run_export", return_value=_summary(dry_run=True)),
+            patch("st_exporter.cli._drain_outbox") as mock_drain,
+            pytest.raises(SystemExit),
+        ):
+            main()
+        mock_drain.assert_not_called()

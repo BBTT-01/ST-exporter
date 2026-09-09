@@ -1,0 +1,156 @@
+name: Export
+
+on:
+  workflow_call:
+    inputs:
+      feeds:
+        description: "Comma-separated feeds to run: jobs, technicians, or both"
+        type: string
+        default: "jobs,technicians"
+      window:
+        description: "Job window in days (appointment_start within last N days or future)"
+        type: number
+        default: 90
+      target:
+        description: "Export target; only 'sheets' is supported today"
+        type: string
+        default: "sheets"
+      pricebook:
+        description: "Reserved; has no effect (the CLI has no price-book commands)"
+        type: boolean
+        default: false
+    secrets:
+      ST_CLIENT_ID:
+        required: true
+      ST_CLIENT_SECRET:
+        required: true
+      ST_APP_KEY:
+        required: true
+      ST_TENANT_ID:
+        required: true
+      GOOGLE_SERVICE_ACCOUNT_JSON:
+        required: true
+      GOOGLE_SHEET_ID:
+        required: true
+      GOOGLE_RAW_CACHE_SHEET_ID:
+        required: true
+      TRADERATED_MACHINE_TOKEN:
+        required: false
+      TRADERATED_OUTBOX_BASE_URL:
+        required: false
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.target == 'sheets' }}
+    # The jobs feed runs every 5 minutes and technicians every 30, and a large
+    # tenant's first full drain can exceed 5 minutes — so runs really can
+    # overlap. Both write the same `_meta` grid and may drain the same
+    # `_outbox_ledger` tab, each via read-then-full-replace, so an overlapping
+    # run can read stale state and silently roll back the other's cursor/ledger
+    # writes. Serialize instead. `github.repository` is the CALLING repo, so
+    # each customer gets their own group: a customer never collides with
+    # themselves, and different customers never block each other.
+    # cancel-in-progress: false — killing a run mid-drain is exactly the
+    # crash the ledger has to recover from; better to just queue.
+    concurrency:
+      group: st-export-${{ github.repository }}
+      cancel-in-progress: false
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      # ---------------------------------------------------------------------
+      # THE ONE VERSION LITERAL IN THIS FILE.
+      # Bump it and pyproject.toml together via `scripts/release.sh <version>`,
+      # in the same commit the new tag is cut from. Everything else — the
+      # checkout ref and the expected version the guard asserts — is derived
+      # from this string.
+      # ---------------------------------------------------------------------
+      EXPORTER_TAG: exporter-v0.2.8
+    steps:
+      # A reusable (workflow_call) workflow runs in the CALLER's context, so a
+      # bare checkout would fetch the caller's repo (which has no pyproject.toml)
+      # and `pip install -e .` would fail. This repo and ref are pinned explicitly.
+      #
+      # `EXPORTER_TAG` (job env, top of this job) is the ONE version literal in
+      # this file. The checkout ref and the expected version are both derived from
+      # it, so they cannot disagree with each other — only with the code, which is
+      # exactly what the guard below is for.
+      #
+      # It is a literal and it STAYS one. Both candidate contexts have now been
+      # measured on a real customer run (Pioneer, run 34392888158, 2026-09-09):
+      #
+      #   github.job_workflow_ref = <EMPTY>
+      #   github.workflow_ref     = BBTT-01/tr-pioneer-overhead-door/
+      #                             .github/workflows/export.yml@refs/heads/main
+      #
+      # `workflow_ref` names the CALLER — deriving from it on 2026-09-08 checked
+      # out this repo's `main` and ran an exporter with no `--feeds` flag.
+      # `job_workflow_ref` is documented to name the reusable workflow itself, but
+      # is simply empty here, so deriving from it yields an empty ref. Neither is
+      # usable. Do not try a third time without re-measuring first.
+      #
+      # `scripts/release.sh <version>` bumps this and pyproject.toml together.
+      # Do not hand-edit one of them.
+      #
+      # The guard exists because the bump was missed once and the failure was
+      # invisible — v0.2.1 was cut, the caller repointed, and the run logged
+      # `Uses: ...@exporter-v0.2.1` while `HEAD is now at c96d08a` named v0.2.0's
+      # commit. The wrong code ran successfully.
+      - uses: actions/checkout@v4
+        with:
+          repository: BBTT-01/ST-exporter
+          ref: ${{ env.EXPORTER_TAG }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: pip install -e .
+
+      # The pinned tag above and the code it fetches can drift, and when they do
+      # nothing errors — the wrong exporter just runs. This turns that into a hard
+      # failure: EXPORTER_VERSION is bumped in the same commit a tag is cut from,
+      # so a mismatch means `ref:` points somewhere other than this file's own tag.
+      # It is also the version stamped into the Export Store's `_meta` tab, so the
+      # Sheet itself records which exporter wrote it.
+      - name: Verify the checked-out exporter matches the pinned tag
+        run: |
+          # Derived from the single literal, not typed a second time.
+          EXPECTED_EXPORTER_VERSION="${EXPORTER_TAG#exporter-v}"
+          if [ "$EXPECTED_EXPORTER_VERSION" = "$EXPORTER_TAG" ]; then
+            echo "::error::EXPORTER_TAG ('$EXPORTER_TAG') is not of the form" \
+                 "exporter-vX.Y.Z, so the expected version cannot be derived."
+            exit 1
+          fi
+          actual="$(python -c 'from st_exporter import EXPORTER_VERSION; print(EXPORTER_VERSION)')"
+          if [ "$actual" != "$EXPECTED_EXPORTER_VERSION" ]; then
+            echo "::error::exporter version mismatch — this workflow expects" \
+                 "$EXPECTED_EXPORTER_VERSION but the checked-out code is $actual." \
+                 "The 'ref:' in the checkout step is pointing at the wrong commit."
+            exit 1
+          fi
+          echo "exporter $actual matches the pinned tag"
+
+      - name: Run export
+        env:
+          ST_CLIENT_ID: ${{ secrets.ST_CLIENT_ID }}
+          ST_CLIENT_SECRET: ${{ secrets.ST_CLIENT_SECRET }}
+          ST_APP_KEY: ${{ secrets.ST_APP_KEY }}
+          ST_TENANT_ID: ${{ secrets.ST_TENANT_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_RAW_CACHE_SHEET_ID: ${{ secrets.GOOGLE_RAW_CACHE_SHEET_ID }}
+          EXPORTER_WINDOW_DAYS: ${{ inputs.window }}
+          TRADERATED_MACHINE_TOKEN: ${{ secrets.TRADERATED_MACHINE_TOKEN }}
+          TRADERATED_OUTBOX_BASE_URL: ${{ secrets.TRADERATED_OUTBOX_BASE_URL }}
+          FEEDS: ${{ inputs.feeds }}
+          PRICEBOOK_FLAG: ${{ inputs.pricebook && '--pricebook' || '' }}
+        run: |
+          case "$FEEDS" in
+            jobs|technicians|jobs,technicians) ;;
+            *) echo "::error::invalid feeds input: $FEEDS" >&2; exit 1 ;;
+          esac
+          st-export --feeds "$FEEDS" $PRICEBOOK_FLAG

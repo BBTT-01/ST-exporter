@@ -14,6 +14,7 @@ from typing import Any
 
 from st_cli.client import ServiceTitanClient
 from st_cli.config import Settings
+from st_cli.exceptions import ConfigError
 from st_exporter import EXPORTER_VERSION
 from st_exporter.config import ExporterSettings
 from st_exporter.denormalize import build_job_rows
@@ -41,6 +42,26 @@ _RAW_JOBS = "_raw_jobs"
 _RAW_APPOINTMENTS = "_raw_appointments"
 _RAW_ASSIGNMENTS = "_raw_assignments"
 
+_VALID_FEEDS = frozenset({"jobs", "technicians"})
+DEFAULT_FEEDS = frozenset({"jobs", "technicians"})
+
+
+def parse_feeds(value: str) -> frozenset[str]:
+    """Parse a comma-separated --feeds value into a validated set.
+
+    Blank segments are dropped so "jobs," or " jobs , technicians " both work —
+    the reusable workflow's `feeds` input is free-text, not a strict enum.
+    """
+    feeds = frozenset(part.strip() for part in value.split(",") if part.strip())
+    if not feeds:
+        raise ConfigError("--feeds must name at least one of: jobs, technicians.")
+    unknown = feeds - _VALID_FEEDS
+    if unknown:
+        raise ConfigError(
+            f"unknown feed(s): {', '.join(sorted(unknown))}. Valid feeds: jobs, technicians."
+        )
+    return feeds
+
 
 @dataclass
 class ExportSummary:
@@ -54,6 +75,7 @@ def run_export(
     st_settings: Settings,
     exporter_settings: ExporterSettings,
     *,
+    feeds: frozenset[str] = DEFAULT_FEEDS,
     pricebook: bool = False,
     dry_run: bool = False,
     client: ServiceTitanClient | None = None,
@@ -61,6 +83,12 @@ def run_export(
     raw_cache_store: SheetsPort | None = None,
 ) -> ExportSummary:
     """Run one export: fetch feeds, denormalise, window-filter, write the Sheets.
+
+    ``feeds`` selects which output tab(s) this call fetches and writes — either
+    subset lets the reusable workflow honor the spec's different cadences (jobs
+    ~5 min, technicians ~30 min) without re-fetching the unneeded feed every
+    time. The feed not selected is left byte-for-byte untouched in both the
+    Export Store's tab and its `_meta` row.
 
     ``client``/``export_store``/``raw_cache_store`` can be injected (used by tests
     with fixtures and an in-memory Sheets double); left as ``None`` in production,
@@ -82,6 +110,7 @@ def run_export(
             active_client,
             active_export_store,
             active_raw_cache_store,
+            feeds=feeds,
             window_days=exporter_settings.window_days,
             dry_run=dry_run,
         )
@@ -117,13 +146,86 @@ def _run(
     export_store: SheetsPort,
     raw_cache_store: SheetsPort,
     *,
+    feeds: frozenset[str] = DEFAULT_FEEDS,
     window_days: int = DEFAULT_WINDOW_DAYS,
     dry_run: bool,
 ) -> ExportSummary:
     now = datetime.now(timezone.utc)
     today = now.date()
+    run_at = now.isoformat()
 
     meta_rows = parse_meta_grid(export_store.read_grid("_meta"))
+    new_meta_rows: list[MetaRow] = []
+
+    windowed_rows: list[dict[str, Any]] = []
+    skipped_no_job = 0
+    jobs_row_count = meta_rows["jobs"].row_count if "jobs" in meta_rows else 0
+
+    if "jobs" in feeds:
+        windowed_rows, skipped_no_job = _run_jobs_feed(
+            client,
+            export_store,
+            raw_cache_store,
+            meta_rows=meta_rows,
+            new_meta_rows=new_meta_rows,
+            today=today,
+            run_at=run_at,
+            window_days=window_days,
+            dry_run=dry_run,
+        )
+        jobs_row_count = len(windowed_rows)
+    elif "jobs" in meta_rows:
+        new_meta_rows.append(meta_rows["jobs"])
+
+    technician_rows: list[dict[str, Any]] = []
+    technicians_row_count = meta_rows["technicians"].row_count if "technicians" in meta_rows else 0
+
+    if "technicians" in feeds:
+        technician_rows = _run_technicians_feed(
+            client,
+            export_store,
+            new_meta_rows=new_meta_rows,
+            run_at=run_at,
+            dry_run=dry_run,
+        )
+        technicians_row_count = len(technician_rows)
+    elif "technicians" in meta_rows:
+        new_meta_rows.append(meta_rows["technicians"])
+
+    if dry_run:
+        logger.info(
+            "dry-run: would write jobs=%d technicians=%d (nothing written)",
+            jobs_row_count,
+            technicians_row_count,
+        )
+    else:
+        export_store.replace_grid("_meta", build_meta_grid(new_meta_rows))
+
+    return ExportSummary(
+        jobs_row_count=jobs_row_count,
+        technicians_row_count=technicians_row_count,
+        skipped_no_job=skipped_no_job,
+        dry_run=dry_run,
+    )
+
+
+def _run_jobs_feed(
+    client: ServiceTitanClient,
+    export_store: SheetsPort,
+    raw_cache_store: SheetsPort,
+    *,
+    meta_rows: dict[str, MetaRow],
+    new_meta_rows: list[MetaRow],
+    today: Any,
+    run_at: str,
+    window_days: int,
+    dry_run: bool,
+) -> tuple[list[dict[str, Any]], int]:
+    """Fetch/denormalise/window the jobs feed; return (windowed_rows, skipped_no_job).
+
+    Mutates ``new_meta_rows`` in place (appends the jobs MetaRow) so the caller
+    doesn't need a second merge step — mirrors how the technicians half works.
+    """
     jobs_meta = meta_rows.get("jobs")
     cursor_bundle = CursorBundle.decode(jobs_meta.last_cursor if jobs_meta else None)
 
@@ -164,7 +266,6 @@ def _run(
 
     job_types = fetch_job_types(client)
     business_units = fetch_business_units(client)
-    technicians = fetch_technicians(client)
 
     denormalized = build_job_rows(
         raw_jobs,
@@ -194,10 +295,6 @@ def _run(
         )
 
     jobs_grid = [list(JOB_COLUMNS)] + [format_job_row(row) for row in windowed_rows]
-    technician_rows = [_technician_row(record) for record in technicians]
-    technicians_grid = [list(TECHNICIAN_COLUMNS)] + [
-        format_technician_row(row) for row in technician_rows
-    ]
 
     new_cursor_bundle = CursorBundle(
         {
@@ -208,54 +305,59 @@ def _run(
             "assignments": assignments_cursor,
         }
     )
-    run_at = now.isoformat()
-    new_meta_rows = [
+    new_meta_rows.append(
         MetaRow(
             feed="jobs",
             last_run_at=run_at,
             last_cursor=new_cursor_bundle.encode(),
             row_count=len(windowed_rows),
             exporter_version=EXPORTER_VERSION,
-        ),
-        MetaRow(
-            feed="technicians",
-            last_run_at=run_at,
-            last_cursor="",
-            row_count=len(technician_rows),
-            exporter_version=EXPORTER_VERSION,
-        ),
-    ]
-
-    if dry_run:
-        logger.info(
-            "dry-run: would write jobs=%d technicians=%d (nothing written)",
-            len(windowed_rows),
-            len(technician_rows),
         )
-    else:
+    )
+
+    if not dry_run:
         _prune_raw_caches(
             denormalized.rows,
             windowed_rows,
             raw_appointments=raw_appointments,
             raw_assignments=raw_assignments,
         )
-
         raw_cache_store.replace_grid(_RAW_CUSTOMERS, raw_customers.to_grid())
         raw_cache_store.replace_grid(_RAW_LOCATIONS, raw_locations.to_grid())
         raw_cache_store.replace_grid(_RAW_JOBS, raw_jobs.to_grid())
         raw_cache_store.replace_grid(_RAW_APPOINTMENTS, raw_appointments.to_grid())
         raw_cache_store.replace_grid(_RAW_ASSIGNMENTS, raw_assignments.to_grid())
-
         export_store.replace_grid("jobs", jobs_grid)
-        export_store.replace_grid("technicians", technicians_grid)
-        export_store.replace_grid("_meta", build_meta_grid(new_meta_rows))
 
-    return ExportSummary(
-        jobs_row_count=len(windowed_rows),
-        technicians_row_count=len(technician_rows),
-        skipped_no_job=denormalized.skipped_no_job,
-        dry_run=dry_run,
+    return windowed_rows, denormalized.skipped_no_job
+
+
+def _run_technicians_feed(
+    client: ServiceTitanClient,
+    export_store: SheetsPort,
+    *,
+    new_meta_rows: list[MetaRow],
+    run_at: str,
+    dry_run: bool,
+) -> list[dict[str, Any]]:
+    """Fetch technicians and (unless dry-run) write the tab; append its MetaRow."""
+    technicians = fetch_technicians(client)
+    technician_rows = [_technician_row(record) for record in technicians]
+    new_meta_rows.append(
+        MetaRow(
+            feed="technicians",
+            last_run_at=run_at,
+            last_cursor="",
+            row_count=len(technician_rows),
+            exporter_version=EXPORTER_VERSION,
+        )
     )
+    if not dry_run:
+        technicians_grid = [list(TECHNICIAN_COLUMNS)] + [
+            format_technician_row(row) for row in technician_rows
+        ]
+        export_store.replace_grid("technicians", technicians_grid)
+    return technician_rows
 
 
 def _technician_row(record: dict[str, Any]) -> dict[str, Any]:

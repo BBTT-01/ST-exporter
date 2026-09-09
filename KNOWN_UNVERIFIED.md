@@ -19,15 +19,25 @@ technician assignment": `{"unassigned", "removed", "cancelled", "canceled"}`
 encodes "removed" as a separate boolean/timestamp field rather than a status
 string), `_active_technician_id` will resolve stale or wrong technicians.
 
-## Technician tie-break rule for concurrent multi-tech assignments
+## ~~Technician tie-break rule for concurrent multi-tech assignments~~ — RESOLVED
 
-`src/st_exporter/denormalize.py`, `_active_technician_id`
+`src/st_exporter/denormalize.py`, `_active_technician_ids`
 
-When two assignment events for the same appointment have the same `assignedOn`
-timestamp (a real, supported ServiceTitan scenario — multi-technician jobs), the
-lowest `technicianId` wins. This is a deliberate, documented simplification
-forced by the frozen contract's single `st_technician_id` column — it hasn't been
-sanity-checked as the "right" choice against a real multi-tech appointment.
+**Resolved in 0.2.7 (2026-09-09).** The sanity check this entry asked for
+arrived: ServiceTitan job 21465348 (Pioneer Overhead Door) is a three-technician
+install — one appointment, three live assignments. It exported as a single row
+carrying only the technician assigned last, and the job was invisible to the
+other two in TradeRated.
+
+Discarding technicians was never the right answer; the single `st_technician_id`
+column forced it. The `jobs` tab is now one row **per assigned technician**, so a
+crew of three yields three rows sharing an `st_appointment_id`. The column set is
+unchanged. The old recency-then-lowest-id rule survives only as row ORDER, to keep
+runs deterministic.
+
+**Consequence for consumers:** `st_appointment_id` is no longer unique in the
+`jobs` tab. Key on (`st_technician_id`, `st_job_id`) — already what
+`sync-hosted-jobs` upserts on.
 
 ## `jobTypeName` / `businessUnitName` presence on job records
 
@@ -90,3 +100,100 @@ real tenant — see the PR #1 review's finding #6.
 The contract describes `modified_on` only as "for drift debugging" without
 specifying which entity's timestamp it should reflect. This mapping is a
 reasonable guess, not a confirmed requirement.
+
+## CRM Outbox response envelope
+
+`src/st_exporter/outbox/client.py`, `TradeRatedOutboxClient.claim`
+
+Assumes `GET /crm-outbox` wraps its items as `{"items": [...]}`. The spec names
+the per-item shape (`id`, `idempotency_key`, `kind`, `payload`) but not the
+envelope around the list. If TradeRated's real response differs (e.g. a bare
+array, or a different key), this is the one function to fix.
+
+## CRM Outbox claim limit
+
+`src/st_exporter/outbox/drain.py`, `_DEFAULT_CLAIM_LIMIT`
+
+Defaults to 10 pending items per drain. The spec says "up to N pending items"
+without naming N. Unverified against a real deployment; adjust once ticket 07's
+real outbox endpoint is live and its actual behavior/limits are known.
+
+## `technician_rating` has no known ServiceTitan write
+
+`src/st_exporter/outbox/actions.py`, `perform_item`
+
+The Outbox contract names two kinds — `referral_lead` and `technician_rating` —
+but this CLI's registry has no ServiceTitan endpoint that resembles "post a
+rating for a technician." `perform_item` raises `UnsupportedOutboxKindError` for
+this kind rather than guessing (a job note? a custom field? something else?).
+Every `technician_rating` item will be reported back to TradeRated as `failed`
+until this is resolved with the spec owner — raised explicitly in this ticket's
+report, not silently worked around.
+
+## ~~`referral_lead` payload passed through unmapped~~ — RESOLVED 2026-09-08
+
+`src/st_exporter/outbox/actions.py`, `_perform_referral_lead`
+
+**No longer a guess: it was tested against a real tenant and the assumption was
+wrong.** The first live attempt (Door Serv Pro, 2026-09-08) returned:
+
+```
+ServiceTitan 400: campaignId and summary required
+```
+
+TradeRated's payload is its own snake_case shape (`name`, `phone`, `address`,
+`referred_by`, `notes`) and carries neither required field, so a pass-through can
+never succeed. The exporter now supplies both — `campaignId` from the referral
+campaign resolver, `summary` derived from the payload — and forwards everything
+else untouched. Only absent keys are filled, so a `campaignId` TradeRated later
+chooses to send still wins.
+
+Still unconfirmed: whether ServiceTitan **ignores** the remaining snake_case keys
+or has other required fields it did not mention in that first rejection. It
+reported only these two, which suggests the rest of the body is tolerated — but
+the error may simply be reporting the first failing validation. If a second 400
+appears naming different fields, the payload needs a real field-by-field mapping
+and that mapping's ownership (this repo vs TradeRated) has to be settled.
+
+## ~~Referral campaign creation body~~ — PARTLY RESOLVED 2026-09-08
+
+`src/st_exporter/outbox/campaign.py`, `ReferralCampaign._create`
+
+**Tested against a real tenant; a name-only body is refused.** The first create
+attempt returned:
+
+```
+categoryId:     Required property 'categoryId' not found
+businessUnitId: Required property 'businessUnitId' not found
+```
+
+Both are now resolved from the tenant — lowest active id from
+`settings/business-units` and `marketing/categories` respectively — so a new Hosted
+customer's first referral succeeds with nothing configured. Each choice is logged,
+and either can be pinned with `TRADERATED_CAMPAIGN_BUSINESS_UNIT_ID` /
+`TRADERATED_CAMPAIGN_CATEGORY_ID`.
+
+Still unconfirmed:
+
+- **Whether those two are the only additions required.** The same 400 also carried
+  `"request": ["The request field is required."]`, which reads like the ASP.NET model
+  binder naming the root object rather than a real field, but it may not be. `dnis`
+  is a plausible further requirement.
+- **Whether lowest-active-id is the right business unit.** It is deterministic and
+  reproducible, not correct: campaign is the dimension ServiceTitan reports revenue
+  by, so a customer with several business units may see referral revenue attributed
+  to the wrong one. The pin exists for that, but nothing prompts them to set it.
+- ~~Whether `marketing/categories` is the correct resource for a campaign's
+  `categoryId`~~ — moot. Asking for it returned `403 Scope validation failed`: the
+  app is not granted that endpoint, and requesting the scope would send every
+  already-onboarded customer back to their Developer Portal. The category is now
+  borrowed from an existing campaign's own `categoryId` (campaigns read is already
+  granted), and `marketing/categories` remains only as a fallback whose 403 is
+  swallowed. **Unverified:** whether the campaigns list returns `categoryId`, a
+  nested `category: {id}`, or neither — all three are handled, the last by raising
+  and naming the pin.
+
+Also unconfirmed: whether the campaign list endpoint supports a server-side `name`
+filter. `_find` deliberately lists all campaigns and matches locally instead, because
+a filter ServiceTitan silently ignored would return page one of every campaign and
+could match the wrong row.

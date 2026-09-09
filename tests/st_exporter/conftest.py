@@ -45,6 +45,21 @@ def mock_auth_token(auth_url: str, token: str = "test-token") -> None:
 
 
 @pytest.fixture(autouse=True)
+def clear_traderated_env(monkeypatch):
+    """Make every st_exporter test hermetic against ambient ``TRADERATED_*`` vars.
+
+    ``TradeRatedSettings`` reads the process environment, so any test that
+    constructs one without patching it (``TestFeedsFlag``, parts of
+    ``TestErrorHandling``) would pick up a developer's real machine token/outbox
+    URL and attempt live network calls. Mirrors the ``clean_token_cache``
+    convention below. Tests that *want* those vars set them with their own
+    ``monkeypatch.setenv``, which runs after this fixture and wins.
+    """
+    monkeypatch.delenv("TRADERATED_MACHINE_TOKEN", raising=False)
+    monkeypatch.delenv("TRADERATED_OUTBOX_BASE_URL", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def clean_token_cache(tmp_path):
     """Redirect st_cli's on-disk OAuth token cache to tmp_path for test isolation
     — mirrors the existing tests/test_auth.py convention. Without this, every test

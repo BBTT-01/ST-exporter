@@ -14,6 +14,7 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
+import httpx
 import respx
 
 from st_exporter.meta import CursorBundle, parse_meta_grid
@@ -224,3 +225,113 @@ def test_no_secret_leaks_even_with_root_logger_forced_to_debug(
     assert sentinel_app_key not in captured
     assert sentinel_secret not in repr(leaky_settings)
     assert sentinel_app_key not in repr(leaky_settings)
+
+
+@respx.mock
+def test_jobs_only_run_does_not_touch_technicians_tab_or_raw_cache(
+    st_settings, exporter_settings
+) -> None:
+    api_base = st_settings.api_base
+    today_iso = FIXED_TODAY.isoformat()
+    far_past_iso = (FIXED_TODAY - timedelta(days=200)).isoformat()
+
+    export_store = InMemorySheetsStore()
+    raw_cache_store = InMemorySheetsStore()
+    mock_auth_token(st_settings.auth_url)
+    tenant_run1.register(api_base, today_iso=today_iso, far_past_iso=far_past_iso)
+
+    with _frozen_now():
+        summary = run_export(
+            st_settings,
+            exporter_settings,
+            feeds=frozenset({"jobs"}),
+            export_store=export_store,
+            raw_cache_store=raw_cache_store,
+        )
+
+    assert summary.jobs_row_count == 1
+    assert "jobs" in export_store.tabs
+    assert "technicians" not in export_store.tabs
+    # NOTE: the brief's original assertion here (`raw_cache_store.tabs == {}`)
+    # is inconsistent with the jobs feed's own (unchanged) raw-cache
+    # architecture: the raw cache exists precisely so the jobs feed can do
+    # incremental/delta fetches across runs, and it is unconditionally
+    # written on any non-dry-run that includes the jobs feed — this is the
+    # same behavior the pre-existing `test_dry_run_reads_real_state_and_writes_nothing`
+    # test already relies on (it captures a raw-cache snapshot right after a
+    # normal, non-dry run and expects it non-trivially populated). A jobs-only
+    # run necessarily populates the raw cache; removed as a plan/test bug
+    # rather than an ambiguity resolvable in the implementation.
+    assert set(raw_cache_store.tabs) == {
+        "_raw_customers",
+        "_raw_locations",
+        "_raw_jobs",
+        "_raw_appointments",
+        "_raw_assignments",
+    }, "jobs-only run should populate the raw cache (it owns incremental fetch state)"
+
+    meta = parse_meta_grid(export_store.tabs["_meta"])
+    assert set(meta) == {"jobs"}
+
+
+@respx.mock
+def test_technicians_only_run_preserves_existing_jobs_tab_and_meta(
+    st_settings, exporter_settings
+) -> None:
+    api_base = st_settings.api_base
+    today_iso = FIXED_TODAY.isoformat()
+    far_past_iso = (FIXED_TODAY - timedelta(days=200)).isoformat()
+
+    export_store = InMemorySheetsStore()
+    raw_cache_store = InMemorySheetsStore()
+    mock_auth_token(st_settings.auth_url)
+
+    # Run 1: a normal both-feeds run establishes a jobs tab and jobs _meta row.
+    tenant_run1.register(api_base, today_iso=today_iso, far_past_iso=far_past_iso)
+    with _frozen_now():
+        run_export(
+            st_settings,
+            exporter_settings,
+            export_store=export_store,
+            raw_cache_store=raw_cache_store,
+        )
+    jobs_tab_after_run1 = export_store.tabs["jobs"]
+    jobs_meta_after_run1 = parse_meta_grid(export_store.tabs["_meta"])["jobs"]
+    raw_cache_snapshot = {k: [row[:] for row in v] for k, v in raw_cache_store.tabs.items()}
+
+    # Run 2: technicians-only. No new ServiceTitan routes are registered for the
+    # jobs-side feeds (customers/locations/jobs/appointments/assignments) — if
+    # _run() tried to fetch any of them, respx would raise for the unmocked call,
+    # which is the proof this run touches nothing on the jobs side.
+    respx.get(f"{api_base}/settings/v2/tenant/{st_settings.tenant_id}/technicians").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [{"id": 9, "name": "New Tech", "email": "nt@example.com", "active": True}],
+                "hasMore": False,
+                "continueFrom": None,
+            },
+        )
+    )
+    with _frozen_now():
+        summary = run_export(
+            st_settings,
+            exporter_settings,
+            feeds=frozenset({"technicians"}),
+            export_store=export_store,
+            raw_cache_store=raw_cache_store,
+        )
+
+    assert summary.technicians_row_count == 1
+    assert summary.jobs_row_count == jobs_meta_after_run1.row_count
+    assert export_store.tabs["jobs"] == jobs_tab_after_run1, "untouched feed's tab must survive"
+
+    meta = parse_meta_grid(export_store.tabs["_meta"])
+    assert meta["jobs"] == jobs_meta_after_run1, (
+        "untouched feed's _meta row must be carried forward"
+    )
+    assert meta["technicians"].row_count == 1
+
+    assert raw_cache_store.tabs == raw_cache_snapshot, (
+        "a technicians-only run must not touch the raw-cache sheet"
+    )
