@@ -95,40 +95,57 @@ def _coordinate(location: dict[str, Any] | None) -> tuple[Any, Any]:
     return lat, lng
 
 
-def _active_technician_id(assignments: list[dict[str, Any]]) -> str | None:
-    """Resolve the single current technician for an appointment from its assignment
-    events (an append-only assign/unassign feed, not a current-state table).
-
-    Discards records whose status indicates removal, then takes the remaining
-    record with the latest ``assignedOn``. A genuine tie (concurrent multi-tech
-    assignment) breaks on the lowest technician id — a deterministic, documented
-    simplification the frozen contract's single `st_technician_id` column forces;
-    flagged in KNOWN_UNVERIFIED.md for a business-rule sanity check once real
-    assignment data exists.
-    """
-    active = [
-        a
-        for a in assignments
-        if str(a.get("status", "")).strip().lower() not in _REMOVED_ASSIGNMENT_STATUSES
-    ]
-    if not active:
-        return None
-
-    def sort_key(a: dict[str, Any]) -> tuple[datetime, int]:
-        assigned_on = _parse_utc_datetime(a.get("assignedOn"))
-        technician_id = a.get("technicianId")
-        if technician_id is None:
+def _assignment_sort_key(a: dict[str, Any]) -> tuple[datetime, int]:
+    """Order assignment events: later ``assignedOn`` first, then lowest technician id."""
+    assigned_on = _parse_utc_datetime(a.get("assignedOn"))
+    technician_id = a.get("technicianId")
+    if technician_id is None:
+        tech_id_int = 0
+    else:
+        try:
+            tech_id_int = int(technician_id)
+        except (TypeError, ValueError):
             tech_id_int = 0
-        else:
-            try:
-                tech_id_int = int(technician_id)
-            except (TypeError, ValueError):
-                tech_id_int = 0
-        return (assigned_on, -tech_id_int)
+    return (assigned_on, -tech_id_int)
 
-    best = max(active, key=sort_key)
-    technician_id = best.get("technicianId")
-    return None if technician_id is None else str(technician_id)
+
+def _active_technician_ids(assignments: list[dict[str, Any]]) -> list[str]:
+    """Resolve EVERY currently-assigned technician for an appointment from its
+    assignment events (an append-only assign/unassign feed, not a current-state
+    table).
+
+    ServiceTitan genuinely supports multi-technician appointments — an install
+    crew of three is one appointment with three live assignments — so this returns
+    all of them and `build_job_rows` emits one row per technician. The
+    single-technician predecessor kept only the most recently assigned, which
+    silently hid the job from the rest of the crew.
+
+    Removal is resolved PER TECHNICIAN, not by filtering the event list. The feed
+    appends rather than mutates, so a technician who was assigned and later
+    unassigned still has a live "Active" record sitting in it; filtering only the
+    removal rows would resurrect them. Their LATEST event decides, and they count
+    as assigned only if that event is not a removal.
+
+    Order is most-recently-assigned first, ties on lowest technician id — the old
+    single-value tie-break, kept so row order stays deterministic between runs.
+    """
+    latest_per_technician: dict[str, dict[str, Any]] = {}
+    for assignment in assignments:
+        technician_id = assignment.get("technicianId")
+        if technician_id is None:
+            continue
+        key = str(technician_id)
+        incumbent = latest_per_technician.get(key)
+        if incumbent is None or _assignment_sort_key(assignment) >= _assignment_sort_key(incumbent):
+            latest_per_technician[key] = assignment
+
+    still_assigned = [
+        (key, assignment)
+        for key, assignment in latest_per_technician.items()
+        if str(assignment.get("status", "")).strip().lower() not in _REMOVED_ASSIGNMENT_STATUSES
+    ]
+    still_assigned.sort(key=lambda pair: _assignment_sort_key(pair[1]), reverse=True)
+    return [key for key, _ in still_assigned]
 
 
 def _job_type_name(job: dict[str, Any], job_types: dict[str, dict[str, Any]]) -> str | None:
@@ -209,36 +226,40 @@ def build_job_rows(
         latitude, longitude = _coordinate(location)
 
         appointment_id = appointment.get("id")
-        technician_id = _active_technician_id(
-            assignments_by_appointment.get(str(appointment_id), [])
-        )
+        # One row per assigned technician. An appointment with a crew of three
+        # yields three rows sharing an `st_appointment_id`; `[None]` preserves the
+        # single unassigned-appointment row the consumer already skips.
+        technician_ids: list[str | None] = list(
+            _active_technician_ids(assignments_by_appointment.get(str(appointment_id), []))
+        ) or [None]
 
-        rows.append(
-            {
-                "st_job_id": job.get("id"),
-                "st_appointment_id": appointment_id,
-                "job_number": job.get("number"),
-                "st_technician_id": technician_id,
-                "customer_name": customer.get("name") if customer else None,
-                "customer_phone": customer.get("phone") if customer else None,
-                "customer_email": customer.get("email") if customer else None,
-                "service_address": build_service_address(location.get("address"))
-                if location
-                else "",
-                "latitude": latitude,
-                "longitude": longitude,
-                "appointment_start": appointment.get("start"),
-                "appointment_end": appointment.get("end"),
-                "job_status": job.get("jobStatus"),
-                "job_type": _job_type_name(job, job_types),
-                "summary": job.get("summary"),
-                "business_unit": _business_unit_name(job, business_units),
-                "modified_on": appointment.get("modifiedOn") or job.get("modifiedOn"),
-                # Not a contract column; used by run.py to sort deterministically
-                # without re-deriving ints from formatted text.
-                "_sort_key": _sort_key(job.get("id"), appointment_id),
-            }
-        )
+        for technician_id in technician_ids:
+            rows.append(
+                {
+                    "st_job_id": job.get("id"),
+                    "st_appointment_id": appointment_id,
+                    "job_number": job.get("number"),
+                    "st_technician_id": technician_id,
+                    "customer_name": customer.get("name") if customer else None,
+                    "customer_phone": customer.get("phone") if customer else None,
+                    "customer_email": customer.get("email") if customer else None,
+                    "service_address": build_service_address(location.get("address"))
+                    if location
+                    else "",
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "appointment_start": appointment.get("start"),
+                    "appointment_end": appointment.get("end"),
+                    "job_status": job.get("jobStatus"),
+                    "job_type": _job_type_name(job, job_types),
+                    "summary": job.get("summary"),
+                    "business_unit": _business_unit_name(job, business_units),
+                    "modified_on": appointment.get("modifiedOn") or job.get("modifiedOn"),
+                    # Not a contract column; used by run.py to sort deterministically
+                    # without re-deriving ints from formatted text.
+                    "_sort_key": _sort_key(job.get("id"), appointment_id),
+                }
+            )
 
     rows.sort(key=lambda r: r["_sort_key"])
     for row in rows:

@@ -19,15 +19,25 @@ technician assignment": `{"unassigned", "removed", "cancelled", "canceled"}`
 encodes "removed" as a separate boolean/timestamp field rather than a status
 string), `_active_technician_id` will resolve stale or wrong technicians.
 
-## Technician tie-break rule for concurrent multi-tech assignments
+## ~~Technician tie-break rule for concurrent multi-tech assignments~~ — RESOLVED
 
-`src/st_exporter/denormalize.py`, `_active_technician_id`
+`src/st_exporter/denormalize.py`, `_active_technician_ids`
 
-When two assignment events for the same appointment have the same `assignedOn`
-timestamp (a real, supported ServiceTitan scenario — multi-technician jobs), the
-lowest `technicianId` wins. This is a deliberate, documented simplification
-forced by the frozen contract's single `st_technician_id` column — it hasn't been
-sanity-checked as the "right" choice against a real multi-tech appointment.
+**Resolved in 0.2.7 (2026-09-09).** The sanity check this entry asked for
+arrived: ServiceTitan job 21465348 (Pioneer Overhead Door) is a three-technician
+install — one appointment, three live assignments. It exported as a single row
+carrying only the technician assigned last, and the job was invisible to the
+other two in TradeRated.
+
+Discarding technicians was never the right answer; the single `st_technician_id`
+column forced it. The `jobs` tab is now one row **per assigned technician**, so a
+crew of three yields three rows sharing an `st_appointment_id`. The column set is
+unchanged. The old recency-then-lowest-id rule survives only as row ORDER, to keep
+runs deterministic.
+
+**Consequence for consumers:** `st_appointment_id` is no longer unique in the
+`jobs` tab. Key on (`st_technician_id`, `st_job_id`) — already what
+`sync-hosted-jobs` upserts on.
 
 ## `jobTypeName` / `businessUnitName` presence on job records
 

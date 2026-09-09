@@ -140,10 +140,13 @@ def test_latest_assignment_wins_over_an_earlier_removed_one() -> None:
 
     result = build_job_rows(jobs, appointments, assignments, _cache(), _cache())
 
+    # Exactly one row: technician 10 still has a live "Active" record in the
+    # append-only feed, and the fan-out must not resurrect them from it.
+    assert len(result.rows) == 1
     assert result.rows[0]["st_technician_id"] == "20"
 
 
-def test_concurrent_multi_technician_tie_breaks_on_lowest_technician_id() -> None:
+def test_concurrent_multi_technician_emits_a_row_each() -> None:
     jobs = _cache({"id": 1})
     appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
     assignments = _cache(
@@ -165,7 +168,119 @@ def test_concurrent_multi_technician_tie_breaks_on_lowest_technician_id() -> Non
 
     result = build_job_rows(jobs, appointments, assignments, _cache(), _cache())
 
-    assert result.rows[0]["st_technician_id"] == "15"
+    # Both technicians are genuinely assigned, so both get the job. The old
+    # single-column contract had to discard one; the ordering survives only so
+    # row order stays stable between runs.
+    assert [r["st_technician_id"] for r in result.rows] == ["15", "30"]
+    assert {r["st_appointment_id"] for r in result.rows} == {100}
+
+
+def test_three_technician_crew_each_get_the_same_job() -> None:
+    """A real install crew: one appointment, three live assignments.
+
+    Modelled on ServiceTitan job 21465348 (Pioneer Overhead Door), where a
+    three-technician install exported as a single row and the job was invisible
+    to two of the three technicians.
+    """
+    jobs = _cache({"id": 1, "number": "J-1", "jobStatus": "InProgress"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-09T14:00:00Z"})
+    assignments = _cache(
+        {
+            "id": 1,
+            "appointmentId": 100,
+            "technicianId": 2565,
+            "status": "Active",
+            "assignedOn": "2026-09-08T08:00:00Z",
+        },
+        {
+            "id": 2,
+            "appointmentId": 100,
+            "technicianId": 20852220,
+            "status": "Active",
+            "assignedOn": "2026-09-08T09:00:00Z",
+        },
+        {
+            "id": 3,
+            "appointmentId": 100,
+            "technicianId": 20364412,
+            "status": "Active",
+            "assignedOn": "2026-09-08T10:00:00Z",
+        },
+    )
+
+    result = build_job_rows(jobs, appointments, assignments, _cache(), _cache())
+
+    assert len(result.rows) == 3
+    assert [r["st_technician_id"] for r in result.rows] == [
+        "20364412",  # assigned last
+        "20852220",
+        "2565",
+    ]
+    # Every row is the same job and appointment — only the technician differs.
+    assert {r["st_job_id"] for r in result.rows} == {1}
+    assert {r["st_appointment_id"] for r in result.rows} == {100}
+    assert {r["job_status"] for r in result.rows} == {"InProgress"}
+
+
+def test_a_technician_reassigned_after_removal_is_present_exactly_once() -> None:
+    """Assign -> unassign -> reassign. The latest event decides, and wins only once."""
+    jobs = _cache({"id": 1})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00Z"})
+    assignments = _cache(
+        {
+            "id": 1,
+            "appointmentId": 100,
+            "technicianId": 10,
+            "status": "Active",
+            "assignedOn": "2026-09-01T08:00:00Z",
+        },
+        {
+            "id": 2,
+            "appointmentId": 100,
+            "technicianId": 10,
+            "status": "Unassigned",
+            "assignedOn": "2026-09-02T08:00:00Z",
+        },
+        {
+            "id": 3,
+            "appointmentId": 100,
+            "technicianId": 10,
+            "status": "Active",
+            "assignedOn": "2026-09-03T08:00:00Z",
+        },
+    )
+
+    result = build_job_rows(jobs, appointments, assignments, _cache(), _cache())
+
+    assert [r["st_technician_id"] for r in result.rows] == ["10"]
+
+
+def test_appointment_with_every_technician_removed_emits_one_unassigned_row() -> None:
+    jobs = _cache({"id": 1})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00Z"})
+    assignments = _cache(
+        {
+            "id": 1,
+            "appointmentId": 100,
+            "technicianId": 10,
+            "status": "Active",
+            "assignedOn": "2026-09-01T08:00:00Z",
+        },
+        {
+            "id": 2,
+            "appointmentId": 100,
+            "technicianId": 10,
+            "status": "Unassigned",
+            "assignedOn": "2026-09-02T08:00:00Z",
+        },
+    )
+
+    result = build_job_rows(jobs, appointments, assignments, _cache(), _cache())
+
+    # The consumer skips a null technician; the row still carries the job so the
+    # appointment does not silently vanish from the Export Store.
+    assert len(result.rows) == 1
+    assert result.rows[0]["st_technician_id"] is None
 
 
 def test_missing_coordinates_are_blank_not_zero() -> None:
