@@ -59,27 +59,52 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+    env:
+      # ---------------------------------------------------------------------
+      # THE ONE VERSION LITERAL IN THIS FILE.
+      # Bump it and pyproject.toml together via `scripts/release.sh <version>`,
+      # in the same commit the new tag is cut from. Everything else — the
+      # checkout ref and the expected version the guard asserts — is derived
+      # from this string.
+      # ---------------------------------------------------------------------
+      EXPORTER_TAG: exporter-v0.2.7
     steps:
       # A reusable (workflow_call) workflow runs in the CALLER's context, so a
       # bare checkout would fetch the caller's repo (which has no pyproject.toml)
       # and `pip install -e .` would fail. This repo and ref are pinned explicitly.
       #
-      # The ref is a LITERAL, and it has to be. There is no GitHub context that
-      # names a called reusable workflow's own ref: `github.ref`, `github.sha` and
-      # `GITHUB_WORKFLOW_REF` all describe the CALLER. Deriving it from
-      # GITHUB_WORKFLOW_REF was tried on 2026-09-08 and resolved to
-      # `refs/heads/main` — the connector repo's branch name — which silently
-      # checked out this repo's `main` and ran an exporter with no `--feeds` flag.
+      # `EXPORTER_TAG` (job env, top of this job) is the ONE version literal in
+      # this file. The checkout ref and the expected version are both derived from
+      # it, so they cannot disagree with each other — only with the code, which is
+      # exactly what the guard below is for.
       #
-      # So: bump this literal in the same commit that a new tag is cut from. The
-      # step below exists because that instruction was already missed once, and
-      # the failure was invisible — v0.2.1 was cut, the caller repointed, and the
-      # run logged `Uses: ...@exporter-v0.2.1` while `HEAD is now at c96d08a`
-      # named v0.2.0's commit. The wrong code ran successfully.
+      # It is a literal, and for now it has to be. There is no PROVEN GitHub
+      # context naming a called reusable workflow's own ref: `github.ref`,
+      # `github.sha` and `GITHUB_WORKFLOW_REF` all describe the CALLER. Deriving it
+      # from GITHUB_WORKFLOW_REF was tried on 2026-09-08 and resolved to
+      # `refs/heads/main` — the connector repo's branch — silently checking out
+      # this repo's `main`. `github.job_workflow_ref` is documented to name the
+      # reusable workflow itself and was NOT the field tried then; the diagnostic
+      # step below records what it actually resolves to on a real customer run, so
+      # the last literal can be removed on evidence rather than on the docs.
+      #
+      # Until then: `scripts/release.sh <version>` bumps this and pyproject.toml
+      # together. Do not hand-edit one of them.
+      #
+      # The guard exists because the bump was missed once and the failure was
+      # invisible — v0.2.1 was cut, the caller repointed, and the run logged
+      # `Uses: ...@exporter-v0.2.1` while `HEAD is now at c96d08a` named v0.2.0's
+      # commit. The wrong code ran successfully.
+      - name: Record what job_workflow_ref resolves to (diagnostic only)
+        run: |
+          echo "github.job_workflow_ref = ${{ github.job_workflow_ref }}"
+          echo "github.workflow_ref     = ${{ github.workflow_ref }}"
+          echo "(nothing depends on these yet — see the comment above)"
+
       - uses: actions/checkout@v4
         with:
           repository: BBTT-01/ST-exporter
-          ref: exporter-v0.2.7
+          ref: ${{ env.EXPORTER_TAG }}
 
       - uses: actions/setup-python@v5
         with:
@@ -95,9 +120,14 @@ jobs:
       # It is also the version stamped into the Export Store's `_meta` tab, so the
       # Sheet itself records which exporter wrote it.
       - name: Verify the checked-out exporter matches the pinned tag
-        env:
-          EXPECTED_EXPORTER_VERSION: "0.2.7"
         run: |
+          # Derived from the single literal, not typed a second time.
+          EXPECTED_EXPORTER_VERSION="${EXPORTER_TAG#exporter-v}"
+          if [ "$EXPECTED_EXPORTER_VERSION" = "$EXPORTER_TAG" ]; then
+            echo "::error::EXPORTER_TAG ('$EXPORTER_TAG') is not of the form" \
+                 "exporter-vX.Y.Z, so the expected version cannot be derived."
+            exit 1
+          fi
           actual="$(python -c 'from st_exporter import EXPORTER_VERSION; print(EXPORTER_VERSION)')"
           if [ "$actual" != "$EXPECTED_EXPORTER_VERSION" ]; then
             echo "::error::exporter version mismatch — this workflow expects" \
