@@ -78,29 +78,26 @@ jobs:
       # it, so they cannot disagree with each other — only with the code, which is
       # exactly what the guard below is for.
       #
-      # It is a literal, and for now it has to be. There is no PROVEN GitHub
-      # context naming a called reusable workflow's own ref: `github.ref`,
-      # `github.sha` and `GITHUB_WORKFLOW_REF` all describe the CALLER. Deriving it
-      # from GITHUB_WORKFLOW_REF was tried on 2026-09-08 and resolved to
-      # `refs/heads/main` — the connector repo's branch — silently checking out
-      # this repo's `main`. `github.job_workflow_ref` is documented to name the
-      # reusable workflow itself and was NOT the field tried then; the diagnostic
-      # step below records what it actually resolves to on a real customer run, so
-      # the last literal can be removed on evidence rather than on the docs.
+      # It is a literal and it STAYS one. Both candidate contexts have now been
+      # measured on a real customer run (Pioneer, run 34392888158, 2026-09-09):
       #
-      # Until then: `scripts/release.sh <version>` bumps this and pyproject.toml
-      # together. Do not hand-edit one of them.
+      #   github.job_workflow_ref = <EMPTY>
+      #   github.workflow_ref     = BBTT-01/tr-pioneer-overhead-door/
+      #                             .github/workflows/export.yml@refs/heads/main
+      #
+      # `workflow_ref` names the CALLER — deriving from it on 2026-09-08 checked
+      # out this repo's `main` and ran an exporter with no `--feeds` flag.
+      # `job_workflow_ref` is documented to name the reusable workflow itself, but
+      # is simply empty here, so deriving from it yields an empty ref. Neither is
+      # usable. Do not try a third time without re-measuring first.
+      #
+      # `scripts/release.sh <version>` bumps this and pyproject.toml together.
+      # Do not hand-edit one of them.
       #
       # The guard exists because the bump was missed once and the failure was
       # invisible — v0.2.1 was cut, the caller repointed, and the run logged
       # `Uses: ...@exporter-v0.2.1` while `HEAD is now at c96d08a` named v0.2.0's
       # commit. The wrong code ran successfully.
-      - name: Record what job_workflow_ref resolves to (diagnostic only)
-        run: |
-          echo "github.job_workflow_ref = ${{ github.job_workflow_ref }}"
-          echo "github.workflow_ref     = ${{ github.workflow_ref }}"
-          echo "(nothing depends on these yet — see the comment above)"
-
       - uses: actions/checkout@v4
         with:
           repository: BBTT-01/ST-exporter
