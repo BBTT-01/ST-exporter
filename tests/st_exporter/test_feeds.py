@@ -21,9 +21,16 @@ class TestParseFeeds:
     def test_default_feeds_constant_is_both(self) -> None:
         assert DEFAULT_FEEDS == {"jobs", "technicians"}
 
+    def test_pricebook_is_a_valid_feed(self) -> None:
+        assert parse_feeds("pricebook") == {"pricebook"}
+
+    def test_pricebook_is_not_a_default_feed(self) -> None:
+        # Catalogue cadence, not the ~5-minute jobs cadence.
+        assert "pricebook" not in DEFAULT_FEEDS
+
     def test_unknown_feed_raises_config_error(self) -> None:
         with pytest.raises(ConfigError, match="unknown"):
-            parse_feeds("jobs,pricebook")
+            parse_feeds("jobs,price-book")
 
     def test_empty_string_raises_config_error(self) -> None:
         with pytest.raises(ConfigError, match="at least one"):

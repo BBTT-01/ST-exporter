@@ -4,6 +4,34 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Pricebook feed
+
+`st-export --feeds pricebook` writes four new tabs to the Export Store —
+`pricebook.services`, `pricebook.equipment`, `pricebook.materials` and
+`pricebook.categories` — each with its own `_meta` row carrying
+`contract_version: pricebook.v1`. TrueQuote reads `equipment` (doors); Profit
+Wizard reads `materials`. The three item tabs share one column set and one code
+path; only the tab name carries the meaning.
+
+Pricebook is a catalogue, so the feed is a **full replace every run**: no window,
+no cursor. It is NOT in the default feed set — it is opted into explicitly,
+because it has nothing like the jobs feed's ~5-minute cadence.
+
+- The `--pricebook` no-op flag is **removed** (and the reusable workflow's
+  `pricebook` boolean input with it). It never did anything; the capability it
+  reserved is now the `pricebook` feed.
+- `_meta` gains a `contract_version` column, blank for `jobs`/`technicians`
+  (whose contract predates versioning) and `pricebook.v1` for the four new rows.
+  A `_meta` tab written by an older exporter reads back as blank, not an error.
+- New optional `EXPORTER_PRICEBOOK_CATEGORY_IDS` (workflow input
+  `pricebook_category_ids`) restricts the feed to specific categories. Ids are
+  requested **one per request and merged** — ServiceTitan's `categoryIds` filter
+  silently ignores every id after the first.
+- Requires the ServiceTitan scopes `pricebook.services:r`,
+  `pricebook.equipment:r`, `pricebook.materials:r`, `pricebook.categories:r` (and
+  `pricebook.images:r` for the separate image-download work, which is not a feed
+  — image bytes never enter the Sheet, only asset identifiers do).
+
 ## [0.2.8] — 2026-09-09 · One place to bump the version
 
 The version was written in four places — `pyproject.toml`, `EXPORTER_VERSION`,

@@ -22,11 +22,10 @@ def run_once(
     feeds: str = typer.Option(
         "jobs,technicians",
         "--feeds",
-        help="Comma-separated feeds to run this call: jobs, technicians, or both.",
-    ),
-    pricebook: bool = typer.Option(
-        False,
-        help="No-op; reserved for a future price-book feed the CLI doesn't support yet.",
+        help=(
+            "Comma-separated feeds to run this call: jobs, technicians, pricebook. "
+            "`pricebook` writes the four pricebook.* tabs and is not on by default."
+        ),
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Compute the run but don't write to Google Sheets."
@@ -41,7 +40,6 @@ def run_once(
         st_settings,
         exporter_settings,
         feeds=parse_feeds(feeds),
-        pricebook=pricebook,
         dry_run=dry_run,
     )
 
@@ -69,6 +67,11 @@ def run_once(
         f"jobs={summary.jobs_row_count} technicians={summary.technicians_row_count} "
         f"skipped_no_job={summary.skipped_no_job} dry_run={summary.dry_run}"
     )
+    if summary.pricebook_row_counts is not None:
+        message += "".join(
+            f" {tab.replace('.', '_')}={count}"
+            for tab, count in sorted(summary.pricebook_row_counts.items())
+        )
     if outbox_summary is not None:
         message += (
             f" outbox_claimed={outbox_summary.claimed} outbox_succeeded={outbox_summary.succeeded} "

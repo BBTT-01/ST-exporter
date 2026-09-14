@@ -23,6 +23,11 @@ from st_exporter.feeds.assignments import fetch_assignments_delta
 from st_exporter.feeds.customers import fetch_customers_delta
 from st_exporter.feeds.jobs import fetch_jobs_delta
 from st_exporter.feeds.locations import fetch_locations_delta
+from st_exporter.feeds.pricebook import (
+    ITEM_RESOURCES,
+    fetch_pricebook_categories,
+    fetch_pricebook_items,
+)
 from st_exporter.feeds.raw_cache import RawCache
 from st_exporter.feeds.reference import fetch_business_units, fetch_job_types, fetch_technicians
 from st_exporter.format import (
@@ -33,6 +38,7 @@ from st_exporter.format import (
 )
 from st_exporter.logging_setup import configure_logging, logger
 from st_exporter.meta import CursorBundle, MetaRow, build_meta_grid, parse_meta_grid
+from st_exporter.pricebook import CONTRACT_VERSION, build_category_grid, build_item_grid
 from st_exporter.sheets import SheetsClient, SheetsPort, get_gspread_client
 from st_exporter.window import DEFAULT_WINDOW_DAYS, in_window
 
@@ -42,8 +48,17 @@ _RAW_JOBS = "_raw_jobs"
 _RAW_APPOINTMENTS = "_raw_appointments"
 _RAW_ASSIGNMENTS = "_raw_assignments"
 
-_VALID_FEEDS = frozenset({"jobs", "technicians"})
+_VALID_FEEDS = frozenset({"jobs", "technicians", "pricebook"})
+# `pricebook` is deliberately NOT a default: it is a catalogue on a much slower
+# cadence than jobs (~5 min) and technicians (~30 min), and re-listing it on every
+# jobs run would be pure waste. It is opted into with `--feeds pricebook`.
 DEFAULT_FEEDS = frozenset({"jobs", "technicians"})
+
+# The four tabs the single `pricebook` feed writes, tab name -> ServiceTitan
+# resource. Each gets its own `_meta` row keyed by the tab name.
+PRICEBOOK_TABS: dict[str, str] = {f"pricebook.{resource}": resource for resource in ITEM_RESOURCES}
+PRICEBOOK_CATEGORIES_TAB = "pricebook.categories"
+PRICEBOOK_FEED_NAMES: tuple[str, ...] = tuple(PRICEBOOK_TABS) + (PRICEBOOK_CATEGORIES_TAB,)
 
 
 def parse_feeds(value: str) -> frozenset[str]:
@@ -54,11 +69,12 @@ def parse_feeds(value: str) -> frozenset[str]:
     """
     feeds = frozenset(part.strip() for part in value.split(",") if part.strip())
     if not feeds:
-        raise ConfigError("--feeds must name at least one of: jobs, technicians.")
+        raise ConfigError("--feeds must name at least one of: jobs, technicians, pricebook.")
     unknown = feeds - _VALID_FEEDS
     if unknown:
         raise ConfigError(
-            f"unknown feed(s): {', '.join(sorted(unknown))}. Valid feeds: jobs, technicians."
+            f"unknown feed(s): {', '.join(sorted(unknown))}. "
+            "Valid feeds: jobs, technicians, pricebook."
         )
     return feeds
 
@@ -69,6 +85,10 @@ class ExportSummary:
     technicians_row_count: int
     skipped_no_job: int
     dry_run: bool
+    # Row count per `pricebook.*` tab, or None when the pricebook feed wasn't
+    # selected this run. None and {} are different: {} would mean "ran, wrote
+    # nothing", which never happens (a tab always gets at least its header).
+    pricebook_row_counts: dict[str, int] | None = None
 
 
 def run_export(
@@ -76,7 +96,6 @@ def run_export(
     exporter_settings: ExporterSettings,
     *,
     feeds: frozenset[str] = DEFAULT_FEEDS,
-    pricebook: bool = False,
     dry_run: bool = False,
     client: ServiceTitanClient | None = None,
     export_store: SheetsPort | None = None,
@@ -90,15 +109,15 @@ def run_export(
     time. The feed not selected is left byte-for-byte untouched in both the
     Export Store's tab and its `_meta` row.
 
+    ``pricebook`` is one selectable feed that writes four tabs
+    (`pricebook.services`/`equipment`/`materials`/`categories`), each with its own
+    `_meta` row — see ``pricebook.py`` for the frozen column contract.
+
     ``client``/``export_store``/``raw_cache_store`` can be injected (used by tests
     with fixtures and an in-memory Sheets double); left as ``None`` in production,
     where real ones are constructed from ``st_settings``/``exporter_settings``.
-    ``pricebook`` is accepted and does nothing when set, per ticket 05's explicit
-    scope cut — the CLI has no price-book commands to call anyway.
     """
     configure_logging()
-    if pricebook:
-        logger.info("pricebook=true has no effect (out of scope for this exporter)")
 
     owns_client = client is None
     active_client = client or ServiceTitanClient(st_settings)
@@ -112,6 +131,7 @@ def run_export(
             active_raw_cache_store,
             feeds=feeds,
             window_days=exporter_settings.window_days,
+            pricebook_category_ids=exporter_settings.pricebook_category_ids,
             dry_run=dry_run,
         )
     finally:
@@ -148,6 +168,7 @@ def _run(
     *,
     feeds: frozenset[str] = DEFAULT_FEEDS,
     window_days: int = DEFAULT_WINDOW_DAYS,
+    pricebook_category_ids: tuple[str, ...] = (),
     dry_run: bool,
 ) -> ExportSummary:
     now = datetime.now(timezone.utc)
@@ -192,11 +213,27 @@ def _run(
     elif "technicians" in meta_rows:
         new_meta_rows.append(meta_rows["technicians"])
 
+    pricebook_row_counts: dict[str, int] | None = None
+    if "pricebook" in feeds:
+        pricebook_row_counts = _run_pricebook_feed(
+            client,
+            export_store,
+            new_meta_rows=new_meta_rows,
+            run_at=run_at,
+            category_ids=pricebook_category_ids,
+            dry_run=dry_run,
+        )
+    else:
+        for feed_name in PRICEBOOK_FEED_NAMES:
+            if feed_name in meta_rows:
+                new_meta_rows.append(meta_rows[feed_name])
+
     if dry_run:
         logger.info(
-            "dry-run: would write jobs=%d technicians=%d (nothing written)",
+            "dry-run: would write jobs=%d technicians=%d pricebook=%s (nothing written)",
             jobs_row_count,
             technicians_row_count,
+            pricebook_row_counts,
         )
     else:
         export_store.replace_grid("_meta", build_meta_grid(new_meta_rows))
@@ -206,6 +243,7 @@ def _run(
         technicians_row_count=technicians_row_count,
         skipped_no_job=skipped_no_job,
         dry_run=dry_run,
+        pricebook_row_counts=pricebook_row_counts,
     )
 
 
@@ -358,6 +396,61 @@ def _run_technicians_feed(
         ]
         export_store.replace_grid("technicians", technicians_grid)
     return technician_rows
+
+
+def _run_pricebook_feed(
+    client: ServiceTitanClient,
+    export_store: SheetsPort,
+    *,
+    new_meta_rows: list[MetaRow],
+    run_at: str,
+    category_ids: tuple[str, ...] = (),
+    dry_run: bool,
+) -> dict[str, int]:
+    """Write the four `pricebook.*` tabs; append one MetaRow per tab.
+
+    A full replace every run, with no window and no cursor: pricebook is a
+    catalogue, so re-deriving every row from a fresh full list is both the simplest
+    correct thing and naturally bounded — `last_cursor` is therefore blank for all
+    four feeds, exactly like `technicians`.
+
+    The three item tabs are built from ONE code path (``build_item_grid``) because
+    they share one column set; only the tab name differs.
+    """
+    row_counts: dict[str, int] = {}
+    grids: dict[str, list[list[str]]] = {}
+
+    for tab_name, resource in PRICEBOOK_TABS.items():
+        records = fetch_pricebook_items(client, resource, category_ids=category_ids)
+        grids[tab_name] = build_item_grid(records)
+        row_counts[tab_name] = len(records)
+
+    categories = fetch_pricebook_categories(client)
+    grids[PRICEBOOK_CATEGORIES_TAB] = build_category_grid(categories)
+    row_counts[PRICEBOOK_CATEGORIES_TAB] = len(categories)
+
+    logger.info(
+        "pricebook: %s",
+        " ".join(f"{tab}={count}" for tab, count in sorted(row_counts.items())),
+    )
+
+    for tab_name, count in row_counts.items():
+        new_meta_rows.append(
+            MetaRow(
+                feed=tab_name,
+                last_run_at=run_at,
+                last_cursor="",
+                row_count=count,
+                exporter_version=EXPORTER_VERSION,
+                contract_version=CONTRACT_VERSION,
+            )
+        )
+
+    if not dry_run:
+        for tab_name, grid in grids.items():
+            export_store.replace_grid(tab_name, grid)
+
+    return row_counts
 
 
 def _technician_row(record: dict[str, Any]) -> dict[str, Any]:

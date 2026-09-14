@@ -82,7 +82,9 @@ def test_build_meta_grid_has_header_and_is_sorted_by_feed() -> None:
     assert grid[0] == list(META_COLUMNS)
     assert grid[1][0] == "jobs"
     assert grid[2][0] == "technicians"
-    assert grid[1] == ["jobs", "t1", "{}", "10", "0.1.0"]
+    # Trailing "" is contract_version: blank for jobs/technicians, whose tab
+    # contract predates versioning. Only the pricebook.* feeds declare one.
+    assert grid[1] == ["jobs", "t1", "{}", "10", "0.1.0", ""]
 
 
 def test_parse_meta_grid_round_trips_build_meta_grid() -> None:
@@ -103,8 +105,33 @@ def test_parse_meta_grid_of_empty_grid_is_empty() -> None:
 
 
 def test_parse_meta_grid_skips_blank_rows() -> None:
-    grid = [list(META_COLUMNS), ["", "", "", "", ""]]
+    grid = [list(META_COLUMNS), ["", "", "", "", "", ""]]
     assert parse_meta_grid(grid) == {}
+
+
+def test_meta_row_round_trips_contract_version() -> None:
+    rows = [
+        MetaRow(
+            feed="pricebook.services",
+            last_run_at="t1",
+            row_count=2,
+            exporter_version="0.2.8",
+            contract_version="pricebook.v1",
+        )
+    ]
+    parsed = parse_meta_grid(build_meta_grid(rows))
+    assert parsed["pricebook.services"].contract_version == "pricebook.v1"
+    assert parsed["pricebook.services"].last_cursor == ""
+
+
+def test_parse_meta_grid_of_a_pre_contract_version_grid_reads_it_as_blank() -> None:
+    # A _meta tab written by an older exporter has no contract_version column at
+    # all. "missing column" must read back as blank, not crash.
+    grid = [
+        ["feed", "last_run_at", "last_cursor", "row_count", "exporter_version"],
+        ["jobs", "t1", "{}", "10", "0.1.0"],
+    ]
+    assert parse_meta_grid(grid)["jobs"].contract_version == ""
 
 
 def test_parse_meta_grid_tolerates_non_numeric_row_count() -> None:

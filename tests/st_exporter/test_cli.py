@@ -46,7 +46,6 @@ class TestSuccessPath:
             "fake-st-settings",
             "fake-exporter-settings",
             feeds=DEFAULT_FEEDS,
-            pricebook=False,
             dry_run=False,
         )
 
@@ -62,11 +61,12 @@ class TestSuccessPath:
             main()
 
         assert exc_info.value.code == 0
-        mock_run.assert_called_once_with(
-            "s", "e", feeds=DEFAULT_FEEDS, pricebook=False, dry_run=True
-        )
+        mock_run.assert_called_once_with("s", "e", feeds=DEFAULT_FEEDS, dry_run=True)
 
-    def test_pricebook_flag_is_passed_through(self, monkeypatch) -> None:
+    def test_pricebook_noop_flag_is_gone(self, monkeypatch, capsys) -> None:
+        """`--pricebook` was a deliberate no-op; ticket 06 replaced it with a real
+        feed selected by `--feeds pricebook`, so the flag must now be rejected
+        rather than silently accepted and ignored."""
         monkeypatch.setattr("sys.argv", [_ARGV0, "--pricebook"])
         with (
             patch("st_exporter.cli.load_settings", return_value="s"),
@@ -77,10 +77,34 @@ class TestSuccessPath:
         ):
             main()
 
+        assert exc_info.value.code != 0
+        mock_run.assert_not_called()
+
+    def test_pricebook_row_counts_are_echoed_when_the_feed_ran(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "pricebook"])
+        counts = {
+            "pricebook.services": 2,
+            "pricebook.equipment": 1,
+            "pricebook.materials": 3,
+            "pricebook.categories": 4,
+        }
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=False)),
+            patch(
+                "st_exporter.cli.run_export",
+                return_value=_summary(pricebook_row_counts=counts),
+            ) as mock_run,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
         assert exc_info.value.code == 0
-        mock_run.assert_called_once_with(
-            "s", "e", feeds=DEFAULT_FEEDS, pricebook=True, dry_run=False
-        )
+        out = capsys.readouterr().out
+        assert "pricebook_services=2" in out
+        assert "pricebook_categories=4" in out
+        mock_run.assert_called_once_with("s", "e", feeds=frozenset({"pricebook"}), dry_run=False)
 
 
 class TestFeedsFlag:
@@ -95,9 +119,7 @@ class TestFeedsFlag:
             main()
 
         assert exc_info.value.code == 0
-        mock_run.assert_called_once_with(
-            "s", "e", feeds=frozenset({"jobs"}), pricebook=False, dry_run=False
-        )
+        mock_run.assert_called_once_with("s", "e", feeds=frozenset({"jobs"}), dry_run=False)
 
     def test_invalid_feeds_value_prints_clean_error_and_exits_one(
         self, monkeypatch, capsys

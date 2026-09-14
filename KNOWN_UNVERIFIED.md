@@ -197,3 +197,29 @@ Also unconfirmed: whether the campaign list endpoint supports a server-side `nam
 filter. `_find` deliberately lists all campaigns and matches locally instead, because
 a filter ServiceTitan silently ignored would return page one of every campaign and
 could match the wrong row.
+
+## Pricebook list endpoints: `active=Any`, and the `assets` shape
+
+`src/st_exporter/feeds/pricebook.py`, `src/st_exporter/pricebook.py`
+
+Three guesses, none confirmable without a tenant:
+
+- **`active=Any`.** Assumed the pricebook list endpoints take the same
+  `active` parameter as the settings endpoints, so withdrawn items export as
+  `active=false` instead of vanishing. If the real parameter differs, the tabs
+  silently become active-only — which consumers cannot distinguish from a
+  contractor deleting items, and they are forbidden from deleting rows.
+- **`assets[].id`.** Taken from TrueQuote's own client type, where it is
+  `string | null`. `image_refs` falls back to `assets[].url` when the id is
+  absent, and that url is either an HTTPS URL or an authenticated storage path
+  (`Images/Pricebook/<uuid>.jpg`). Whether ServiceTitan supplies stable asset ids
+  at all on these payloads is unconfirmed; if it never does, `image_refs` is
+  entirely url/path-shaped, which the contract still permits ("identifiers").
+- **`name` is never blank.** The contract guarantees it; ServiceTitan could
+  return both `displayName` and `name` as null. The builder falls back to `code`
+  and then the item id rather than emit a blank cell. Whether that fallback ever
+  fires in practice is unknown.
+
+Also unverified: that the four tabs' row counts are small enough that a full
+replace every run stays well inside a Sheets write. A very large catalogue has
+never been measured.

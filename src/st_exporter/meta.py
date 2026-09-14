@@ -1,7 +1,8 @@
 """The `_meta` tab: per-feed run bookkeeping, and the bundled multi-feed cursor.
 
-`_meta` has one row per output feed (`jobs`, `technicians`) with columns `feed`,
-`last_run_at`, `last_cursor`, `row_count`, `exporter_version`. TradeRated reads it
+`_meta` has one row per output feed (`jobs`, `technicians`, and the four
+`pricebook.*` tabs) with columns `feed`, `last_run_at`, `last_cursor`,
+`row_count`, `exporter_version`, `contract_version`. TradeRated reads it
 for reconciliation and support.
 
 `last_cursor` for the `jobs` feed is not a single ServiceTitan continuation token —
@@ -23,6 +24,7 @@ META_COLUMNS: tuple[str, ...] = (
     "last_cursor",
     "row_count",
     "exporter_version",
+    "contract_version",
 )
 
 # The five high-volume, cursor-tracked feeds that the `jobs` output feed is
@@ -43,6 +45,11 @@ class MetaRow:
     last_cursor: str = ""
     row_count: int = 0
     exporter_version: str = ""
+    # The tab contract this row's feed was written against, e.g. "pricebook.v1".
+    # Blank for the `jobs`/`technicians` feeds, whose contract (spec.md) predates
+    # versioning and is identified by the tab shape itself. A blank cell means
+    # "no declared version" — never collapse it with an unrecognised one.
+    contract_version: str = ""
 
 
 @dataclass
@@ -101,6 +108,7 @@ def parse_meta_grid(grid: list[list[str]]) -> dict[str, MetaRow]:
             last_cursor=cell("last_cursor"),
             row_count=_parse_row_count(cell("row_count")),
             exporter_version=cell("exporter_version"),
+            contract_version=cell("contract_version"),
         )
     return rows
 
@@ -126,6 +134,7 @@ def build_meta_grid(rows: list[MetaRow]) -> list[list[str]]:
                 row.last_cursor,
                 str(row.row_count),
                 row.exporter_version,
+                row.contract_version,
             ]
         )
     return grid

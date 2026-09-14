@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       feeds:
-        description: "Comma-separated feeds to run: jobs, technicians, or both"
+        description: "Comma-separated feeds to run: jobs, technicians, pricebook"
         type: string
         default: "jobs,technicians"
       window:
@@ -15,10 +15,14 @@ on:
         description: "Export target; only 'sheets' is supported today"
         type: string
         default: "sheets"
-      pricebook:
-        description: "Reserved; has no effect (the CLI has no price-book commands)"
-        type: boolean
-        default: false
+      pricebook_category_ids:
+        description: >-
+          Optional comma-separated ServiceTitan pricebook category ids to restrict
+          the pricebook feed to. Blank exports the whole catalogue. Each id costs
+          one extra request per item resource (ServiceTitan honours one id per
+          request), so leave it blank unless a tenant really needs it.
+        type: string
+        default: ""
     secrets:
       ST_CLIENT_ID:
         required: true
@@ -149,11 +153,17 @@ jobs:
           EXPORTER_WINDOW_DAYS: ${{ inputs.window }}
           TRADERATED_MACHINE_TOKEN: ${{ secrets.TRADERATED_MACHINE_TOKEN }}
           TRADERATED_OUTBOX_BASE_URL: ${{ secrets.TRADERATED_OUTBOX_BASE_URL }}
+          EXPORTER_PRICEBOOK_CATEGORY_IDS: ${{ inputs.pricebook_category_ids }}
           FEEDS: ${{ inputs.feeds }}
-          PRICEBOOK_FLAG: ${{ inputs.pricebook && '--pricebook' || '' }}
         run: |
-          case "$FEEDS" in
-            jobs|technicians|jobs,technicians) ;;
-            *) echo "::error::invalid feeds input: $FEEDS" >&2; exit 1 ;;
-          esac
-          st-export --feeds "$FEEDS" $PRICEBOOK_FLAG
+          # Per-segment check rather than an enumeration of every combination —
+          # `st-export` validates the same set again (parse_feeds), this is just
+          # the earlier, clearer failure.
+          IFS=',' read -ra FEED_PARTS <<< "$FEEDS"
+          for feed in "${FEED_PARTS[@]}"; do
+            case "$(echo "$feed" | tr -d '[:space:]')" in
+              jobs|technicians|pricebook) ;;
+              *) echo "::error::invalid feeds input: $FEEDS" >&2; exit 1 ;;
+            esac
+          done
+          st-export --feeds "$FEEDS"

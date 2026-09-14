@@ -33,3 +33,22 @@ class ExporterSettings(BaseSettings):
     # than error — the exact silent-failure mode this package treats as its
     # highest-stakes risk (see window.py's module docstring).
     window_days: int = Field(default=90, ge=1, validation_alias="EXPORTER_WINDOW_DAYS")
+
+    # Optional comma-separated ServiceTitan pricebook category ids to restrict the
+    # pricebook feed to. Blank (the default) exports the whole catalogue, which is
+    # what the tab contract describes. Kept as a raw string rather than a tuple
+    # field because pydantic-settings parses a complex-typed env var as JSON, and
+    # "1,2,3" is not JSON. Not GOOGLE_-prefixed; see window_days.
+    #
+    # Each id costs one extra serial request per item resource — ServiceTitan's
+    # `categoryIds` filter honours exactly ONE id per request (see
+    # feeds/pricebook.py), so ids are never batched.
+    pricebook_category_ids_raw: str = Field(
+        default="", validation_alias="EXPORTER_PRICEBOOK_CATEGORY_IDS"
+    )
+
+    @property
+    def pricebook_category_ids(self) -> tuple[str, ...]:
+        """``pricebook_category_ids_raw`` split into ids, blanks dropped."""
+        parts = self.pricebook_category_ids_raw.split(",")
+        return tuple(part.strip() for part in parts if part.strip())

@@ -3,9 +3,11 @@
 Reads ServiceTitan change feeds via the (upstream) ``st_cli`` package, denormalises
 jobs/appointments/customers/locations into one row per appointment, applies the
 90-day-or-future window, and writes the result to a Google Sheet that TradeRated
-reads read-only. The tab contract (``jobs``/``technicians``/``_meta``) is frozen by
-``spec.md`` on the TradeRated side; see ``KNOWN_UNVERIFIED.md`` for field-mapping
-assumptions that need confirming once real ServiceTitan credentials exist.
+reads read-only, plus the four ``pricebook.*`` catalogue tabs. The tab contract
+(``jobs``/``technicians``/``_meta``) is frozen by ``spec.md`` on the TradeRated
+side, and the pricebook tabs by ``CONTRACT-pricebook-tabs.md`` (``pricebook.v1``);
+see ``KNOWN_UNVERIFIED.md`` for field-mapping assumptions that need confirming once
+real ServiceTitan credentials exist.
 """
 
 from __future__ import annotations
