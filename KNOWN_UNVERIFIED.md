@@ -223,3 +223,45 @@ Three guesses, none confirmable without a tenant:
 Also unverified: that the four tabs' row counts are small enough that a full
 replace every run stays well inside a Sheets write. A very large catalogue has
 never been measured.
+
+## Pricebook image upload — what could not be confirmed without a live TrueQuote
+
+`src/st_exporter/images/`
+
+The wire format was derived by READING TrueQuote's receiving route
+(`apps/admin/app/api/outbox/pricebook-image/route.ts` and
+`lib/integrations/hosted-pricebook-image.ts`) on branch
+`feat/servicetitan-hosted`, **which was uncommitted working-tree code at the time
+(2026-09-14)**. Nothing was exchanged with a running instance. Specifically:
+
+- **The base URL's shape is assumed.** This client posts to
+  `{TRADERATED_OUTBOX_BASE_URL}/pricebook-image`, i.e. the base is expected to be
+  `https://<truequote-host>/api/outbox`. The same setting is used by the booking
+  outbox client, which posts to `{base}/crm-outbox` and
+  `{base}/crm-outbox/{id}/result` — but TrueQuote's booking routes are
+  `/api/outbox/booking/claim` and `/api/outbox/booking/result`. **Those two
+  cannot both be right.** The image path here matches TrueQuote's route exactly;
+  the booking lane's paths are a pre-existing, separate mismatch (ticket 07) and
+  were deliberately left alone.
+- **TrueQuote reads no idempotency field.** Its dedupe is intrinsic —
+  `storage_path = sha256(source_url)`, uploaded with `upsert: true`, and the row
+  keyed `(external_item_id, asset_id | sha256(source_url))`. The
+  `Idempotency-Key` header this exporter sends is therefore ignored today. What
+  actually stops bytes being re-sent is our own `_image_ledger` tab, because the
+  endpoint offers **no GET, no HEAD and no manifest** to ask "do you have this
+  already?" before sending.
+- **One asset per item, by necessity.** The receiving route hardcodes
+  `is_primary: true` and the reconcile RPC clears `is_primary` for the whole item
+  first, so a second upload for one item MOVES its primary rather than adding a
+  second image. The exporter therefore sends only the asset TrueQuote's own
+  `selectDefaultPricebookImage` would have chosen. If TrueQuote later wants every
+  asset, its route has to stop asserting `is_primary`.
+- **Tie-break ordering may differ in the last digit.** TrueQuote sorts the
+  `id|fileName|alias|url` tuple with `localeCompare`; this sorts by code point.
+  They can disagree only about which of several equally-default images wins.
+- **`active=Any` items are uploaded too.** The pricebook feed lists withdrawn
+  items so the `active` column can say `false`; their images are uploaded like
+  any other. Whether TrueQuote wants bytes for inactive items was not asked.
+- Nothing here has met a real ServiceTitan tenant: the `Pricebook → Images`
+  permission, the real `Content-Type` ServiceTitan returns for a storage-path
+  image, and whether real assets ever exceed the 8 MiB cap are all unconfirmed.

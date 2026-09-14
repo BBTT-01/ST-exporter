@@ -28,9 +28,28 @@ because it has nothing like the jobs feed's ~5-minute cadence.
   requested **one per request and merged** — ServiceTitan's `categoryIds` filter
   silently ignores every id after the first.
 - Requires the ServiceTitan scopes `pricebook.services:r`,
-  `pricebook.equipment:r`, `pricebook.materials:r`, `pricebook.categories:r` (and
-  `pricebook.images:r` for the separate image-download work, which is not a feed
-  — image bytes never enter the Sheet, only asset identifiers do).
+  `pricebook.equipment:r`, `pricebook.materials:r`, `pricebook.categories:r` and
+  `pricebook.images:r`.
+
+### Image upload (`--upload-images`, on by default with `--feeds pricebook`)
+
+Image bytes still never enter the Sheet — `image_refs` carries identifiers only.
+The bytes are downloaded on the contractor's own runner and POSTed to TrueQuote's
+`{TRADERATED_OUTBOX_BASE_URL}/pricebook-image` endpoint with a **second** machine
+token, `TRADERATED_IMAGE_TOKEN` (scope `image_upload` — not interchangeable with
+the booking outbox's token). No token, no upload, no error: the tabs are written
+either way.
+
+- Both identifier forms are resolved: a public `https://` url is fetched
+  directly, an authenticated `Images/Pricebook/<uuid>.jpg` path through
+  `pricebook/v2/tenant/{id}/images?path=…`.
+- A 403 on that images endpoint is a **named, non-fatal** outcome
+  (`images_permission_denied=true` in the run's output): the contractor may not
+  have granted `Pricebook → Images`. Public images and every tab still land.
+- Safe to run twice. A new `_image_ledger` tab on the private raw-cache Sheet
+  records a key derived from the asset identity plus a hash of its bytes, so a
+  re-run sends nothing and a genuinely changed image is re-sent.
+- One failed or refused image never aborts the run.
 
 ## [0.2.8] — 2026-09-09 · One place to bump the version
 

@@ -36,6 +36,9 @@ from st_exporter.format import (
     format_job_row,
     format_technician_row,
 )
+from st_exporter.images.client import TrueQuoteImageClient
+from st_exporter.images.ledger import ImageLedger
+from st_exporter.images.upload import ImageUploadSummary, upload_pricebook_images
 from st_exporter.logging_setup import configure_logging, logger
 from st_exporter.meta import CursorBundle, MetaRow, build_meta_grid, parse_meta_grid
 from st_exporter.pricebook import CONTRACT_VERSION, build_category_grid, build_item_grid
@@ -89,6 +92,9 @@ class ExportSummary:
     # selected this run. None and {} are different: {} would mean "ran, wrote
     # nothing", which never happens (a tab always gets at least its header).
     pricebook_row_counts: dict[str, int] | None = None
+    # What the image upload pass did, or None when it didn't run (pricebook feed
+    # not selected, no `image_upload` machine token configured, or dry-run).
+    images: ImageUploadSummary | None = None
 
 
 def run_export(
@@ -100,6 +106,7 @@ def run_export(
     client: ServiceTitanClient | None = None,
     export_store: SheetsPort | None = None,
     raw_cache_store: SheetsPort | None = None,
+    image_client: TrueQuoteImageClient | None = None,
 ) -> ExportSummary:
     """Run one export: fetch feeds, denormalise, window-filter, write the Sheets.
 
@@ -132,6 +139,7 @@ def run_export(
             feeds=feeds,
             window_days=exporter_settings.window_days,
             pricebook_category_ids=exporter_settings.pricebook_category_ids,
+            image_client=image_client,
             dry_run=dry_run,
         )
     finally:
@@ -169,6 +177,7 @@ def _run(
     feeds: frozenset[str] = DEFAULT_FEEDS,
     window_days: int = DEFAULT_WINDOW_DAYS,
     pricebook_category_ids: tuple[str, ...] = (),
+    image_client: TrueQuoteImageClient | None = None,
     dry_run: bool,
 ) -> ExportSummary:
     now = datetime.now(timezone.utc)
@@ -214,13 +223,16 @@ def _run(
         new_meta_rows.append(meta_rows["technicians"])
 
     pricebook_row_counts: dict[str, int] | None = None
+    image_summary: ImageUploadSummary | None = None
     if "pricebook" in feeds:
-        pricebook_row_counts = _run_pricebook_feed(
+        pricebook_row_counts, image_summary = _run_pricebook_feed(
             client,
             export_store,
+            raw_cache_store,
             new_meta_rows=new_meta_rows,
             run_at=run_at,
             category_ids=pricebook_category_ids,
+            image_client=image_client,
             dry_run=dry_run,
         )
     else:
@@ -244,6 +256,7 @@ def _run(
         skipped_no_job=skipped_no_job,
         dry_run=dry_run,
         pricebook_row_counts=pricebook_row_counts,
+        images=image_summary,
     )
 
 
@@ -401,12 +414,14 @@ def _run_technicians_feed(
 def _run_pricebook_feed(
     client: ServiceTitanClient,
     export_store: SheetsPort,
+    raw_cache_store: SheetsPort,
     *,
     new_meta_rows: list[MetaRow],
     run_at: str,
     category_ids: tuple[str, ...] = (),
+    image_client: TrueQuoteImageClient | None = None,
     dry_run: bool,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], ImageUploadSummary | None]:
     """Write the four `pricebook.*` tabs; append one MetaRow per tab.
 
     A full replace every run, with no window and no cursor: pricebook is a
@@ -420,10 +435,13 @@ def _run_pricebook_feed(
     row_counts: dict[str, int] = {}
     grids: dict[str, list[list[str]]] = {}
 
+    item_records: list[dict[str, Any]] = []
+
     for tab_name, resource in PRICEBOOK_TABS.items():
         records = fetch_pricebook_items(client, resource, category_ids=category_ids)
         grids[tab_name] = build_item_grid(records)
         row_counts[tab_name] = len(records)
+        item_records.extend(records)
 
     categories = fetch_pricebook_categories(client)
     grids[PRICEBOOK_CATEGORIES_TAB] = build_category_grid(categories)
@@ -450,7 +468,56 @@ def _run_pricebook_feed(
         for tab_name, grid in grids.items():
             export_store.replace_grid(tab_name, grid)
 
-    return row_counts
+    return row_counts, _upload_pricebook_images(
+        client,
+        raw_cache_store,
+        item_records,
+        image_client=image_client,
+        run_at=run_at,
+        dry_run=dry_run,
+    )
+
+
+def _upload_pricebook_images(
+    client: ServiceTitanClient,
+    raw_cache_store: SheetsPort,
+    item_records: list[dict[str, Any]],
+    *,
+    image_client: TrueQuoteImageClient | None,
+    run_at: str,
+    dry_run: bool,
+) -> ImageUploadSummary | None:
+    """Push image bytes to TrueQuote for the items this feed just exported.
+
+    A flag on the pricebook feed rather than a feed of its own, because the
+    assets it uploads are a column of the rows that were just fetched: running
+    it separately would mean re-listing the whole catalogue to learn the same
+    thing. It inherits the pricebook cadence for the same reason images change
+    when the catalogue changes.
+
+    Returns None — not an empty summary — when the pass did not run at all:
+    "nothing to upload" and "never looked" are different facts to whoever reads
+    the run's output.
+    """
+    if image_client is None or dry_run:
+        return None
+
+    ledger = ImageLedger(raw_cache_store)
+    summary = upload_pricebook_images(client, image_client, ledger, item_records, now=run_at)
+    # Only prune on a pass that actually saw the whole catalogue — a run stopped
+    # by a 403 or a rate limit has "not looked at" assets that must not be
+    # mistaken for "gone" and re-uploaded next run.
+    if summary.complete:
+        ledger.keep(summary.seen_keys)
+    ledger.flush()
+
+    logger.info("pricebook images: %s", summary.as_log_fields())
+    if summary.permission_denied:
+        logger.warning(
+            "pricebook image upload incomplete: the tenant has not granted "
+            "`Pricebook -> Images`. Every pricebook tab was still written."
+        )
+    return summary
 
 
 def _technician_row(record: dict[str, Any]) -> dict[str, Any]:

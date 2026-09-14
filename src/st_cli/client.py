@@ -62,6 +62,19 @@ class ServiceTitanClient:
     ) -> Any:
         return self._request("DELETE", module, resource, params=params, json_body=json_body)
 
+    def get_bytes(
+        self, module: str, resource: str, params: dict[str, Any] | None = None
+    ) -> tuple[bytes, str | None]:
+        """Raw response body + its ``Content-Type``, for endpoints returning a file.
+
+        ``pricebook/v2/tenant/{id}/images?path=…`` answers with image bytes, not
+        JSON, so ``get()``'s ``resp.json()`` would raise on it. Everything else —
+        auth header, 401 refresh, 429 backoff, error mapping — is identical;
+        only the decoding differs.
+        """
+        resp = self._send("GET", module, resource, params=params)
+        return resp.content, resp.headers.get("content-type")
+
     def _request(
         self,
         method: str,
@@ -70,6 +83,25 @@ class ServiceTitanClient:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> Any:
+        resp = self._send(method, module, resource, params=params, json_body=json_body)
+        if resp.status_code == 204:
+            return None
+        return resp.json()
+
+    def _send(
+        self,
+        method: str,
+        module: str,
+        resource: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        """Issue one API call and map failures onto the exception hierarchy.
+
+        Returns the raw ``httpx.Response`` so callers can decode it as JSON
+        (``_request``) or as bytes (``get_bytes``) — the retry/auth/error
+        behaviour must not be duplicated per decoding.
+        """
         url = self._url(module, resource)
         retries = 0
         refreshed = False
@@ -99,6 +131,4 @@ class ServiceTitanClient:
         if resp.status_code >= 400:
             raise APIError(resp.status_code, resp.text)
 
-        if resp.status_code == 204:
-            return None
-        return resp.json()
+        return resp

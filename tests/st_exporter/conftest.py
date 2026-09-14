@@ -57,6 +57,7 @@ def clear_traderated_env(monkeypatch):
     """
     monkeypatch.delenv("TRADERATED_MACHINE_TOKEN", raising=False)
     monkeypatch.delenv("TRADERATED_OUTBOX_BASE_URL", raising=False)
+    monkeypatch.delenv("TRADERATED_IMAGE_TOKEN", raising=False)
 
 
 @pytest.fixture(autouse=True)

@@ -9,6 +9,7 @@ from st_cli.client import ServiceTitanClient
 from st_cli.config import Settings, load_settings
 from st_cli.exceptions import STCLIError
 from st_exporter.config import ExporterSettings
+from st_exporter.images.client import TrueQuoteImageClient
 from st_exporter.logging_setup import logger
 from st_exporter.outbox.client import TradeRatedOutboxClient
 from st_exporter.outbox.drain import DrainSummary, drain_outbox
@@ -30,18 +31,34 @@ def run_once(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Compute the run but don't write to Google Sheets."
     ),
+    upload_images: bool = typer.Option(
+        True,
+        "--upload-images/--no-upload-images",
+        help=(
+            "With `--feeds pricebook`, also POST the pricebook image bytes to TrueQuote. "
+            "Needs TRADERATED_IMAGE_TOKEN + TRADERATED_OUTBOX_BASE_URL; silently skipped "
+            "without them. Identifiers still go in the Sheet either way."
+        ),
+    ),
 ) -> None:
     """Run one ServiceTitan -> Export Store export pass, then drain the CRM Outbox."""
     st_settings = load_settings()
     exporter_settings = ExporterSettings()  # type: ignore[call-arg]
     traderated_settings = TradeRatedSettings()
 
-    summary = run_export(
-        st_settings,
-        exporter_settings,
-        feeds=parse_feeds(feeds),
-        dry_run=dry_run,
-    )
+    parsed_feeds = parse_feeds(feeds)
+    image_client = _image_client(traderated_settings, parsed_feeds, upload_images, dry_run)
+    try:
+        summary = run_export(
+            st_settings,
+            exporter_settings,
+            feeds=parsed_feeds,
+            dry_run=dry_run,
+            image_client=image_client,
+        )
+    finally:
+        if image_client is not None:
+            image_client.close()
 
     outbox_summary: DrainSummary | None = None
     if not dry_run and traderated_settings.configured:
@@ -72,12 +89,44 @@ def run_once(
             f" {tab.replace('.', '_')}={count}"
             for tab, count in sorted(summary.pricebook_row_counts.items())
         )
+    if summary.images is not None:
+        images = summary.images
+        message += (
+            f" images_uploaded={images.uploaded} images_already={images.already_uploaded} "
+            f"images_failed={images.download_failed + images.upload_rejected} "
+            f"images_permission_denied={str(images.permission_denied).lower()}"
+        )
     if outbox_summary is not None:
         message += (
             f" outbox_claimed={outbox_summary.claimed} outbox_succeeded={outbox_summary.succeeded} "
             f"outbox_failed={outbox_summary.failed} outbox_replayed={outbox_summary.replayed}"
         )
     typer.echo(message)
+
+
+def _image_client(
+    traderated_settings: TradeRatedSettings,
+    feeds: frozenset[str],
+    upload_images: bool,
+    dry_run: bool,
+) -> TrueQuoteImageClient | None:
+    """The image-upload client, or None when this run has no business uploading.
+
+    Gated the same way the outbox drain is: a missing token is the EXPECTED
+    state until TrueQuote issues one, so it is INFO and a skip, never an error.
+    The token is the `image_upload`-scoped one — presenting the booking token
+    here earns a 401 from TrueQuote, not a fallback.
+    """
+    if not upload_images or dry_run or "pricebook" not in feeds:
+        return None
+    if not traderated_settings.images_configured:
+        logger.info("TRADERATED_IMAGE_TOKEN/OUTBOX_BASE_URL not set; skipping image upload")
+        return None
+    assert traderated_settings.image_token
+    assert traderated_settings.outbox_base_url
+    return TrueQuoteImageClient(
+        traderated_settings.outbox_base_url, traderated_settings.image_token
+    )
 
 
 def _drain_outbox(

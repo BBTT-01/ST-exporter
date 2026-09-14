@@ -34,7 +34,10 @@ class TestSuccessPath:
         with (
             patch("st_exporter.cli.load_settings", return_value="fake-st-settings"),
             patch("st_exporter.cli.ExporterSettings", return_value="fake-exporter-settings"),
-            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=False)),
+            patch(
+                "st_exporter.cli.TradeRatedSettings",
+                return_value=MagicMock(configured=False, images_configured=False),
+            ),
             patch("st_exporter.cli.run_export", return_value=_summary()) as mock_run,
             pytest.raises(SystemExit) as exc_info,
         ):
@@ -47,6 +50,7 @@ class TestSuccessPath:
             "fake-exporter-settings",
             feeds=DEFAULT_FEEDS,
             dry_run=False,
+            image_client=None,
         )
 
     def test_dry_run_flag_is_passed_through(self, monkeypatch) -> None:
@@ -54,14 +58,19 @@ class TestSuccessPath:
         with (
             patch("st_exporter.cli.load_settings", return_value="s"),
             patch("st_exporter.cli.ExporterSettings", return_value="e"),
-            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=False)),
+            patch(
+                "st_exporter.cli.TradeRatedSettings",
+                return_value=MagicMock(configured=False, images_configured=False),
+            ),
             patch("st_exporter.cli.run_export", return_value=_summary(dry_run=True)) as mock_run,
             pytest.raises(SystemExit) as exc_info,
         ):
             main()
 
         assert exc_info.value.code == 0
-        mock_run.assert_called_once_with("s", "e", feeds=DEFAULT_FEEDS, dry_run=True)
+        mock_run.assert_called_once_with(
+            "s", "e", feeds=DEFAULT_FEEDS, dry_run=True, image_client=None
+        )
 
     def test_pricebook_noop_flag_is_gone(self, monkeypatch, capsys) -> None:
         """`--pricebook` was a deliberate no-op; ticket 06 replaced it with a real
@@ -71,7 +80,10 @@ class TestSuccessPath:
         with (
             patch("st_exporter.cli.load_settings", return_value="s"),
             patch("st_exporter.cli.ExporterSettings", return_value="e"),
-            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=False)),
+            patch(
+                "st_exporter.cli.TradeRatedSettings",
+                return_value=MagicMock(configured=False, images_configured=False),
+            ),
             patch("st_exporter.cli.run_export", return_value=_summary()) as mock_run,
             pytest.raises(SystemExit) as exc_info,
         ):
@@ -91,7 +103,10 @@ class TestSuccessPath:
         with (
             patch("st_exporter.cli.load_settings", return_value="s"),
             patch("st_exporter.cli.ExporterSettings", return_value="e"),
-            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=False)),
+            patch(
+                "st_exporter.cli.TradeRatedSettings",
+                return_value=MagicMock(configured=False, images_configured=False),
+            ),
             patch(
                 "st_exporter.cli.run_export",
                 return_value=_summary(pricebook_row_counts=counts),
@@ -104,7 +119,9 @@ class TestSuccessPath:
         out = capsys.readouterr().out
         assert "pricebook_services=2" in out
         assert "pricebook_categories=4" in out
-        mock_run.assert_called_once_with("s", "e", feeds=frozenset({"pricebook"}), dry_run=False)
+        mock_run.assert_called_once_with(
+            "s", "e", feeds=frozenset({"pricebook"}), dry_run=False, image_client=None
+        )
 
 
 class TestFeedsFlag:
@@ -119,7 +136,9 @@ class TestFeedsFlag:
             main()
 
         assert exc_info.value.code == 0
-        mock_run.assert_called_once_with("s", "e", feeds=frozenset({"jobs"}), dry_run=False)
+        mock_run.assert_called_once_with(
+            "s", "e", feeds=frozenset({"jobs"}), dry_run=False, image_client=None
+        )
 
     def test_invalid_feeds_value_prints_clean_error_and_exits_one(
         self, monkeypatch, capsys
@@ -185,7 +204,7 @@ class TestOutboxDrain:
 
     def test_skips_outbox_drain_when_not_configured(self, monkeypatch) -> None:
         monkeypatch.setattr("sys.argv", [_ARGV0])
-        fake_traderated_settings = MagicMock(configured=False)
+        fake_traderated_settings = MagicMock(configured=False, images_configured=False)
         with (
             patch("st_exporter.cli.load_settings", return_value="s"),
             patch("st_exporter.cli.ExporterSettings", return_value="e"),

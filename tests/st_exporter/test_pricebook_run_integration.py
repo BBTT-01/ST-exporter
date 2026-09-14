@@ -197,3 +197,149 @@ def test_not_selecting_pricebook_leaves_its_tabs_and_meta_untouched(
     assert export_store.tabs["pricebook.services"] == before
     meta = parse_meta_grid(export_store.tabs["_meta"])
     assert meta["pricebook.services"].contract_version == "pricebook.v1"
+
+
+# --- image upload lane -------------------------------------------------------
+#
+# The pricebook feed carries a second, optional job: POST the image bytes to
+# TrueQuote. These run the whole of `run_export` with an image client attached,
+# so what's exercised is the wiring (feed -> assets -> download -> POST ->
+# ledger), not just the uploader in isolation.
+
+TQ_BASE = "https://truequote.example.com/api/outbox"
+TQ_UPLOAD = f"{TQ_BASE}/pricebook-image"
+# tenant_pricebook's EQUIPMENT_1 carries this as its default asset.
+EQUIPMENT_IMAGE_URL = "https://cdn.example.com/a1.jpg"
+PNG = b"\x89PNG\r\n\x1a\n" + b"body"
+
+
+def _image_client():
+    from st_exporter.images.client import TrueQuoteImageClient
+
+    return TrueQuoteImageClient(TQ_BASE, "tqm_image-token")
+
+
+def _run_with_images(st_settings, exporter_settings, export_store, raw_cache_store, client):
+    with _frozen_now():
+        return run_export(
+            st_settings,
+            exporter_settings,
+            feeds=frozenset({"pricebook"}),
+            export_store=export_store,
+            raw_cache_store=raw_cache_store,
+            image_client=client,
+        )
+
+
+@respx.mock
+def test_pricebook_run_uploads_image_bytes_and_records_them(st_settings, exporter_settings) -> None:
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    respx.get(EQUIPMENT_IMAGE_URL).mock(return_value=httpx.Response(200, content=PNG))
+    respx.get(f"{st_settings.api_base}/pricebook/v2/tenant/12345/images").mock(
+        return_value=httpx.Response(200, content=PNG)
+    )
+    upload = respx.post(TQ_UPLOAD).mock(
+        return_value=httpx.Response(
+            200, json={"asset_key": "100:a1", "storage_path": "co/st/x.png", "status": "stored"}
+        )
+    )
+    export_store, raw_cache_store = InMemorySheetsStore(), InMemorySheetsStore()
+
+    client = _image_client()
+    try:
+        summary = _run_with_images(
+            st_settings, exporter_settings, export_store, raw_cache_store, client
+        )
+    finally:
+        client.close()
+
+    assert summary.images is not None
+    assert summary.images.uploaded == 1
+    assert upload.calls[0].request.content == PNG
+    # The identifiers still went to the Sheet; the bytes never did.
+    assert "image_refs" in export_store.tabs["pricebook.equipment"][0]
+    assert b"PNG" not in repr(export_store.tabs["pricebook.equipment"]).encode()
+    # And the run remembered the upload so the next one can skip it.
+    assert raw_cache_store.tabs["_image_ledger"][1][0]
+
+
+@respx.mock
+def test_a_refused_upload_does_not_abort_the_run(st_settings, exporter_settings) -> None:
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    respx.get(EQUIPMENT_IMAGE_URL).mock(return_value=httpx.Response(200, content=PNG))
+    respx.post(TQ_UPLOAD).mock(
+        return_value=httpx.Response(422, json={"error": "image_content_mismatch"})
+    )
+    export_store, raw_cache_store = InMemorySheetsStore(), InMemorySheetsStore()
+
+    client = _image_client()
+    try:
+        summary = _run_with_images(
+            st_settings, exporter_settings, export_store, raw_cache_store, client
+        )
+    finally:
+        client.close()
+
+    # Every tab was still written and every row still counted.
+    assert summary.pricebook_row_counts == {
+        "pricebook.services": 2,
+        "pricebook.equipment": 1,
+        "pricebook.materials": 1,
+        "pricebook.categories": 2,
+    }
+    assert set(export_store.tabs) >= set(PRICEBOOK_TABS)
+    assert summary.images is not None and summary.images.upload_rejected == 1
+
+
+@respx.mock
+def test_servicetitan_403_on_images_is_reported_and_the_tabs_still_land(
+    st_settings, exporter_settings
+) -> None:
+    mock_auth_token(st_settings.auth_url)
+    # An item whose only image is an AUTHENTICATED storage path — the form that
+    # needs the `Pricebook -> Images` permission the contractor may not have
+    # granted.
+    tenant_pricebook.register(
+        st_settings.api_base,
+        equipment=[
+            {
+                **tenant_pricebook.EQUIPMENT_1,
+                "assets": [{"id": None, "url": "Images/Pricebook/9f2c-uuid.jpg"}],
+            }
+        ],
+    )
+    respx.get(f"{st_settings.api_base}/pricebook/v2/tenant/12345/images").mock(
+        return_value=httpx.Response(403, text="Pricebook Images permission missing")
+    )
+    respx.post(TQ_UPLOAD).mock(
+        return_value=httpx.Response(
+            200, json={"asset_key": "k", "storage_path": "p", "status": "stored"}
+        )
+    )
+    export_store, raw_cache_store = InMemorySheetsStore(), InMemorySheetsStore()
+
+    client = _image_client()
+    try:
+        summary = _run_with_images(
+            st_settings, exporter_settings, export_store, raw_cache_store, client
+        )
+    finally:
+        client.close()
+
+    assert summary.images is not None
+    assert summary.images.permission_denied is True
+    assert set(export_store.tabs) >= set(PRICEBOOK_TABS)
+
+
+@respx.mock
+def test_no_image_client_means_no_upload_pass_at_all(st_settings, exporter_settings) -> None:
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    export_store = InMemorySheetsStore()
+
+    summary = _run(st_settings, exporter_settings, export_store)
+
+    # None, not an empty summary: "didn't look" and "nothing to send" differ.
+    assert summary.images is None
