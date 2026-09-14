@@ -4,6 +4,89 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Financial feed
+
+`st-export --feeds financial` writes four new tabs for Profit Wizard —
+`accounting.invoices`, `payroll.timesheets`, `settings.businessUnits` and
+`reporting.jobCosts` — each with its own `_meta` row carrying
+`contract_version: financial.v1`.
+
+**The column names are Profit Wizard's, not this exporter's.** Its reader already
+exists (`lib/hosted/tabs.ts` on `feat-servicetitan-hosted`) and indexes these tabs
+by header name using ServiceTitan's own PascalCase spellings, so the headers here
+were transcribed from that parser rather than designed. Two consequences worth
+knowing: `accounting.invoices` is **one row per invoice LINE ITEM**, not per
+invoice, and `reporting.jobCosts` carries the report's own field names verbatim.
+
+### Window: 90 days, for a different reason than the jobs window's 90
+
+Not inherited from the jobs feed. The jobs window is 90 because a five-month-old
+job scheduled for today must appear on a technician's screen; nothing about that
+applies to an invoice. This window is 90 because that is the **shortest** window
+still covering every Profit Wizard surface fed from ServiceTitan — measured
+against Profit Wizard's own code, not picked as a round number:
+
+- `OPERATING_METRIC_WINDOW_DAYS = 90` (warranty %, financing %)
+- `ANALYSIS_WINDOW_DAYS = 90` in the safety engine, with 7/30/90 buckets
+- the six-hourly `sync-job-costs` cron pulls invoices, hours and quotes with
+  `maxLookbackDays: 90`
+- the dashboard (30 days), technicians page (30) and goals (month-to-date) all
+  sit inside 90
+
+It is a separate, separately-configurable knob (`EXPORTER_FINANCIAL_WINDOW_DAYS`,
+workflow input `financial_window`) so that a tenant needing a longer financial
+history can never drag the jobs window along with it. Known gap: Profit Wizard's
+reports page offers a 365-day timeframe, which 90 does not cover — raise the knob
+for a tenant that uses it. The 12-month forecasting inputs and 36-month history
+come from QuickBooks, not ServiceTitan, and are not this feed's problem.
+
+### Job costing comes from the built-in report, located BY NAME
+
+`/accounting/v2/.../jobs/{id}/costing` 404s on every tenant tried, so per-job cost
+comes from the **Job Costing Summary** report instead. Its report id differs per
+tenant, so it is discovered at runtime — by exact name, case-folded and
+whitespace-collapsed, and by nothing else:
+
+- **no fingerprint fallback and no best-match scoring.** Profit Wizard prefers a
+  name match and then falls back to scoring every report by its columns; taking
+  the best fingerprint match can silently resolve to a contractor's own report and
+  produce wrong money numbers with no error anywhere.
+- a report marked user-defined is skipped even when the name matches exactly;
+- no match raises `JobCostingReportNotFoundError`, two distinct matches raise
+  `JobCostingReportAmbiguousError`. Both are refusals, never a guess.
+
+`POST .../reports/{id}/data` is a **read** — its parameters are in the body only
+because a report run has more of them than a query string holds — and is never
+gated behind a mutation or dry-run guard. Reporting is throttled far harder than
+the rest of the API, so a 429 surviving the client's backoff aborts the whole
+report pull rather than writing a truncated tab, and pagination is capped.
+
+### One tab failing never costs the other three
+
+Each of the four tabs is built behind its own guard. A tab that fails is not
+written: its previous contents stay exactly as they were and its previous `_meta`
+row is **carried forward unchanged**, so `last_run_at` still says when that tab was
+last genuinely refreshed. The other three land, and the failure is named in the
+run's output as `financial_failed=<tab>`, not buried in a log. Only `STCLIError`
+is caught — a bug in the row mapping still crashes loudly rather than quietly
+emptying a money tab.
+
+- `financial` is **not** in the default feed set. It is a six-hourly cadence,
+  matching the Profit Wizard cron it replaces, not the jobs feed's ~5 minutes.
+- `payroll.timesheets` costs **one request per completed job**: the bulk
+  `payroll/timesheets` list returns the payroll shape
+  (`employeeId`/`startedOn`), while the consumer reads the dispatch shape
+  (`jobId`/`technicianId`/`arrivedOn`/`doneOn`/`canceledOn`), which only
+  `payroll/v2/.../jobs/{jobId}/timesheets` supplies. Capped by
+  `EXPORTER_FINANCIAL_MAX_JOBS` (default 500); hitting the cap is logged.
+- `settings.businessUnits` is written here for the first time — the jobs feed
+  already *fetched* business units for its denormalisation join, but never wrote
+  a tab, so nothing is written twice.
+- Requires the ServiceTitan scopes `accounting.invoices:r`, `payroll.timesheets:r`
+  and `settings.businessUnits:r`, plus the Reporting permission (exact portal name
+  still unconfirmed — see KNOWN_UNVERIFIED.md) and `jpm.jobs:r` for the job list
+  the timesheet pass walks.
+
 ## [Unreleased] · Pricebook feed
 
 `st-export --feeds pricebook` writes four new tabs to the Export Store —

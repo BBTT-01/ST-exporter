@@ -9,6 +9,55 @@ is flagged inline in the relevant source file too. **Check these first** once
 Paul's ServiceTitan environment (or any real tenant) is available, before trusting
 `st_exporter`'s output against real data.
 
+## Financial feed: date-filter parameter spellings
+
+`src/st_exporter/feeds/financial.py`, `INVOICE_DATE_PARAM`, `JOB_COMPLETED_PARAM`
+
+Assumed `invoicedOnOrAfter` on `accounting/v2/.../invoices` (Profit Wizard uses
+this exact spelling, so it is well-evidenced) and `completedOnOrAfter` on
+`jpm/v2/.../jobs` (inferred — Profit Wizard filters its own local `completed_date`
+column rather than ServiceTitan's parameter, so nothing confirms the API spelling).
+A wrong parameter name is the dangerous kind of wrong here: ServiceTitan ignores
+unknown query parameters rather than rejecting them, so the feed would quietly
+export the **entire** invoice or job history instead of the window. Check the
+row counts against the window on the first real run.
+
+`sort: "-completedOn"` on the job list is likewise inferred; if it is rejected or
+ignored, the `max_jobs` cap would truncate to an arbitrary set of jobs rather than
+the most recently completed ones.
+
+## Financial feed: how ServiceTitan marks a report as custom
+
+`src/st_exporter/feeds/reporting.py`, `_CUSTOM_BOOLEAN_FIELDS`, `_CUSTOM_KIND_FIELDS`
+
+The exporter refuses to build `reporting.jobCosts` from a contractor-authored
+report, but ServiceTitan's actual field for "this report is user-defined" has not
+been seen on a real tenant. Several plausible spellings are accepted (`isCustom`,
+`custom`, `isUserDefined`, `userDefined`, and a `type`/`reportType`/`kind`/`source`
+of `Custom`/`UserDefined`/`Tenant`). The asymmetry is deliberate: a false positive
+costs a loud refusal, a false negative costs silently wrong money numbers. **If
+ServiceTitan marks custom reports some other way, or not at all, the only
+remaining guard is the exact-name match plus the ambiguity refusal** — which is
+still strictly stronger than Profit Wizard's current fingerprint fallback, but
+weaker than intended. Confirm on a tenant that has custom reports.
+
+## Financial feed: the Reporting permission's portal name
+
+The ticket flags this too. `reporting/v2/...` needs a Reporting permission whose
+exact name on the ServiceTitan app page is unconfirmed. Until it is granted, the
+`reporting.jobCosts` tab is skipped with `financial_failed=reporting.jobCosts`
+and the other three tabs still land — the failure is visible, not silent.
+
+## Financial feed: the job-timesheets response envelope
+
+`src/st_exporter/feeds/financial.py`, `_as_records`
+
+`payroll/v2/.../jobs/{jobId}/timesheets` has been observed answering with a bare
+JSON array on some tenants and a `{"data": [...]}` envelope on others (Profit
+Wizard accepts both). Both are accepted here. Whether it also paginates on a job
+with very many segments is unknown — this code reads one response per job and
+would silently truncate if it does.
+
 ## `appointment-assignments` "removed" status values
 
 `src/st_exporter/denormalize.py`, `_REMOVED_ASSIGNMENT_STATUSES`

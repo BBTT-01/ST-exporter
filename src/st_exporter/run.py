@@ -14,13 +14,21 @@ from typing import Any
 
 from st_cli.client import ServiceTitanClient
 from st_cli.config import Settings
-from st_cli.exceptions import ConfigError
+from st_cli.exceptions import ConfigError, STCLIError
 from st_exporter import EXPORTER_VERSION
 from st_exporter.config import ExporterSettings
 from st_exporter.denormalize import build_job_rows
 from st_exporter.feeds.appointments import fetch_appointments_delta
 from st_exporter.feeds.assignments import fetch_assignments_delta
 from st_exporter.feeds.customers import fetch_customers_delta
+from st_exporter.feeds.financial import (
+    DEFAULT_MAX_TIMESHEET_JOBS,
+    fetch_completed_job_ids,
+    fetch_invoices,
+    fetch_job_costs,
+    fetch_timesheets,
+)
+from st_exporter.feeds.financial import fetch_business_units as fetch_business_unit_list
 from st_exporter.feeds.jobs import fetch_jobs_delta
 from st_exporter.feeds.locations import fetch_locations_delta
 from st_exporter.feeds.pricebook import (
@@ -30,6 +38,15 @@ from st_exporter.feeds.pricebook import (
 )
 from st_exporter.feeds.raw_cache import RawCache
 from st_exporter.feeds.reference import fetch_business_units, fetch_job_types, fetch_technicians
+from st_exporter.financial import (
+    CONTRACT_VERSION as FINANCIAL_CONTRACT_VERSION,
+)
+from st_exporter.financial import (
+    build_business_unit_grid,
+    build_invoice_grid,
+    build_job_cost_grid,
+    build_timesheet_grid,
+)
 from st_exporter.format import (
     JOB_COLUMNS,
     TECHNICIAN_COLUMNS,
@@ -43,7 +60,7 @@ from st_exporter.logging_setup import configure_logging, logger
 from st_exporter.meta import CursorBundle, MetaRow, build_meta_grid, parse_meta_grid
 from st_exporter.pricebook import CONTRACT_VERSION, build_category_grid, build_item_grid
 from st_exporter.sheets import SheetsClient, SheetsPort, get_gspread_client
-from st_exporter.window import DEFAULT_WINDOW_DAYS, in_window
+from st_exporter.window import DEFAULT_WINDOW_DAYS, FINANCIAL_WINDOW_DAYS, in_window
 
 _RAW_CUSTOMERS = "_raw_customers"
 _RAW_LOCATIONS = "_raw_locations"
@@ -51,10 +68,13 @@ _RAW_JOBS = "_raw_jobs"
 _RAW_APPOINTMENTS = "_raw_appointments"
 _RAW_ASSIGNMENTS = "_raw_assignments"
 
-_VALID_FEEDS = frozenset({"jobs", "technicians", "pricebook"})
-# `pricebook` is deliberately NOT a default: it is a catalogue on a much slower
-# cadence than jobs (~5 min) and technicians (~30 min), and re-listing it on every
-# jobs run would be pure waste. It is opted into with `--feeds pricebook`.
+_VALID_FEEDS = frozenset({"jobs", "technicians", "pricebook", "financial"})
+# Neither `pricebook` nor `financial` is a default. `pricebook` is a catalogue on a
+# much slower cadence than jobs (~5 min) and technicians (~30 min), and re-listing
+# it on every jobs run would be pure waste. `financial` is a six-hourly feed —
+# matching the cadence of the Profit Wizard cron it replaces — and its job-costing
+# half runs a ServiceTitan report, which is throttled to roughly one run per minute
+# per tenant, so putting it on the jobs cadence would throttle the tenant outright.
 DEFAULT_FEEDS = frozenset({"jobs", "technicians"})
 
 # The four tabs the single `pricebook` feed writes, tab name -> ServiceTitan
@@ -62,6 +82,20 @@ DEFAULT_FEEDS = frozenset({"jobs", "technicians"})
 PRICEBOOK_TABS: dict[str, str] = {f"pricebook.{resource}": resource for resource in ITEM_RESOURCES}
 PRICEBOOK_CATEGORIES_TAB = "pricebook.categories"
 PRICEBOOK_FEED_NAMES: tuple[str, ...] = tuple(PRICEBOOK_TABS) + (PRICEBOOK_CATEGORIES_TAB,)
+
+# The four tabs the single `financial` feed writes. The names are Profit Wizard's,
+# not this exporter's — its reader (`lib/hosted/tabs.ts`) addresses these exact
+# strings, so they are part of the contract, dots and camelCase included.
+FINANCIAL_INVOICES_TAB = "accounting.invoices"
+FINANCIAL_TIMESHEETS_TAB = "payroll.timesheets"
+FINANCIAL_BUSINESS_UNITS_TAB = "settings.businessUnits"
+FINANCIAL_JOB_COSTS_TAB = "reporting.jobCosts"
+FINANCIAL_FEED_NAMES: tuple[str, ...] = (
+    FINANCIAL_INVOICES_TAB,
+    FINANCIAL_TIMESHEETS_TAB,
+    FINANCIAL_BUSINESS_UNITS_TAB,
+    FINANCIAL_JOB_COSTS_TAB,
+)
 
 
 def parse_feeds(value: str) -> frozenset[str]:
@@ -72,12 +106,14 @@ def parse_feeds(value: str) -> frozenset[str]:
     """
     feeds = frozenset(part.strip() for part in value.split(",") if part.strip())
     if not feeds:
-        raise ConfigError("--feeds must name at least one of: jobs, technicians, pricebook.")
+        raise ConfigError(
+            "--feeds must name at least one of: jobs, technicians, pricebook, financial."
+        )
     unknown = feeds - _VALID_FEEDS
     if unknown:
         raise ConfigError(
             f"unknown feed(s): {', '.join(sorted(unknown))}. "
-            "Valid feeds: jobs, technicians, pricebook."
+            "Valid feeds: jobs, technicians, pricebook, financial."
         )
     return feeds
 
@@ -95,6 +131,14 @@ class ExportSummary:
     # What the image upload pass did, or None when it didn't run (pricebook feed
     # not selected, no `image_upload` machine token configured, or dry-run).
     images: ImageUploadSummary | None = None
+    # Row count per successfully-written `financial` tab, or None when the feed
+    # wasn't selected. A tab that FAILED is absent from this dict and present in
+    # `financial_failures` — the two together always name all four tabs, so
+    # "wrote 0 rows" can never be confused with "didn't manage to write".
+    financial_row_counts: dict[str, int] | None = None
+    # Tab name -> why it was skipped, for the financial tabs that failed. Its
+    # previous contents and its `_meta` row are left untouched in the Sheet.
+    financial_failures: dict[str, str] | None = None
 
 
 def run_export(
@@ -120,6 +164,12 @@ def run_export(
     (`pricebook.services`/`equipment`/`materials`/`categories`), each with its own
     `_meta` row — see ``pricebook.py`` for the frozen column contract.
 
+    ``financial`` is likewise one selectable feed writing four tabs
+    (`accounting.invoices`, `payroll.timesheets`, `settings.businessUnits`,
+    `reporting.jobCosts`) for Profit Wizard — see ``financial.py``. Its four tabs
+    are independent: one failing leaves the other three written and keeps the
+    failed tab's previous contents and `_meta` row.
+
     ``client``/``export_store``/``raw_cache_store`` can be injected (used by tests
     with fixtures and an in-memory Sheets double); left as ``None`` in production,
     where real ones are constructed from ``st_settings``/``exporter_settings``.
@@ -138,6 +188,8 @@ def run_export(
             active_raw_cache_store,
             feeds=feeds,
             window_days=exporter_settings.window_days,
+            financial_window_days=exporter_settings.financial_window_days,
+            financial_max_jobs=exporter_settings.financial_max_jobs,
             pricebook_category_ids=exporter_settings.pricebook_category_ids,
             image_client=image_client,
             dry_run=dry_run,
@@ -176,6 +228,8 @@ def _run(
     *,
     feeds: frozenset[str] = DEFAULT_FEEDS,
     window_days: int = DEFAULT_WINDOW_DAYS,
+    financial_window_days: int = FINANCIAL_WINDOW_DAYS,
+    financial_max_jobs: int = DEFAULT_MAX_TIMESHEET_JOBS,
     pricebook_category_ids: tuple[str, ...] = (),
     image_client: TrueQuoteImageClient | None = None,
     dry_run: bool,
@@ -240,12 +294,33 @@ def _run(
             if feed_name in meta_rows:
                 new_meta_rows.append(meta_rows[feed_name])
 
+    financial_row_counts: dict[str, int] | None = None
+    financial_failures: dict[str, str] | None = None
+    if "financial" in feeds:
+        financial_row_counts, financial_failures = _run_financial_feed(
+            client,
+            export_store,
+            meta_rows=meta_rows,
+            new_meta_rows=new_meta_rows,
+            run_at=run_at,
+            today=today,
+            window_days=financial_window_days,
+            max_jobs=financial_max_jobs,
+            dry_run=dry_run,
+        )
+    else:
+        for feed_name in FINANCIAL_FEED_NAMES:
+            if feed_name in meta_rows:
+                new_meta_rows.append(meta_rows[feed_name])
+
     if dry_run:
         logger.info(
-            "dry-run: would write jobs=%d technicians=%d pricebook=%s (nothing written)",
+            "dry-run: would write jobs=%d technicians=%d pricebook=%s financial=%s "
+            "(nothing written)",
             jobs_row_count,
             technicians_row_count,
             pricebook_row_counts,
+            financial_row_counts,
         )
     else:
         export_store.replace_grid("_meta", build_meta_grid(new_meta_rows))
@@ -257,6 +332,8 @@ def _run(
         dry_run=dry_run,
         pricebook_row_counts=pricebook_row_counts,
         images=image_summary,
+        financial_row_counts=financial_row_counts,
+        financial_failures=financial_failures,
     )
 
 
@@ -476,6 +553,115 @@ def _run_pricebook_feed(
         run_at=run_at,
         dry_run=dry_run,
     )
+
+
+def _run_financial_feed(
+    client: ServiceTitanClient,
+    export_store: SheetsPort,
+    *,
+    meta_rows: dict[str, MetaRow],
+    new_meta_rows: list[MetaRow],
+    run_at: str,
+    today: Any,
+    window_days: int,
+    max_jobs: int,
+    dry_run: bool,
+) -> tuple[dict[str, int], dict[str, str]]:
+    """Write the four `financial` tabs; append one MetaRow per tab that succeeded.
+
+    **The four tabs are independent, and that is the point.** ``reporting.jobCosts``
+    depends on a report that may be absent, ambiguous or throttled, and
+    ``payroll.timesheets`` costs one request per completed job — either can fail on
+    a tenant where invoices and business units are perfectly readable. So each tab
+    is built behind its own guard:
+
+    - a tab that succeeds is written and gets a fresh `_meta` row;
+    - a tab that fails is NOT written — its previous contents stay exactly as they
+      were, and its previous `_meta` row is carried forward unchanged, so
+      ``last_run_at`` still says when that tab was last genuinely refreshed rather
+      than claiming a run that produced nothing;
+    - either way the other three land.
+
+    Only ``STCLIError`` (which covers every ServiceTitan HTTP failure and every
+    ``ReportUnavailableError``) is caught. A ``KeyError`` or ``TypeError`` out of the
+    row-mapping code is a bug in this repo, not a tenant's bad day, and must still
+    crash loudly rather than quietly emptying a money tab.
+
+    Unlike the pricebook feed this one is **window-bounded** — invoices and
+    timesheets grow without limit. See ``window.FINANCIAL_WINDOW_DAYS``.
+    """
+    row_counts: dict[str, int] = {}
+    failures: dict[str, str] = {}
+    grids: dict[str, list[list[str]]] = {}
+
+    def attempt(tab_name: str, build: Any) -> None:
+        try:
+            grid = build()
+        except STCLIError as exc:
+            failures[tab_name] = str(exc)
+            logger.warning(
+                "financial: %s was NOT written this run (%s). Its previous contents "
+                "and _meta row are unchanged; the other tabs are unaffected.",
+                tab_name,
+                exc,
+            )
+            if tab_name in meta_rows:
+                new_meta_rows.append(meta_rows[tab_name])
+            return
+        grids[tab_name] = grid
+        # The header row is not data — a tab with only a header is zero rows.
+        row_counts[tab_name] = max(len(grid) - 1, 0)
+        new_meta_rows.append(
+            MetaRow(
+                feed=tab_name,
+                last_run_at=run_at,
+                # Window-bounded full replace, re-derived every run exactly like
+                # the jobs tab: the window is time-relative, so a row's membership
+                # has to be re-decided each run regardless of what changed. Nothing
+                # to carry forward, so no cursor.
+                last_cursor="",
+                row_count=row_counts[tab_name],
+                exporter_version=EXPORTER_VERSION,
+                contract_version=FINANCIAL_CONTRACT_VERSION,
+            )
+        )
+
+    attempt(
+        FINANCIAL_INVOICES_TAB,
+        lambda: build_invoice_grid(fetch_invoices(client, today=today, window_days=window_days)),
+    )
+    attempt(
+        FINANCIAL_TIMESHEETS_TAB,
+        lambda: build_timesheet_grid(
+            fetch_timesheets(
+                client,
+                fetch_completed_job_ids(
+                    client, today=today, window_days=window_days, max_jobs=max_jobs
+                ),
+            )
+        ),
+    )
+    attempt(
+        FINANCIAL_BUSINESS_UNITS_TAB,
+        lambda: build_business_unit_grid(fetch_business_unit_list(client)),
+    )
+    attempt(
+        FINANCIAL_JOB_COSTS_TAB,
+        lambda: build_job_cost_grid(fetch_job_costs(client, today=today, window_days=window_days)),
+    )
+
+    logger.info(
+        "financial (window=%dd): %s",
+        window_days,
+        " ".join(f"{tab}={count}" for tab, count in sorted(row_counts.items()))
+        or "nothing written",
+    )
+
+    if not dry_run:
+        for tab_name, grid in grids.items():
+            export_store.replace_grid(tab_name, grid)
+
+    return row_counts, failures
 
 
 def _upload_pricebook_images(

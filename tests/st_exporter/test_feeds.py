@@ -28,6 +28,14 @@ class TestParseFeeds:
         # Catalogue cadence, not the ~5-minute jobs cadence.
         assert "pricebook" not in DEFAULT_FEEDS
 
+    def test_financial_is_a_valid_feed(self) -> None:
+        assert parse_feeds("financial") == {"financial"}
+
+    def test_financial_is_not_a_default_feed(self) -> None:
+        # Six-hourly cadence, and its job-costing half runs a ServiceTitan report
+        # throttled to roughly one run per minute per tenant.
+        assert "financial" not in DEFAULT_FEEDS
+
     def test_unknown_feed_raises_config_error(self) -> None:
         with pytest.raises(ConfigError, match="unknown"):
             parse_feeds("jobs,price-book")

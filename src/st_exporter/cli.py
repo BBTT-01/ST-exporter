@@ -24,8 +24,10 @@ def run_once(
         "jobs,technicians",
         "--feeds",
         help=(
-            "Comma-separated feeds to run this call: jobs, technicians, pricebook. "
-            "`pricebook` writes the four pricebook.* tabs and is not on by default."
+            "Comma-separated feeds to run this call: jobs, technicians, pricebook, "
+            "financial. `pricebook` writes the four pricebook.* tabs and `financial` "
+            "the four Profit Wizard tabs (accounting.invoices, payroll.timesheets, "
+            "settings.businessUnits, reporting.jobCosts); neither is on by default."
         ),
     ),
     dry_run: bool = typer.Option(
@@ -89,6 +91,16 @@ def run_once(
             f" {tab.replace('.', '_')}={count}"
             for tab, count in sorted(summary.pricebook_row_counts.items())
         )
+    if summary.financial_row_counts is not None:
+        message += "".join(
+            f" {_tab_key(tab)}={count}"
+            for tab, count in sorted(summary.financial_row_counts.items())
+        )
+    if summary.financial_failures:
+        # Named in the run's output rather than only in the log: a missing
+        # `reporting.jobCosts` tab is the difference between Profit Wizard costing
+        # jobs and not, and it must not be something you have to go digging for.
+        message += " financial_failed=" + ",".join(sorted(summary.financial_failures))
     if summary.images is not None:
         images = summary.images
         message += (
@@ -102,6 +114,11 @@ def run_once(
             f"outbox_failed={outbox_summary.failed} outbox_replayed={outbox_summary.replayed}"
         )
     typer.echo(message)
+
+
+def _tab_key(tab_name: str) -> str:
+    """`accounting.invoices` -> `accounting_invoices`, for the flat summary line."""
+    return tab_name.replace(".", "_")
 
 
 def _image_client(

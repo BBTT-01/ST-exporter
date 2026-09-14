@@ -1,7 +1,8 @@
 """The `_meta` tab: per-feed run bookkeeping, and the bundled multi-feed cursor.
 
-`_meta` has one row per output feed (`jobs`, `technicians`, and the four
-`pricebook.*` tabs) with columns `feed`, `last_run_at`, `last_cursor`,
+`_meta` has one row per output TAB (`jobs`, `technicians`, the four `pricebook.*`
+tabs and the four `financial` ones — `accounting.invoices`, `payroll.timesheets`,
+`settings.businessUnits`, `reporting.jobCosts`) with columns `feed`, `last_run_at`, `last_cursor`,
 `row_count`, `exporter_version`, `contract_version`. TradeRated reads it
 for reconciliation and support.
 
@@ -45,7 +46,8 @@ class MetaRow:
     last_cursor: str = ""
     row_count: int = 0
     exporter_version: str = ""
-    # The tab contract this row's feed was written against, e.g. "pricebook.v1".
+    # The tab contract this row's feed was written against, e.g. "pricebook.v1"
+    # or "financial.v1".
     # Blank for the `jobs`/`technicians` feeds, whose contract (spec.md) predates
     # versioning and is identified by the tab shape itself. A blank cell means
     # "no declared version" — never collapse it with an unrecognised one.

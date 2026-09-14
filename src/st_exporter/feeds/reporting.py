@@ -1,0 +1,252 @@
+"""Locating and pulling ONE ServiceTitan built-in report: Job Costing Summary.
+
+`/accounting/v2/.../jobs/{id}/costing` 404s on every tenant tried, so per-job cost
+comes from the **Job Costing Summary** report instead — a report ServiceTitan
+ships and owns, not one a contractor builds. Its report *id* differs per tenant
+(ServiceTitan assigns ids per account) so it has to be discovered at runtime; its
+*columns* do not, which is why ``financial.JOB_COST_COLUMNS`` can be frozen like
+every other tab.
+
+**The guard that matters.** Discovery is by NAME and by nothing else. ServiceTitan
+lets contractors create their own reports and edit their columns, and which custom
+reports exist depends on the contractor's package — so "the report whose columns
+best match what we expect" can silently resolve to a contractor's own spreadsheet
+and produce wrong money numbers with no error anywhere. Profit Wizard's current
+code prefers a name match and then falls back to scoring every report; this module
+deliberately has **no such fallback**:
+
+- exact name match after case-folding and whitespace collapsing — never
+  "contains", never fuzzy, never a best-of score;
+- a report carrying any marker that says it is user-defined is skipped even when
+  the name matches, because a contractor can name their own report anything;
+- no match at all raises :class:`JobCostingReportNotFoundError`;
+- more than one distinct match raises :class:`JobCostingReportAmbiguousError` rather
+  than picking one.
+
+Refusing is the correct outcome: the ``reporting.jobCosts`` tab is simply not
+written that run, the other three financial tabs still land, and nobody reconciles
+against a number that came from the wrong report.
+
+**`POST .../data` is a read.** Its parameters are in the body only because a report
+run has more of them than a query string comfortably holds. Nothing here mutates
+anything, so it is not gated behind ``dry_run`` and must never be treated as a
+write by a future guard.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Iterator
+
+from st_cli.client import ServiceTitanClient
+from st_cli.exceptions import RateLimitError, STCLIError
+from st_cli.pagination import fetch_all
+
+MODULE = "reporting"
+
+#: The built-in report this feed replicates. Matched exactly (case-folded,
+#: whitespace-collapsed) — see the module docstring for why there is no fallback.
+JOB_COSTING_SUMMARY_REPORT_NAME = "Job Costing Summary"
+
+_CATEGORIES_RESOURCE = "report-categories"
+_PAGE_SIZE = 200
+
+#: Reporting is rate-limited far harder than the rest of the API (ServiceTitan
+#: documents roughly one run of the same report per minute per tenant), so a
+#: runaway pagination loop is a way to get the whole tenant throttled. A report
+#: of per-job costs over the financial window is thousands of rows, not millions.
+_MAX_DATA_PAGES = 50
+
+
+class ReportUnavailableError(STCLIError):
+    """Base: the Job Costing Summary report could not be read this run.
+
+    Always non-fatal to the run as a whole — ``run.py`` skips the
+    ``reporting.jobCosts`` tab and writes the other three.
+    """
+
+
+class JobCostingReportNotFoundError(ReportUnavailableError):
+    """No report named exactly `Job Costing Summary` is visible to this tenant."""
+
+
+class JobCostingReportAmbiguousError(ReportUnavailableError):
+    """More than one distinct report carries that exact name — refuse to choose."""
+
+
+class ReportRateLimitedError(ReportUnavailableError):
+    """ServiceTitan throttled the report run even after the client's own retries."""
+
+
+@dataclass(frozen=True)
+class ReportRef:
+    """Where one report lives for THIS tenant: its category id and its report id."""
+
+    category_id: str
+    report_id: str
+    name: str
+
+
+def find_job_costing_summary(client: ServiceTitanClient) -> ReportRef:
+    """Locate the built-in Job Costing Summary report for this tenant, by name.
+
+    Raises :class:`JobCostingReportNotFoundError` or :class:`JobCostingReportAmbiguousError`
+    rather than returning a best guess. See the module docstring.
+    """
+    return find_builtin_report(client, JOB_COSTING_SUMMARY_REPORT_NAME)
+
+
+def find_builtin_report(client: ServiceTitanClient, report_name: str) -> ReportRef:
+    """The one built-in report with exactly ``report_name``, or refuse."""
+    wanted = _normalize(report_name)
+    matches: dict[tuple[str, str], ReportRef] = {}
+    skipped_custom = 0
+
+    for category in _iter_categories(client):
+        category_id = category.get("id")
+        if category_id is None:
+            continue
+        for report in _iter_reports(client, str(category_id)):
+            if _normalize(report.get("name")) != wanted:
+                continue
+            if _looks_custom(report):
+                # A contractor can name their own report anything, including this.
+                skipped_custom += 1
+                continue
+            report_id = report.get("id")
+            if report_id is None:
+                continue
+            ref = ReportRef(str(category_id), str(report_id), str(report.get("name")))
+            matches[(ref.category_id, ref.report_id)] = ref
+
+    if not matches:
+        detail = (
+            f"no built-in report named {report_name!r} is visible to this tenant"
+            if not skipped_custom
+            else (
+                f"the only report(s) named {report_name!r} visible to this tenant "
+                f"({skipped_custom}) are custom reports, which are never used — "
+                "a contractor-authored report would produce wrong cost numbers silently"
+            )
+        )
+        raise JobCostingReportNotFoundError(
+            f"{detail}. Grant the Reporting permission and confirm the built-in "
+            "Job Costing Summary report is available, then re-run."
+        )
+    if len(matches) > 1:
+        located = ", ".join(f"category {c}/report {r}" for c, r in sorted(matches))
+        raise JobCostingReportAmbiguousError(
+            f"{len(matches)} distinct reports are named {report_name!r} ({located}). "
+            "Refusing to choose between them — picking the wrong one would produce "
+            "wrong cost numbers with no error."
+        )
+    return next(iter(matches.values()))
+
+
+def fetch_report_rows(
+    client: ServiceTitanClient,
+    ref: ReportRef,
+    *,
+    parameters: list[dict[str, Any]],
+    page_size: int = _PAGE_SIZE,
+) -> list[dict[str, Any]]:
+    """Run the report and return every row as a dict keyed by field name.
+
+    The response is columnar (``fields`` describe the columns, ``data`` is a list
+    of positional lists), so it is zipped back into dicts here — the same shape
+    ``st_cli.commands.reporting._report_rows_to_dicts`` produces, kept local so
+    the exporter does not depend on a CLI presentation module.
+
+    A 429 that survives the client's own backoff aborts the WHOLE pull rather
+    than returning the pages fetched so far: a truncated cost report is worse
+    than no cost report, because a half-written tab looks complete to whoever
+    reads it. ``run.py`` leaves the previous tab and its `_meta` row untouched.
+    """
+    resource = f"report-category/{ref.category_id}/reports/{ref.report_id}/data"
+    body = {"parameters": parameters}
+
+    rows: list[dict[str, Any]] = []
+    field_names: list[str] = []
+    page = 1
+    while True:
+        try:
+            # A read, despite the verb — the parameters simply don't fit a query
+            # string. Never gate this behind a mutation guard or a dry-run check.
+            envelope = client.post(
+                MODULE, resource, json_body=body, params={"page": page, "pageSize": page_size}
+            )
+        except RateLimitError as exc:
+            raise ReportRateLimitedError(
+                f"ServiceTitan rate-limited the {ref.name!r} report on page {page} "
+                "(reporting is throttled to roughly one run of the same report per "
+                "minute per tenant). Skipping this tab; the rest of the feed is "
+                f"unaffected. Detail: {exc}"
+            ) from exc
+
+        if not field_names:
+            field_names = [str(field.get("name")) for field in envelope.get("fields") or []]
+        for data_row in envelope.get("data") or []:
+            rows.append(dict(zip(field_names, data_row)))
+
+        if not envelope.get("hasMore", False):
+            break
+        page += 1
+        if page > _MAX_DATA_PAGES:
+            raise ReportRateLimitedError(
+                f"the {ref.name!r} report still reported hasMore after "
+                f"{_MAX_DATA_PAGES} pages; stopping rather than hammering a "
+                "throttled endpoint or writing an unbounded tab."
+            )
+    return rows
+
+
+def report_metadata(client: ServiceTitanClient, ref: ReportRef) -> dict[str, Any]:
+    """The report's own description of its fields and parameters."""
+    result = client.get(MODULE, f"report-category/{ref.category_id}/reports/{ref.report_id}")
+    return result if isinstance(result, dict) else {}
+
+
+def _iter_categories(client: ServiceTitanClient) -> Iterator[dict[str, Any]]:
+    yield from fetch_all(client, MODULE, _CATEGORIES_RESOURCE, page_size=_PAGE_SIZE)
+
+
+def _iter_reports(client: ServiceTitanClient, category_id: str) -> Iterator[dict[str, Any]]:
+    yield from fetch_all(
+        client, MODULE, f"report-category/{category_id}/reports", page_size=_PAGE_SIZE
+    )
+
+
+def _normalize(name: Any) -> str:
+    """Case-fold and collapse whitespace — nothing looser.
+
+    This is the ENTIRE matching rule. It absorbs `"Job  Costing Summary"` and
+    `"job costing summary"`, and nothing else: no substring match, no token
+    subset, no edit distance. Anything looser lets a report called
+    "Job Costing Summary (Dave's copy)" through.
+    """
+    if name is None:
+        return ""
+    return " ".join(str(name).split()).casefold()
+
+
+#: Fields that, when truthy, mark a report as authored by the contractor rather
+#: than shipped by ServiceTitan. ServiceTitan's exact spelling is unconfirmed
+#: against a real tenant (see KNOWN_UNVERIFIED.md), so several plausible ones are
+#: accepted — a false positive here costs a refusal (loud, recoverable), while a
+#: false negative costs wrong money numbers (silent).
+_CUSTOM_BOOLEAN_FIELDS: tuple[str, ...] = ("isCustom", "custom", "isUserDefined", "userDefined")
+_CUSTOM_KIND_FIELDS: tuple[str, ...] = ("type", "reportType", "kind", "source")
+_CUSTOM_KIND_VALUES: frozenset[str] = frozenset({"custom", "userdefined", "user-defined", "tenant"})
+
+
+def _looks_custom(report: dict[str, Any]) -> bool:
+    """True when the report record says, in any spelling, that it is user-authored."""
+    for field in _CUSTOM_BOOLEAN_FIELDS:
+        value = report.get(field)
+        if isinstance(value, bool) and value:
+            return True
+    for field in _CUSTOM_KIND_FIELDS:
+        value = report.get(field)
+        if isinstance(value, str) and value.strip().casefold() in _CUSTOM_KIND_VALUES:
+            return True
+    return False

@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       feeds:
-        description: "Comma-separated feeds to run: jobs, technicians, pricebook"
+        description: "Comma-separated feeds to run: jobs, technicians, pricebook, financial"
         type: string
         default: "jobs,technicians"
       window:
@@ -15,6 +15,22 @@ on:
         description: "Export target; only 'sheets' is supported today"
         type: string
         default: "sheets"
+      financial_window:
+        description: >-
+          Financial window in days for the `financial` feed (invoices, timesheets
+          and the Job Costing Summary report). Separate from `window` on purpose:
+          the two share the number 90 but not the reason. 90 is the shortest
+          window covering every Profit Wizard surface fed from ServiceTitan; raise
+          it to 365 only for a tenant that uses the reports page's "Last year".
+        type: number
+        default: 90
+      financial_max_jobs:
+        description: >-
+          Cap on how many completed jobs the `financial` feed pulls timesheets for.
+          ServiceTitan has no bulk endpoint carrying the timesheet fields Profit
+          Wizard reads, so this costs one request per job.
+        type: number
+        default: 500
       pricebook_category_ids:
         description: >-
           Optional comma-separated ServiceTitan pricebook category ids to restrict
@@ -162,6 +178,8 @@ jobs:
           TRADERATED_OUTBOX_BASE_URL: ${{ secrets.TRADERATED_OUTBOX_BASE_URL }}
           TRADERATED_IMAGE_TOKEN: ${{ secrets.TRADERATED_IMAGE_TOKEN }}
           EXPORTER_PRICEBOOK_CATEGORY_IDS: ${{ inputs.pricebook_category_ids }}
+          EXPORTER_FINANCIAL_WINDOW_DAYS: ${{ inputs.financial_window }}
+          EXPORTER_FINANCIAL_MAX_JOBS: ${{ inputs.financial_max_jobs }}
           FEEDS: ${{ inputs.feeds }}
         run: |
           # Per-segment check rather than an enumeration of every combination —
@@ -170,7 +188,7 @@ jobs:
           IFS=',' read -ra FEED_PARTS <<< "$FEEDS"
           for feed in "${FEED_PARTS[@]}"; do
             case "$(echo "$feed" | tr -d '[:space:]')" in
-              jobs|technicians|pricebook) ;;
+              jobs|technicians|pricebook|financial) ;;
               *) echo "::error::invalid feeds input: $FEEDS" >&2; exit 1 ;;
             esac
           done

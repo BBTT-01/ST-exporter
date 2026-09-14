@@ -11,6 +11,9 @@ from __future__ import annotations
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from st_exporter.feeds.financial import DEFAULT_MAX_TIMESHEET_JOBS
+from st_exporter.window import FINANCIAL_WINDOW_DAYS
+
 
 class ExporterSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="GOOGLE_")
@@ -33,6 +36,26 @@ class ExporterSettings(BaseSettings):
     # than error — the exact silent-failure mode this package treats as its
     # highest-stakes risk (see window.py's module docstring).
     window_days: int = Field(default=90, ge=1, validation_alias="EXPORTER_WINDOW_DAYS")
+
+    # How far back the `financial` feed reaches. A SEPARATE knob from
+    # `window_days` on purpose: the two windows happen to share the number 90 but
+    # not the reason, and one tenant needing a longer financial history (Profit
+    # Wizard's reports page offers a 365-day timeframe) must not be able to drag
+    # the jobs window along with it. See window.FINANCIAL_WINDOW_DAYS.
+    # ge=1 for the same reason as window_days: a zero window would silently empty
+    # three money tabs rather than error.
+    financial_window_days: int = Field(
+        default=FINANCIAL_WINDOW_DAYS, ge=1, validation_alias="EXPORTER_FINANCIAL_WINDOW_DAYS"
+    )
+
+    # Cap on how many completed jobs the `financial` feed asks for timesheets.
+    # ServiceTitan has no bulk endpoint carrying the dispatch-shaped timesheet
+    # fields Profit Wizard reads, so this costs one request per job — see
+    # feeds/financial.py. ge=1 because zero would write an empty
+    # `payroll.timesheets` tab that looks like "this tenant logs no labour".
+    financial_max_jobs: int = Field(
+        default=DEFAULT_MAX_TIMESHEET_JOBS, ge=1, validation_alias="EXPORTER_FINANCIAL_MAX_JOBS"
+    )
 
     # Optional comma-separated ServiceTitan pricebook category ids to restrict the
     # pricebook feed to. Blank (the default) exports the whole catalogue, which is
