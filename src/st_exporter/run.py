@@ -475,7 +475,7 @@ def _run_technicians_feed(
 ) -> list[dict[str, Any]]:
     """Fetch technicians and (unless dry-run) write the tab; append its MetaRow."""
     technicians = fetch_technicians(client)
-    technician_rows = [_technician_row(record) for record in technicians]
+    technician_rows = _dedupe_technician_rows([_technician_row(record) for record in technicians])
     new_meta_rows.append(
         MetaRow(
             feed="technicians",
@@ -709,6 +709,62 @@ def _upload_pricebook_images(
             "`Pricebook -> Images`. Every pricebook tab was still written."
         )
     return summary
+
+
+def _dedupe_technician_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse repeats of the same technician, keeping the first occurrence.
+
+    The dedupe key is ``st_technician_id`` — the tab's own identity, and the key
+    the `jobs` tab's ``st_technician_id`` column joins against. A second row for
+    an id already emitted carries no information the first doesn't, so dropping
+    it is always safe; it also makes the tab robust against the list endpoint
+    returning a record twice across page boundaries.
+
+    It is deliberately NOT ``email``. Two DISTINCT technician ids sharing one
+    address is a real ServiceTitan state (a re-created technician record, or a
+    shop's shared inbox on several techs), and both of those technicians can be
+    assigned to jobs — so both must appear here or a `jobs` row would reference a
+    technician missing from the tab. A downstream unique-email constraint is the
+    downstream's to resolve; we log the collision rather than silently deleting a
+    real technician to satisfy it. Rows with no id are all kept, for the same
+    "never drop a real technician" reason.
+    """
+    seen_ids: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    duplicate_id_count = 0
+    for row in rows:
+        technician_id = row.get("st_technician_id")
+        if technician_id is not None:
+            key = str(technician_id)
+            if key in seen_ids:
+                duplicate_id_count += 1
+                continue
+            seen_ids.add(key)
+        deduped.append(row)
+
+    if duplicate_id_count:
+        logger.warning(
+            "technicians: dropped %d duplicate row(s) for an already-exported st_technician_id",
+            duplicate_id_count,
+        )
+
+    ids_by_email: dict[str, list[str]] = {}
+    for row in deduped:
+        email = str(row.get("email") or "").strip().lower()
+        if not email:
+            continue
+        ids_by_email.setdefault(email, []).append(str(row.get("st_technician_id")))
+    for email, ids in ids_by_email.items():
+        if len(ids) > 1:
+            logger.warning(
+                "technicians: %s is shared by %d distinct technician ids (%s); all "
+                "are exported — a consumer requiring unique emails must resolve it",
+                email,
+                len(ids),
+                ", ".join(ids),
+            )
+
+    return deduped
 
 
 def _technician_row(record: dict[str, Any]) -> dict[str, Any]:

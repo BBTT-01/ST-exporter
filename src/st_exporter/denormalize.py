@@ -238,7 +238,12 @@ def build_job_rows(
                 {
                     "st_job_id": job.get("id"),
                     "st_appointment_id": appointment_id,
-                    "job_number": job.get("number"),
+                    # ServiceTitan's JPM job object names this `jobNumber`; reading
+                    # only `number` left the column blank on every row ever exported
+                    # (0 non-empty cells across 2431 live rows), which hard-blocked
+                    # the consumer's NOT NULL `jobs.job_number`. `number` is kept as a
+                    # fallback because the contract only ever widens, never narrows.
+                    "job_number": _first_present(job, keys=("jobNumber", "number")),
                     "st_technician_id": technician_id,
                     "customer_name": customer.get("name") if customer else None,
                     "customer_phone": customer.get("phone") if customer else None,

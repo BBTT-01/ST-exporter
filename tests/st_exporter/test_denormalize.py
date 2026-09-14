@@ -12,7 +12,7 @@ def _cache(*records: dict) -> RawCache:
 
 def test_basic_join_produces_one_row_per_appointment() -> None:
     jobs = _cache(
-        {"id": 1, "number": "J-1", "customerId": 10, "locationId": 20, "jobStatus": "Scheduled"}
+        {"id": 1, "jobNumber": "J-1", "customerId": 10, "locationId": 20, "jobStatus": "Scheduled"}
     )
     appointments = _cache(
         {
@@ -182,7 +182,7 @@ def test_three_technician_crew_each_get_the_same_job() -> None:
     three-technician install exported as a single row and the job was invisible
     to two of the three technicians.
     """
-    jobs = _cache({"id": 1, "number": "J-1", "jobStatus": "InProgress"})
+    jobs = _cache({"id": 1, "jobNumber": "J-1", "jobStatus": "InProgress"})
     appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-09T14:00:00Z"})
     assignments = _cache(
         {
@@ -420,10 +420,58 @@ def test_unrelated_run_untouched_appointment_formats_identically() -> None:
     # Denormalisation itself is deterministic given identical raw input — this is
     # the guarantee run.py's "byte-identical unchanged rows" acceptance criterion
     # (tested at the run.py integration level) rests on.
-    jobs = _cache({"id": 1, "number": "J-1"})
+    jobs = _cache({"id": 1, "jobNumber": "J-1"})
     appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
 
     first = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
     second = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
 
     assert first.rows == second.rows
+
+
+def test_job_number_comes_from_servicetitan_jobnumber_field() -> None:
+    """A job payload in ServiceTitan's real shape must fill `job_number`.
+
+    The JPM job object names the field `jobNumber`. The exporter read `number`,
+    so the column was emitted but never filled — 0 non-empty cells across 2431
+    live rows — and the consumer's NOT NULL `jobs.job_number` rejected every
+    insert. Every job fixture in this suite used `number` too, so the whole
+    suite passed vacuously. This test fails if anyone reads only `number` again.
+    """
+    jobs = _cache({"id": 1, "jobNumber": "JOB-4821", "jobStatus": "Scheduled"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert len(result.rows) == 1
+    assert result.rows[0]["job_number"] == "JOB-4821"
+    assert result.rows[0]["job_number"] not in (None, "")
+
+
+def test_job_number_falls_back_to_legacy_number_field() -> None:
+    """The contract only ever widens: a payload carrying the old `number`
+    spelling (and no `jobNumber`) must still fill the column."""
+    jobs = _cache({"id": 1, "number": "LEGACY-7", "jobStatus": "Scheduled"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["job_number"] == "LEGACY-7"
+
+
+def test_job_number_prefers_jobnumber_when_both_spellings_are_present() -> None:
+    jobs = _cache({"id": 1, "jobNumber": "REAL-1", "number": "STALE-1"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["job_number"] == "REAL-1"
+
+
+def test_job_number_is_blank_only_when_servicetitan_sends_neither_spelling() -> None:
+    jobs = _cache({"id": 1, "jobStatus": "Scheduled"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["job_number"] is None

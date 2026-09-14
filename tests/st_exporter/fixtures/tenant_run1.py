@@ -14,7 +14,7 @@ TENANT_ID = 12345
 
 JOB_1 = {
     "id": 1,
-    "number": "J-1",
+    "jobNumber": "J-1",
     "customerId": 10,
     "locationId": 20,
     "jobStatus": "Scheduled",
@@ -26,7 +26,7 @@ JOB_1 = {
 # into it in run 2 (tenant_run2.py).
 JOB_2 = {
     "id": 2,
-    "number": "J-2",
+    "jobNumber": "J-2",
     "customerId": 11,
     "locationId": 21,
     "jobStatus": "Scheduled",

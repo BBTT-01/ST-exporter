@@ -89,6 +89,30 @@ failure. The four ServiceTitan **writes** its items carry belong to ticket 15 an
 are raised as named failures until then. See KNOWN_UNVERIFIED.md before pointing
 a live Profit Wizard tenant at this.
 
+### Fixed — `job_number` was emitted on every jobs row but never filled
+
+The `jobs` tab read the job number from `job["number"]`. ServiceTitan's JPM job
+object names it **`jobNumber`**, so the column was blank on every row the
+exporter has ever written (0 non-empty cells across 2431 live rows). Profit
+Wizard's `public.jobs.job_number` is NOT NULL, so all 1694 hosted job inserts
+failed with `23502`. It reads `jobNumber` now, falling back to `number` — the
+contract only ever widens.
+
+The suite did not catch this because every job fixture in it also used `number`,
+so the tests asserted our mistake rather than ServiceTitan's shape. The job
+fixtures now use the real field name and there are explicit regression tests that
+fail if anyone reads only `number` again. (`number` fixtures on invoices and
+projects are untouched — it is the correct field name on those entities.)
+
+### Fixed — a repeated `st_technician_id` could reach the `technicians` tab twice
+
+`technicians` rows are now deduplicated on `st_technician_id`, first-seen. The
+key is deliberately **not** `email`: two distinct technician ids sharing one
+address is a real ServiceTitan state, both can be assigned to jobs, and dropping
+one would leave `jobs` rows pointing at a technician missing from the tab. That
+collision is now logged with both ids, for a consumer whose schema requires
+unique emails to resolve on its side.
+
 ## [Unreleased] · Financial feed
 
 `st-export --feeds financial` writes four new tabs for Profit Wizard —
