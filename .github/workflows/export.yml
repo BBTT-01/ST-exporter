@@ -4,7 +4,21 @@ on:
   workflow_call:
     inputs:
       feeds:
-        description: "Comma-separated feeds to run: jobs, technicians, pricebook, financial"
+        description: >-
+          Comma-separated feeds to run: jobs, technicians, pricebook, financial,
+          outbox.
+
+          `outbox` is not an export feed — it writes no tab and fetches nothing.
+          It DRAINS the outbox queue of every product whose secrets this job was
+          given, and it MUST appear in exactly one caller job.
+
+          This is the structural half of the one-drain rule. Before it, the
+          exporter drained on any invocation whose outbox secrets happened to be
+          set, and the only thing stopping a second job from draining the same
+          queue again was a comment in the caller workflow — a comment that was
+          already stripped from one live connector repo. Now the secrets alone
+          do nothing: a job that does not ask for `outbox` cannot drain, however
+          many secrets it is handed.
         type: string
         default: "jobs,technicians"
       window:
@@ -54,15 +68,41 @@ on:
         required: true
       GOOGLE_RAW_CACHE_SHEET_ID:
         required: true
+      # ---------------------------------------------------------------------
+      # OUTBOX LANES — one pair of secrets per product the contractor bought.
+      # A lane runs only when BOTH of its values are non-empty, so an unbought
+      # product is simply absent. All optional: `required: false` is what lets
+      # a caller omit the ones it did not buy.
+      #
+      # Handing these to a second job is now INERT rather than harmful: the
+      # drain is gated on `feeds: outbox`, not on the secrets being present.
+      # ---------------------------------------------------------------------
       TRADERATED_MACHINE_TOKEN:
         required: false
       TRADERATED_OUTBOX_BASE_URL:
         required: false
-      # A SECOND machine token, scope `image_upload`, issued from the same
-      # TrueQuote panel as TRADERATED_MACHINE_TOKEN (scope `booking_outbox`).
-      # TrueQuote rejects a token presented to the wrong scope, so these are not
-      # interchangeable. Absent = pricebook image bytes are simply not uploaded;
-      # the `image_refs` identifiers still go to the Sheet.
+      TRUEQUOTE_MACHINE_TOKEN:
+        required: false
+      TRUEQUOTE_OUTBOX_URL:
+        required: false
+      PROFITWIZARD_MACHINE_TOKEN:
+        required: false
+      PROFITWIZARD_OUTBOX_URL:
+        required: false
+      # A SEPARATE machine token, scope `image_upload`, issued from the same
+      # TrueQuote panel as TRUEQUOTE_MACHINE_TOKEN (scope `booking_outbox`).
+      # Every app rejects a token presented to the wrong scope with a flat 401,
+      # and the three apps do not even share a scope vocabulary
+      # (`crm_outbox` / `booking_outbox` + `image_upload` / `servicetitan_outbox`),
+      # so no token is ever interchangeable with another. Absent = pricebook
+      # image bytes are simply not uploaded; the `image_refs` identifiers still
+      # go to the Sheet.
+      #
+      # TRADERATED_IMAGE_TOKEN is the ORIGINAL name for this same TrueQuote
+      # token and is still accepted — a connector pinned in a contractor's own
+      # repository cannot be updated on our schedule, so names widen.
+      TRUEQUOTE_IMAGE_TOKEN:
+        required: false
       TRADERATED_IMAGE_TOKEN:
         required: false
 
@@ -72,12 +112,21 @@ jobs:
     if: ${{ inputs.target == 'sheets' }}
     # The jobs feed runs every 5 minutes and technicians every 30, and a large
     # tenant's first full drain can exceed 5 minutes — so runs really can
-    # overlap. Both write the same `_meta` grid and may drain the same
-    # `_outbox_ledger` tab, each via read-then-full-replace, so an overlapping
-    # run can read stale state and silently roll back the other's cursor/ledger
-    # writes. Serialize instead. `github.repository` is the CALLING repo, so
-    # each customer gets their own group: a customer never collides with
-    # themselves, and different customers never block each other.
+    # overlap. They write the same `_meta` grid and the same `_outbox_ledger`
+    # tab (one tab shared by all three products' lanes), each via
+    # read-then-full-replace, so an overlapping run can read stale state and
+    # silently roll back the other's cursor/ledger writes. Serialize instead.
+    # `github.repository` is the CALLING repo, so each customer gets their own
+    # group: a customer never collides with themselves, and different customers
+    # never block each other.
+    #
+    # This group spans EVERY caller job, because every one of them calls this
+    # same reusable workflow. That is the second guarantee behind the one-drain
+    # rule: even if somebody did add `feeds: outbox` to a second job, the two
+    # drains could never run at the same time and could never interleave their
+    # ledger writes — the damage would be a doubled drain RATE, not a corrupted
+    # ledger or a duplicated ServiceTitan write (every app's claim is
+    # skip-locked, so two drainers never receive the same row).
     # cancel-in-progress: false — killing a run mid-drain is exactly the
     # crash the ledger has to recover from; better to just queue.
     concurrency:
@@ -176,6 +225,11 @@ jobs:
           EXPORTER_WINDOW_DAYS: ${{ inputs.window }}
           TRADERATED_MACHINE_TOKEN: ${{ secrets.TRADERATED_MACHINE_TOKEN }}
           TRADERATED_OUTBOX_BASE_URL: ${{ secrets.TRADERATED_OUTBOX_BASE_URL }}
+          TRUEQUOTE_MACHINE_TOKEN: ${{ secrets.TRUEQUOTE_MACHINE_TOKEN }}
+          TRUEQUOTE_OUTBOX_URL: ${{ secrets.TRUEQUOTE_OUTBOX_URL }}
+          PROFITWIZARD_MACHINE_TOKEN: ${{ secrets.PROFITWIZARD_MACHINE_TOKEN }}
+          PROFITWIZARD_OUTBOX_URL: ${{ secrets.PROFITWIZARD_OUTBOX_URL }}
+          TRUEQUOTE_IMAGE_TOKEN: ${{ secrets.TRUEQUOTE_IMAGE_TOKEN }}
           TRADERATED_IMAGE_TOKEN: ${{ secrets.TRADERATED_IMAGE_TOKEN }}
           EXPORTER_PRICEBOOK_CATEGORY_IDS: ${{ inputs.pricebook_category_ids }}
           EXPORTER_FINANCIAL_WINDOW_DAYS: ${{ inputs.financial_window }}
@@ -188,7 +242,7 @@ jobs:
           IFS=',' read -ra FEED_PARTS <<< "$FEEDS"
           for feed in "${FEED_PARTS[@]}"; do
             case "$(echo "$feed" | tr -d '[:space:]')" in
-              jobs|technicians|pricebook|financial) ;;
+              jobs|technicians|pricebook|financial|outbox) ;;
               *) echo "::error::invalid feeds input: $FEEDS" >&2; exit 1 ;;
             esac
           done

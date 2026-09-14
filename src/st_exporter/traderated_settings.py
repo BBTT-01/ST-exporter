@@ -28,6 +28,32 @@ class TradeRatedSettings(BaseSettings):
     # the `image_upload` one, issued from the same panel as a separate value.
     image_token: str | None = Field(default=None, repr=False)
 
+    # The image route is TRUEQUOTE'S (`/api/outbox/pricebook-image`), and it is
+    # reached under TRUEQUOTE'S base url — not TradeRated's, which is a Supabase
+    # Functions origin serving the `crm-outbox` edge function and has no such
+    # route. Shipping the image lane under `TRADERATED_OUTBOX_BASE_URL` was
+    # therefore only ever going to work for a contractor who had set that secret
+    # to TrueQuote's host.
+    #
+    # The two correctly-named secrets below WIN when set; the two above remain
+    # accepted so a connector already deployed with the old names keeps working.
+    # Widening, never narrowing: a connector pinned in a contractor's own
+    # repository cannot be updated on our schedule.
+    truequote_outbox_url: str | None = Field(default=None, validation_alias="TRUEQUOTE_OUTBOX_URL")
+    truequote_image_token: str | None = Field(
+        default=None, repr=False, validation_alias="TRUEQUOTE_IMAGE_TOKEN"
+    )
+
+    @property
+    def image_base_url(self) -> str | None:
+        """Where the pricebook image route lives. TrueQuote's host, if named."""
+        return self.truequote_outbox_url or self.outbox_base_url
+
+    @property
+    def image_upload_token(self) -> str | None:
+        """The `image_upload`-scoped machine token, under either spelling."""
+        return self.truequote_image_token or self.image_token
+
     @property
     def configured(self) -> bool:
         """True only when BOTH values are present *and* non-empty.
@@ -48,7 +74,9 @@ class TradeRatedSettings(BaseSettings):
 
         Truthiness for the same reason ``configured`` uses it: an Actions
         ``env:`` entry mapped to an unset secret arrives as the empty string.
-        The base url is shared with the outbox lane — one TrueQuote deployment,
-        two routes under it.
+        The base url is shared with TrueQuote's BOOKING outbox lane — one
+        TrueQuote deployment, three routes under it (`/pricebook-image`,
+        `/booking/claim`, `/booking/result`) — but NOT with TradeRated's, which
+        is a different app on a different host entirely.
         """
-        return bool(self.image_token) and bool(self.outbox_base_url)
+        return bool(self.image_upload_token) and bool(self.image_base_url)

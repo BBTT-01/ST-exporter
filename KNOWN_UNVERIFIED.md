@@ -150,14 +150,23 @@ The contract describes `modified_on` only as "for drift debugging" without
 specifying which entity's timestamp it should reflect. This mapping is a
 reasonable guess, not a confirmed requirement.
 
-## CRM Outbox response envelope
+## ~~CRM Outbox response envelope~~ — RESOLVED 2026-09-14
 
 `src/st_exporter/outbox/client.py`, `TradeRatedOutboxClient.claim`
 
-Assumes `GET /crm-outbox` wraps its items as `{"items": [...]}`. The spec names
-the per-item shape (`id`, `idempotency_key`, `kind`, `payload`) but not the
-envelope around the list. If TradeRated's real response differs (e.g. a bare
-array, or a different key), this is the one function to fix.
+Confirmed by reading the deployed edge function
+(`supabase/functions/crm-outbox/index.ts:320-325`, branch
+`feat-st-export-reader`): the envelope is
+`{"success": true, "count": N, "items": [...]}` and each item is
+`{id, kind, idempotency_key, payload, attempts}` (`toClaimedItem`, :207-217).
+The `{"items": [...]}` assumption was right; `success`/`count`/`attempts` are
+extra fields this client ignores.
+
+Also confirmed at the same time: the **base URL** is the Supabase Functions
+origin, `https://<project-ref>.supabase.co/functions/v1`, because the gateway
+strips `/functions/v1` before `parseOutboxRoute` sees the path (:32-45). That is
+a different host and a different path shape from TrueQuote's and Profit Wizard's
+— see "Three outbox path shapes" below.
 
 ## CRM Outbox claim limit
 
@@ -167,17 +176,40 @@ Defaults to 10 pending items per drain. The spec says "up to N pending items"
 without naming N. Unverified against a real deployment; adjust once ticket 07's
 real outbox endpoint is live and its actual behavior/limits are known.
 
-## `technician_rating` has no known ServiceTitan write
+## ~~`technician_rating` has no known ServiceTitan write~~ — WRONG, FIXED 2026-09-14
 
-`src/st_exporter/outbox/actions.py`, `perform_item`
+`src/st_exporter/outbox/actions.py`, `_perform_technician_rating`
 
-The Outbox contract names two kinds — `referral_lead` and `technician_rating` —
-but this CLI's registry has no ServiceTitan endpoint that resembles "post a
-rating for a technician." `perform_item` raises `UnsupportedOutboxKindError` for
-this kind rather than guessing (a job note? a custom field? something else?).
-Every `technician_rating` item will be reported back to TradeRated as `failed`
-until this is resolved with the spec owner — raised explicitly in this ticket's
-report, not silently worked around.
+**The premise was false when it was written.** `registry.py` has declared
+`Module("customer-interactions", resources=(Resource("technician-ratings",
+ops="LRC"),))` since `e08a801` (2026-06-01) — three months before `actions.py` —
+and `C` is create. The URL it generates,
+`/customer-interactions/v2/tenant/{id}/technician-ratings`, is
+character-for-character the one TradeRated's Direct path posts to
+(`update-servicetitan-rating/index.ts:88`), and `SETUP.md:147` has every
+contractor grant Customer Interactions -> Technician Rating -> WRITE before
+their first run. Every `technician_rating` item was being reported `failed`
+against a permission the contractor had already given.
+
+The exporter now maps TradeRated's payload — `technicianId =
+int(servicetitan_technician_id)`, `jobId = int(servicetitan_job_id)`,
+`rating = float(rating) * 2` clamped to 0-10, mirroring `convertRating`
+(:117-120) — and posts it. `st_id` is the synthetic `"<technicianId>:<jobId>"`,
+because the endpoint is create-or-update keyed on that pair and its response
+carries no id.
+
+**Still unverified against a real tenant.** Nothing has ever been queued: the
+production `crm_outbox` table was empty on 2026-09-09, and the enqueue is
+unreachable because `update-servicetitan-rating` answers 401 to its own
+service-role caller (`verifyAuth`, confirmed from the production function log
+2026-09-10). So this write will fire for the first time only after TradeRated
+fixes that caller. Two specific things to check on that first real item:
+
+- the rating lands as **10** for a five-star review, not 5;
+- a 404 (job not in the tenant) is reported `failed` with no `permanent` flag,
+  which costs five attempts before the row goes terminal. Their result endpoint
+  already accepts `permanent: true` (`crm-outbox/index.ts:178`) — sending it on
+  a 4xx is a worthwhile follow-up, not done here.
 
 ## ~~`referral_lead` payload passed through unmapped~~ — RESOLVED 2026-09-08
 
@@ -285,13 +317,16 @@ The wire format was derived by READING TrueQuote's receiving route
 
 - **The base URL's shape is assumed.** This client posts to
   `{TRADERATED_OUTBOX_BASE_URL}/pricebook-image`, i.e. the base is expected to be
-  `https://<truequote-host>/api/outbox`. The same setting is used by the booking
-  outbox client, which posts to `{base}/crm-outbox` and
-  `{base}/crm-outbox/{id}/result` — but TrueQuote's booking routes are
-  `/api/outbox/booking/claim` and `/api/outbox/booking/result`. **Those two
-  cannot both be right.** The image path here matches TrueQuote's route exactly;
-  the booking lane's paths are a pre-existing, separate mismatch (ticket 07) and
-  were deliberately left alone.
+  `https://<truequote-host>/api/outbox`. **Confirmed 2026-09-14** against
+  `apps/admin/next.config.js` (no `basePath`, no rewrite touching `/api/outbox`).
+
+  The apparent conflict with the booking lane's `{base}/crm-outbox` paths is
+  **RESOLVED, and it was a real bug**: `/crm-outbox` is TRADERATED's route on
+  TradeRated's own Supabase host, and it was only ever sharing this setting by
+  accident. The image lane now reads `TRUEQUOTE_OUTBOX_URL` /
+  `TRUEQUOTE_IMAGE_TOKEN` first, falling back to the `TRADERATED_*` spellings so
+  a connector already deployed with the old names keeps working. See "Three
+  outbox path shapes".
 - **TrueQuote reads no idempotency field.** Its dedupe is intrinsic —
   `storage_path = sha256(source_url)`, uploaded with `upsert: true`, and the row
   keyed `(external_item_id, asset_id | sha256(source_url))`. The
@@ -314,3 +349,66 @@ The wire format was derived by READING TrueQuote's receiving route
 - Nothing here has met a real ServiceTitan tenant: the `Pricebook → Images`
   permission, the real `Content-Type` ServiceTitan returns for a storage-path
   image, and whether real assets ever exceed the 8 MiB cap are all unconfirmed.
+
+
+## Three outbox path shapes — confirmed, not a bug to reconcile
+
+`src/st_exporter/outbox/routes.py`
+
+    TradeRated     GET|POST {base}/crm-outbox     POST {base}/crm-outbox/{id}/result
+    TrueQuote      POST     {base}/booking/claim  POST {base}/booking/result
+    Profit Wizard  POST     {base}/claim          POST {base}/result
+
+All three are correct, for structural reasons: TradeRated's base is a Supabase
+Functions origin where the whole edge function is one route and the id is a path
+segment; TrueQuote's and Profit Wizard's are Next.js route handlers under
+`https://<host>/api/outbox`, and TrueQuote's booking queue is one level deeper
+because its base already carries `/pricebook-image`. Paths are therefore per-lane
+configuration, overridable without a release via `{PREFIX}_OUTBOX_CLAIM_PATH` /
+`{PREFIX}_OUTBOX_RESULT_PATH`.
+
+The **token scopes** do not share a vocabulary either — `crm_outbox`,
+`booking_outbox` + `image_upload`, `servicetitan_outbox` — and every app answers
+a wrong-scope token with a flat 401. There is no "one token per app".
+
+## TrueQuote's booking lane is transcribed from uncommitted-at-the-time code
+
+`src/st_exporter/outbox/truequote.py`
+
+Everything about this lane — `item_id` not `id`, `booking` not `payload`, no
+`kind` field, `booking_id` rather than `st_id` on the result, the JSON-body
+claim limit — was read from TrueQuote's `feat/servicetitan-hosted` branch on
+2026-09-14. That branch is **committed** (all of it lands in `2731a615`) but
+**not merged**: TrueQuote's `main` has no `apps/admin/app/api/outbox` directory
+at all. Treat it as provisional and confirm with their session before a real
+contractor is pointed at it.
+
+One consequence worth stating separately: **the queued `payload` is TrueQuote's
+own `ServiceTitanBookingInput`, not a ServiceTitan request body.** `dispatch.ts:240`
+enqueues the input and the direct path applies `createBookingPayload`
+(`server.ts:840`) afterwards, at push time — which for a Hosted company happens
+on this runner instead. `build_booking_body` re-expresses that transform. If
+TrueQuote ever moves the transform to *before* the enqueue, this exporter would
+double-transform and every booking would lose its contacts. That is the one
+change on their side that would silently break this lane.
+
+## Profit Wizard's items cannot be performed yet
+
+`src/st_exporter/outbox/profitwizard.py`, `perform_profitwizard_item`
+
+The lane is real and drained: claim, ledger, report, isolation and the
+`matched: false` handling are all exercised. The four ServiceTitan **writes** its
+items carry — `push_estimate`, `update_job`, `push_prices`, `assign_technician` —
+belong to ticket 15, which is blocked by this ticket, so their request bodies are
+not knowable here. Each is raised as a named `UnsupportedOutboxKindError` that
+says which write is missing and which ticket owns it, and is reported `failed`.
+
+The queue is empty by construction until ticket 15 also builds the enqueue side,
+so nothing burns attempts today — but **do not set `PROFITWIZARD_*` on a
+contractor whose Profit Wizard is already enqueueing** until those four
+performers exist.
+
+Also unverified: Profit Wizard's **claim response field names**. The client reads
+several spellings for each field (`item_id`/`itemId`/`id`, `payload`/`body`/`data`,
+and so on) rather than assuming one, in the same widen-don't-narrow posture their
+result endpoint takes. Confirm the real names on the first live claim.

@@ -11,10 +11,11 @@ from st_cli.exceptions import STCLIError
 from st_exporter.config import ExporterSettings
 from st_exporter.images.client import TrueQuoteImageClient
 from st_exporter.logging_setup import logger
-from st_exporter.outbox.client import TradeRatedOutboxClient
-from st_exporter.outbox.drain import DrainSummary, drain_outbox
+from st_exporter.outbox.drain import LaneOutcome, drain_lanes
+from st_exporter.outbox.lanes import build_lanes, close_lanes
 from st_exporter.outbox.ledger import OutboxLedger
-from st_exporter.run import parse_feeds, run_export
+from st_exporter.outbox.settings import load_all_lane_credentials
+from st_exporter.run import EXPORT_FEEDS, OUTBOX_FEED, ExportSummary, parse_feeds, run_export
 from st_exporter.sheets import SheetsClient, get_gspread_client
 from st_exporter.traderated_settings import TradeRatedSettings
 
@@ -25,9 +26,12 @@ def run_once(
         "--feeds",
         help=(
             "Comma-separated feeds to run this call: jobs, technicians, pricebook, "
-            "financial. `pricebook` writes the four pricebook.* tabs and `financial` "
-            "the four Profit Wizard tabs (accounting.invoices, payroll.timesheets, "
-            "settings.businessUnits, reporting.jobCosts); neither is on by default."
+            "financial, outbox. `pricebook` writes the four pricebook.* tabs and "
+            "`financial` the four Profit Wizard tabs (accounting.invoices, "
+            "payroll.timesheets, settings.businessUnits, reporting.jobCosts); neither "
+            "is on by default. `outbox` writes no tab at all — it drains the outbox "
+            "queue of every product whose secrets are set, and it must appear in "
+            "EXACTLY ONE workflow job."
         ),
     ),
     dry_run: bool = typer.Option(
@@ -38,82 +42,128 @@ def run_once(
         "--upload-images/--no-upload-images",
         help=(
             "With `--feeds pricebook`, also POST the pricebook image bytes to TrueQuote. "
-            "Needs TRADERATED_IMAGE_TOKEN + TRADERATED_OUTBOX_BASE_URL; silently skipped "
+            "Needs TRUEQUOTE_IMAGE_TOKEN + TRUEQUOTE_OUTBOX_URL (the TRADERATED_* "
+            "spellings are still accepted); silently skipped "
             "without them. Identifiers still go in the Sheet either way."
         ),
     ),
 ) -> None:
-    """Run one ServiceTitan -> Export Store export pass, then drain the CRM Outbox."""
+    """Run one ServiceTitan -> Export Store export pass, then drain the outboxes."""
     st_settings = load_settings()
     exporter_settings = ExporterSettings()  # type: ignore[call-arg]
     traderated_settings = TradeRatedSettings()
 
     parsed_feeds = parse_feeds(feeds)
-    image_client = _image_client(traderated_settings, parsed_feeds, upload_images, dry_run)
-    try:
-        summary = run_export(
-            st_settings,
-            exporter_settings,
-            feeds=parsed_feeds,
-            dry_run=dry_run,
-            image_client=image_client,
-        )
-    finally:
-        if image_client is not None:
-            image_client.close()
+    export_feeds = parsed_feeds & EXPORT_FEEDS
+    drain_requested = OUTBOX_FEED in parsed_feeds
 
-    outbox_summary: DrainSummary | None = None
-    if not dry_run and traderated_settings.configured:
+    summary: ExportSummary | None = None
+    if export_feeds:
+        image_client = _image_client(traderated_settings, export_feeds, upload_images, dry_run)
         try:
-            outbox_summary = _drain_outbox(st_settings, exporter_settings, traderated_settings)
-        except Exception as exc:
-            # The export half already succeeded and committed its Sheets writes
-            # by now, so an outbox problem must not fail the whole run — and an
-            # httpx error escaping drain_outbox (e.g. claim() itself failing) is
-            # neither STCLIError nor ValidationError, so main()'s handler would
-            # not catch it and the run would end in a raw traceback. Leaving
-            # outbox_summary as None just omits the outbox fields from the echoed
-            # line, exactly like the not-configured and dry-run paths.
-            # `Exception`, not bare `except`: SystemExit/KeyboardInterrupt must
-            # still propagate.
-            logger.warning("outbox drain failed; export results are unaffected: %s", exc)
-    elif not traderated_settings.configured:
-        # Expected until ticket 07 issues the machine token/outbox URL — not an
-        # error, so this is INFO, not WARNING.
-        logger.info("TRADERATED_MACHINE_TOKEN/OUTBOX_BASE_URL not set; skipping outbox drain")
+            summary = run_export(
+                st_settings,
+                exporter_settings,
+                feeds=export_feeds,
+                dry_run=dry_run,
+                image_client=image_client,
+            )
+        finally:
+            if image_client is not None:
+                image_client.close()
 
-    message = (
-        f"jobs={summary.jobs_row_count} technicians={summary.technicians_row_count} "
-        f"skipped_no_job={summary.skipped_no_job} dry_run={summary.dry_run}"
+    outcomes: list[LaneOutcome] = []
+    if drain_requested and not dry_run:
+        try:
+            outcomes = _drain_outboxes(st_settings, exporter_settings)
+        except Exception as exc:
+            # Any export half has already succeeded and committed its Sheets
+            # writes by now, so an outbox problem must not fail the whole run —
+            # and an httpx error escaping the drain is neither STCLIError nor
+            # ValidationError, so main()'s handler would not catch it and the run
+            # would end in a raw traceback. `Exception`, not bare `except`:
+            # SystemExit/KeyboardInterrupt must still propagate.
+            #
+            # `drain_lanes` already isolates each lane from the others, so
+            # reaching here means something outside any single lane broke —
+            # opening the ledger Sheet, say.
+            logger.warning("outbox drain failed; export results are unaffected: %s", exc)
+    elif not drain_requested:
+        _warn_if_undrained()
+
+    typer.echo(_summary_line(summary, outcomes))
+
+
+def _warn_if_undrained() -> None:
+    """Say loudly when a purchased product's queue was not drained by this call.
+
+    Silence is what makes the double-drain trap dangerous in reverse: a
+    connector repo that bumps to this version without adding `outbox` to one of
+    its jobs would simply stop draining, and nobody would learn about it from a
+    green run. So every invocation that carries a product's secrets but did not
+    ask for the drain names that product at WARNING.
+
+    After the caller workflow is migrated this is silent, because the jobs that
+    do not drain are not given the secrets either.
+    """
+    configured = [credentials.product for credentials in load_all_lane_credentials()]
+    if not configured:
+        return
+    logger.warning(
+        "outbox secrets are set for %s but this run did not request the `outbox` feed, "
+        "so NOTHING was drained. Exactly one job in the caller workflow must pass "
+        "`feeds: outbox`.",
+        ", ".join(configured),
     )
-    if summary.pricebook_row_counts is not None:
-        message += "".join(
-            f" {tab.replace('.', '_')}={count}"
-            for tab, count in sorted(summary.pricebook_row_counts.items())
+
+
+def _summary_line(summary: ExportSummary | None, outcomes: list[LaneOutcome]) -> str:
+    """The one line this run echoes. Drain-only runs have no export half."""
+    message = ""
+    if summary is not None:
+        message = (
+            f"jobs={summary.jobs_row_count} technicians={summary.technicians_row_count} "
+            f"skipped_no_job={summary.skipped_no_job} dry_run={summary.dry_run}"
         )
-    if summary.financial_row_counts is not None:
-        message += "".join(
-            f" {_tab_key(tab)}={count}"
-            for tab, count in sorted(summary.financial_row_counts.items())
-        )
-    if summary.financial_failures:
-        # Named in the run's output rather than only in the log: a missing
-        # `reporting.jobCosts` tab is the difference between Profit Wizard costing
-        # jobs and not, and it must not be something you have to go digging for.
-        message += " financial_failed=" + ",".join(sorted(summary.financial_failures))
-    if summary.images is not None:
-        images = summary.images
-        message += (
-            f" images_uploaded={images.uploaded} images_already={images.already_uploaded} "
-            f"images_failed={images.download_failed + images.upload_rejected} "
-            f"images_permission_denied={str(images.permission_denied).lower()}"
-        )
-    if outbox_summary is not None:
-        message += (
-            f" outbox_claimed={outbox_summary.claimed} outbox_succeeded={outbox_summary.succeeded} "
-            f"outbox_failed={outbox_summary.failed} outbox_replayed={outbox_summary.replayed}"
-        )
-    typer.echo(message)
+        if summary.pricebook_row_counts is not None:
+            message += "".join(
+                f" {tab.replace('.', '_')}={count}"
+                for tab, count in sorted(summary.pricebook_row_counts.items())
+            )
+        if summary.financial_row_counts is not None:
+            message += "".join(
+                f" {_tab_key(tab)}={count}"
+                for tab, count in sorted(summary.financial_row_counts.items())
+            )
+        if summary.financial_failures:
+            # Named in the run's output rather than only in the log: a missing
+            # `reporting.jobCosts` tab is the difference between Profit Wizard
+            # costing jobs and not, and it must not be something you have to go
+            # digging for.
+            message += " financial_failed=" + ",".join(sorted(summary.financial_failures))
+        if summary.images is not None:
+            images = summary.images
+            message += (
+                f" images_uploaded={images.uploaded} images_already={images.already_uploaded} "
+                f"images_failed={images.download_failed + images.upload_rejected} "
+                f"images_permission_denied={str(images.permission_denied).lower()}"
+            )
+
+    for outcome in outcomes:
+        # Prefixed per product, so a two-lane run reads as two sets of counters
+        # rather than as one set nobody can attribute.
+        if outcome.summary is not None:
+            counts = outcome.summary
+            message += (
+                f" {outcome.product}_claimed={counts.claimed} "
+                f"{outcome.product}_succeeded={counts.succeeded} "
+                f"{outcome.product}_failed={counts.failed} "
+                f"{outcome.product}_replayed={counts.replayed}"
+            )
+        else:
+            message += f" {outcome.product}_lane_error=1"
+
+    return message.strip() or "nothing to do"
 
 
 def _tab_key(tab_name: str) -> str:
@@ -137,38 +187,50 @@ def _image_client(
     if not upload_images or dry_run or "pricebook" not in feeds:
         return None
     if not traderated_settings.images_configured:
-        logger.info("TRADERATED_IMAGE_TOKEN/OUTBOX_BASE_URL not set; skipping image upload")
+        logger.info("TRUEQUOTE_IMAGE_TOKEN/TRUEQUOTE_OUTBOX_URL not set; skipping image upload")
         return None
-    assert traderated_settings.image_token
-    assert traderated_settings.outbox_base_url
-    return TrueQuoteImageClient(
-        traderated_settings.outbox_base_url, traderated_settings.image_token
-    )
+    token = traderated_settings.image_upload_token
+    base_url = traderated_settings.image_base_url
+    assert token
+    assert base_url
+    return TrueQuoteImageClient(base_url, token)
 
 
-def _drain_outbox(
+def _drain_outboxes(
     st_settings: Settings,
     exporter_settings: ExporterSettings,
-    traderated_settings: TradeRatedSettings,
-) -> DrainSummary:
-    # Truthiness, not `is not None`, to match `configured` exactly — an empty
-    # string is a value pydantic will happily load and httpx will not accept.
-    assert traderated_settings.machine_token
-    assert traderated_settings.outbox_base_url
+) -> list[LaneOutcome]:
+    """Build every configured lane and drain them, sharing one ledger and client.
+
+    One ``OutboxLedger`` across all lanes on purpose: it is a single tab read and
+    rewritten whole, so a ledger per lane would have each lane's flush erase the
+    others' rows. Keys are namespaced by product inside it, not by tab.
+    """
+    credentials = load_all_lane_credentials()
+    if not credentials:
+        # Expected for a contractor who bought a product whose write lane they do
+        # not use — not an error, so INFO.
+        logger.info("no outbox secrets are set; nothing to drain")
+        return []
+
+    client = ServiceTitanClient(st_settings)
+    lanes, skipped = build_lanes(credentials, client)
+    for lane in skipped:
+        logger.warning("outbox lane %s not drained: %s", lane.product, lane.reason)
+
+    if not lanes:
+        client.close()
+        return []
 
     gc = get_gspread_client(exporter_settings.service_account_json)
     raw_cache_store = SheetsClient.open(gc, exporter_settings.raw_cache_sheet_id)
     ledger = OutboxLedger(raw_cache_store)
 
-    client = ServiceTitanClient(st_settings)
-    outbox_client = TradeRatedOutboxClient(
-        traderated_settings.outbox_base_url, traderated_settings.machine_token
-    )
     try:
-        return drain_outbox(client, outbox_client, ledger)
+        return drain_lanes(client, lanes, ledger)
     finally:
         client.close()
-        outbox_client.close()
+        close_lanes(lanes)
 
 
 def main() -> None:

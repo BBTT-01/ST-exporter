@@ -5,13 +5,19 @@ Kinds come from TradeRated's Outbox contract (spec.md, "Outbox contract"):
 id created/affected, which is what gets reported back so TradeRated can link its
 own record to a real ServiceTitan entity.
 
-`technician_rating` has no known ServiceTitan write endpoint anywhere in this
-CLI's registry — ServiceTitan has no obvious native "post a rating" concept.
-Rather than guess (a note? a custom field? something else?), it's raised here as
-an explicit, distinguishable failure so the drain loop reports it back to
-TradeRated as failed (releasing any credit hold) instead of silently dropping it
-or inventing a write nobody asked for. Flagged in this ticket's final report as
-an open question for the spec owner.
+`technician_rating` used to raise here, on the claim that no ServiceTitan write
+endpoint existed. That claim was false when it was written: `registry.py` has
+declared `Module("customer-interactions", resources=(Resource("technician-ratings",
+ops="LRC"),))` since 2026-06-01 — three months before this file — and `C` is
+create. The URL that generates, `/customer-interactions/v2/tenant/{id}/
+technician-ratings`, is character-for-character the one TradeRated's own Direct
+path posts to (`update-servicetitan-rating/index.ts:88`), and the scope for it is
+already granted: `SETUP.md` has every contractor tick Customer Interactions ->
+Technician Rating -> WRITE before their first run. Nothing was missing but the
+code, so every rating on a Hosted company was reported failed against a
+permission the contractor had already given.
+
+Only genuinely unknown kinds raise now.
 """
 
 from __future__ import annotations
@@ -46,11 +52,7 @@ def perform_item(
     if item.kind == "referral_lead":
         return _perform_referral_lead(client, item, campaign or ReferralCampaign(client))
     if item.kind == "technician_rating":
-        raise UnsupportedOutboxKindError(
-            "technician_rating has no known ServiceTitan write endpoint yet "
-            "(no rating concept in this CLI's registry) — needs clarification "
-            "from the spec owner, not a guess."
-        )
+        return _perform_technician_rating(client, item)
     raise UnsupportedOutboxKindError(f"unknown outbox kind: {item.kind!r}")
 
 
@@ -93,6 +95,64 @@ def _perform_referral_lead(
 
     created = client.post("crm", "leads", json_body=body)
     return str(created["id"])
+
+
+def _perform_technician_rating(client: ServiceTitanClient, item: OutboxItem) -> str:
+    """Post one technician rating; return a synthetic id for the pair it keys on.
+
+    TradeRated's payload (``update-servicetitan-rating/index.ts:251-259``) is
+    ``{review_id, rating, servicetitan_job_id, servicetitan_technician_id,
+    customer_name}``, where ``rating`` is the raw **1-5 star** review value and
+    both ids are **strings**.
+
+    ServiceTitan's body is ``{technicianId, jobId, rating}`` with integer ids and
+    a rating on a **0-10** scale. The star-to-ten conversion is `convertRating`
+    (same file, lines 117-120): ``rating * 2``. Forwarding the payload unmapped
+    would post every five-star review as 5/10 — a wrong number that looks right,
+    which nobody would notice for weeks. It is the single reason this function
+    exists rather than a pass-through.
+
+    The endpoint is create-or-update keyed on (technician, job) and its response
+    carries no id of its own, so the reported ``st_id`` is that pair. That also
+    makes an at-least-once redelivery harmless on ServiceTitan's side: the same
+    rating re-posted overwrites itself with the same value.
+    """
+    payload = item.payload
+    try:
+        technician_id = int(payload["servicetitan_technician_id"])
+        job_id = int(payload["servicetitan_job_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        # A rating with no ST job or technician id cannot be placed anywhere.
+        # Raised as a plain failure (not UnsupportedOutboxKindError): the KIND is
+        # supported, this one item is unusable, and the distinction is what tells
+        # a reader whether to fix the exporter or fix the row.
+        raise ValueError(
+            "technician_rating needs integer servicetitan_technician_id and "
+            f"servicetitan_job_id; got {payload.get('servicetitan_technician_id')!r} "
+            f"and {payload.get('servicetitan_job_id')!r}"
+        ) from exc
+
+    body = {
+        "technicianId": technician_id,
+        "jobId": job_id,
+        "rating": _star_rating_to_servicetitan(payload.get("rating")),
+    }
+    client.post("customer-interactions", "technician-ratings", json_body=body)
+    return f"{technician_id}:{job_id}"
+
+
+def _star_rating_to_servicetitan(stars: Any) -> float:
+    """1-5 stars -> ServiceTitan's 0-10 double, clamped to the range it accepts.
+
+    Clamped rather than validated: a rating is not worth failing an item over,
+    and a value outside 1-5 means TradeRated changed its scale, in which case
+    posting the nearest legal number beats reporting failed five times.
+    """
+    try:
+        value = float(stars) * 2
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"technician_rating carried a non-numeric rating: {stars!r}") from exc
+    return max(0.0, min(10.0, value))
 
 
 def _today() -> date:

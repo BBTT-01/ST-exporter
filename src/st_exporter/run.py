@@ -68,7 +68,15 @@ _RAW_JOBS = "_raw_jobs"
 _RAW_APPOINTMENTS = "_raw_appointments"
 _RAW_ASSIGNMENTS = "_raw_assignments"
 
-_VALID_FEEDS = frozenset({"jobs", "technicians", "pricebook", "financial"})
+# `outbox` is not an export feed — it writes no tab and fetches nothing. It is
+# named here because naming it is what makes the outbox drain OPT-IN: the drain
+# runs if and only if this exact word is in `--feeds`, so the mere presence of a
+# product's secrets in some other workflow job can no longer cause a second
+# drain of the same queue. See EXPORT_FEEDS / OUTBOX_FEED below and cli.py.
+OUTBOX_FEED = "outbox"
+EXPORT_FEEDS = frozenset({"jobs", "technicians", "pricebook", "financial"})
+_VALID_FEEDS = EXPORT_FEEDS | {OUTBOX_FEED}
+_FEED_LIST = "jobs, technicians, pricebook, financial, outbox"
 # Neither `pricebook` nor `financial` is a default. `pricebook` is a catalogue on a
 # much slower cadence than jobs (~5 min) and technicians (~30 min), and re-listing
 # it on every jobs run would be pure waste. `financial` is a six-hourly feed —
@@ -106,14 +114,11 @@ def parse_feeds(value: str) -> frozenset[str]:
     """
     feeds = frozenset(part.strip() for part in value.split(",") if part.strip())
     if not feeds:
-        raise ConfigError(
-            "--feeds must name at least one of: jobs, technicians, pricebook, financial."
-        )
+        raise ConfigError(f"--feeds must name at least one of: {_FEED_LIST}.")
     unknown = feeds - _VALID_FEEDS
     if unknown:
         raise ConfigError(
-            f"unknown feed(s): {', '.join(sorted(unknown))}. "
-            "Valid feeds: jobs, technicians, pricebook, financial."
+            f"unknown feed(s): {', '.join(sorted(unknown))}. Valid feeds: {_FEED_LIST}."
         )
     return feeds
 

@@ -9,6 +9,7 @@ plain wrapper function).
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -17,6 +18,7 @@ import pytest
 
 from st_cli.exceptions import ConfigError
 from st_exporter.cli import main
+from st_exporter.outbox.drain import DrainSummary, LaneOutcome
 from st_exporter.run import DEFAULT_FEEDS, ExportSummary
 
 _ARGV0 = "st-export"
@@ -188,33 +190,125 @@ class TestErrorHandling:
 
 
 class TestOutboxDrain:
-    def test_drains_outbox_when_configured_and_not_dry_run(self, monkeypatch) -> None:
-        monkeypatch.setattr("sys.argv", [_ARGV0])
-        fake_traderated_settings = MagicMock(configured=True)
-        with (
-            patch("st_exporter.cli.load_settings", return_value="s"),
-            patch("st_exporter.cli.ExporterSettings", return_value="e"),
-            patch("st_exporter.cli.TradeRatedSettings", return_value=fake_traderated_settings),
-            patch("st_exporter.cli.run_export", return_value=_summary()),
-            patch("st_exporter.cli._drain_outbox") as mock_drain,
-            pytest.raises(SystemExit),
-        ):
-            main()
-        mock_drain.assert_called_once_with("s", "e", fake_traderated_settings)
+    """The drain is OPT-IN on `--feeds outbox`.
 
-    def test_skips_outbox_drain_when_not_configured(self, monkeypatch) -> None:
-        monkeypatch.setattr("sys.argv", [_ARGV0])
-        fake_traderated_settings = MagicMock(configured=False, images_configured=False)
+    This is the structural half of ticket 12's "exactly one workflow job" rule:
+    before it, the exporter drained on ANY invocation whose secrets happened to
+    be present, so a second job given the same secrets doubled the drain rate
+    and put a second writer on the `_outbox_ledger` tab. A comment in the caller
+    workflow was the only thing preventing it, and that comment was stripped
+    from a live connector repo.
+    """
+
+    def test_does_not_drain_without_the_outbox_feed_even_with_secrets(self, monkeypatch) -> None:
+        """Secrets alone can no longer cause a drain. THIS is what makes adding
+        the secrets to a second workflow job inert rather than harmful."""
+        monkeypatch.setenv("TRADERATED_MACHINE_TOKEN", "t")
+        monkeypatch.setenv("TRADERATED_OUTBOX_URL", "https://tr.test")
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "jobs,technicians"])
         with (
             patch("st_exporter.cli.load_settings", return_value="s"),
             patch("st_exporter.cli.ExporterSettings", return_value="e"),
-            patch("st_exporter.cli.TradeRatedSettings", return_value=fake_traderated_settings),
             patch("st_exporter.cli.run_export", return_value=_summary()),
-            patch("st_exporter.cli._drain_outbox") as mock_drain,
+            patch("st_exporter.cli._drain_outboxes") as mock_drain,
             pytest.raises(SystemExit),
         ):
             main()
         mock_drain.assert_not_called()
+
+    def test_an_undrained_configured_lane_is_warned_about_loudly(self, monkeypatch, caplog) -> None:
+        """The migration gap made un-missable: a connector that bumps to this
+        version without adding `outbox` to one job would otherwise just stop
+        draining, on green runs, forever."""
+        monkeypatch.setenv("TRUEQUOTE_MACHINE_TOKEN", "t")
+        monkeypatch.setenv("TRUEQUOTE_OUTBOX_URL", "https://tq.test")
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "jobs"])
+        with (
+            caplog.at_level(logging.WARNING),
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            pytest.raises(SystemExit),
+        ):
+            main()
+        assert "truequote" in caplog.text
+        assert "`outbox` feed" in caplog.text
+
+    def test_no_warning_when_no_product_is_configured(self, monkeypatch, caplog) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "jobs"])
+        with (
+            caplog.at_level(logging.WARNING),
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            pytest.raises(SystemExit),
+        ):
+            main()
+        assert "NOTHING was drained" not in caplog.text
+
+    def test_drains_when_the_outbox_feed_is_requested(self, monkeypatch) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "jobs,outbox"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            patch("st_exporter.cli._drain_outboxes", return_value=[]) as mock_drain,
+            pytest.raises(SystemExit),
+        ):
+            main()
+        mock_drain.assert_called_once_with("s", "e")
+
+    def test_outbox_only_run_skips_the_export_half_entirely(self, monkeypatch) -> None:
+        """A dedicated drain job must not pay for a Sheets round-trip it does not
+        need — `--feeds outbox` fetches nothing and writes no tab."""
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "outbox"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.run_export") as mock_export,
+            patch("st_exporter.cli._drain_outboxes", return_value=[]) as mock_drain,
+            pytest.raises(SystemExit),
+        ):
+            main()
+        mock_export.assert_not_called()
+        mock_drain.assert_called_once()
+
+    def test_per_lane_counters_are_echoed_with_the_product_name(self, monkeypatch, capsys) -> None:
+        outcomes = [
+            LaneOutcome(product="traderated", summary=DrainSummary(2, 1, 1, 0)),
+            LaneOutcome(product="truequote", summary=DrainSummary(3, 3, 0, 0)),
+        ]
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "jobs,outbox"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            patch("st_exporter.cli._drain_outboxes", return_value=outcomes),
+            pytest.raises(SystemExit),
+        ):
+            main()
+        out = capsys.readouterr().out
+        assert "traderated_claimed=2 traderated_succeeded=1 traderated_failed=1" in out
+        assert "truequote_claimed=3 truequote_succeeded=3" in out
+
+    def test_a_dead_lane_is_named_in_the_output_not_hidden(self, monkeypatch, capsys) -> None:
+        outcomes = [
+            LaneOutcome(product="traderated", error="connection refused"),
+            LaneOutcome(product="truequote", summary=DrainSummary(1, 1, 0, 0)),
+        ]
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "jobs,outbox"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            patch("st_exporter.cli._drain_outboxes", return_value=outcomes),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 0
+        out = capsys.readouterr().out
+        assert "traderated_lane_error=1" in out
+        assert "truequote_succeeded=1" in out
 
     def test_outbox_failure_does_not_fail_the_run_or_print_a_traceback(
         self, monkeypatch, capsys
@@ -223,14 +317,13 @@ class TestOutboxDrain:
         runs, so an outbox error must exit 0 with the export summary — not a raw
         httpx traceback (which main()'s STCLIError/ValidationError handler would
         not catch)."""
-        monkeypatch.setattr("sys.argv", [_ARGV0])
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "jobs,technicians,outbox"])
         with (
             patch("st_exporter.cli.load_settings", return_value="s"),
             patch("st_exporter.cli.ExporterSettings", return_value="e"),
-            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=True)),
             patch("st_exporter.cli.run_export", return_value=_summary()),
             patch(
-                "st_exporter.cli._drain_outbox",
+                "st_exporter.cli._drain_outboxes",
                 side_effect=httpx.ConnectError("outbox unreachable"),
             ),
             pytest.raises(SystemExit) as exc_info,
@@ -240,20 +333,19 @@ class TestOutboxDrain:
         assert exc_info.value.code == 0
         captured = capsys.readouterr()
         assert "jobs=3 technicians=2" in captured.out
-        assert "outbox_claimed" not in captured.out
+        assert "_claimed" not in captured.out
         assert "Traceback" not in captured.err
 
     def test_outbox_keyboard_interrupt_is_not_swallowed(self, monkeypatch, capsys) -> None:
         """`except Exception` must let KeyboardInterrupt/SystemExit through — it
         reaches click, which turns it into its standard abort exit code 130, not
         the exit-0-with-a-summary of the swallowed-error path."""
-        monkeypatch.setattr("sys.argv", [_ARGV0])
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "jobs,technicians,outbox"])
         with (
             patch("st_exporter.cli.load_settings", return_value="s"),
             patch("st_exporter.cli.ExporterSettings", return_value="e"),
-            patch("st_exporter.cli.TradeRatedSettings", return_value=MagicMock(configured=True)),
             patch("st_exporter.cli.run_export", return_value=_summary()),
-            patch("st_exporter.cli._drain_outbox", side_effect=KeyboardInterrupt),
+            patch("st_exporter.cli._drain_outboxes", side_effect=KeyboardInterrupt),
             pytest.raises(SystemExit) as exc_info,
         ):
             main()
@@ -261,15 +353,13 @@ class TestOutboxDrain:
         assert exc_info.value.code == 130
         assert "jobs=3" not in capsys.readouterr().out
 
-    def test_skips_outbox_drain_on_dry_run_even_if_configured(self, monkeypatch) -> None:
-        monkeypatch.setattr("sys.argv", [_ARGV0, "--dry-run"])
-        fake_traderated_settings = MagicMock(configured=True)
+    def test_skips_outbox_drain_on_dry_run_even_when_requested(self, monkeypatch) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--dry-run", "--feeds", "jobs,outbox"])
         with (
             patch("st_exporter.cli.load_settings", return_value="s"),
             patch("st_exporter.cli.ExporterSettings", return_value="e"),
-            patch("st_exporter.cli.TradeRatedSettings", return_value=fake_traderated_settings),
             patch("st_exporter.cli.run_export", return_value=_summary(dry_run=True)),
-            patch("st_exporter.cli._drain_outbox") as mock_drain,
+            patch("st_exporter.cli._drain_outboxes") as mock_drain,
             pytest.raises(SystemExit),
         ):
             main()

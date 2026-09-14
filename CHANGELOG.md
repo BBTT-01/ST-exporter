@@ -4,6 +4,91 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Three outbox lanes, one drain
+
+The exporter drained one queue. It now drains the queue of every product the
+contractor bought — TradeRated, TrueQuote and Profit Wizard — in one run, with
+each lane isolated from the others and from the export feeds.
+
+### `outbox` is now a feed, and that is what stops a double drain
+
+`st-export --feeds outbox` drains. **Nothing else does.** Before this, the
+exporter drained on any invocation whose outbox secrets happened to be set, and
+the only thing keeping the `technicians-feed` job from draining the same queue a
+second time every cycle was an explanatory comment in the caller workflow — a
+comment that had already been stripped from one live connector repo. With three
+queues that trap was about to get three times worse.
+
+The capability is now keyed on an explicit request rather than on the incidental
+presence of a secret, so handing the secrets to a second job is **inert**. The
+existing repo-wide concurrency group is the second guarantee: every caller job
+calls this same reusable workflow, so two drains could never run at once even if
+someone did add `feeds: outbox` to a second job.
+
+**This is a required migration for existing connectors.** A caller that bumps to
+this version without adding `outbox` to exactly one job stops draining. That
+cannot be silent, so every run carrying a product's secrets without the `outbox`
+feed logs a WARNING naming that product. `--feeds outbox` on its own skips the
+export half entirely, so a dedicated drain job costs no Sheets round-trip.
+
+### Three apps, three path shapes, three scope vocabularies — none of it shared
+
+    TradeRated     GET|POST {base}/crm-outbox     POST {base}/crm-outbox/{id}/result
+    TrueQuote      POST     {base}/booking/claim  POST {base}/booking/result
+    Profit Wizard  POST     {base}/claim          POST {base}/result
+
+All three are correct. TradeRated's base is a Supabase Functions origin where
+the whole edge function is one route and the id is a path segment; the other two
+are Next.js route handlers under `https://<host>/api/outbox`, and TrueQuote's
+booking queue sits a level deeper because its base already carries
+`/pricebook-image`. Paths are per-lane configuration (`routes.py`), overridable
+by `{PREFIX}_OUTBOX_CLAIM_PATH` / `_RESULT_PATH` without an exporter release.
+
+The result vocabularies are per-lane too, and deliberately so: TradeRated settles
+a credit hold on `{"status": "succeeded", "st_id": ...}`; TrueQuote attaches a
+booking to a lead on `{"status": "succeeded", "booking_id": ...}` and does not
+read `st_id` at all. One shared shape would have meant one app silently losing
+the id of the thing the exporter had just created for it.
+
+Every accepted vocabulary only widens. `TRADERATED_OUTBOX_BASE_URL` still works
+alongside the ticket's `TRADERATED_OUTBOX_URL`, and `TRADERATED_IMAGE_TOKEN`
+alongside `TRUEQUOTE_IMAGE_TOKEN`.
+
+### The image lane was pointed at the wrong host
+
+`{TRADERATED_OUTBOX_BASE_URL}/pricebook-image` could only ever have worked for a
+contractor who had set TradeRated's secret to TrueQuote's host: the route is
+TrueQuote's, under TrueQuote's base. It now reads `TRUEQUOTE_OUTBOX_URL` /
+`TRUEQUOTE_IMAGE_TOKEN` first and falls back to the old names.
+
+### `technician_rating` writes, at last
+
+It used to raise `UnsupportedOutboxKindError` on the claim that no ServiceTitan
+rating endpoint existed. That was false when it was written: the registry has
+shipped `customer-interactions technician-ratings` with create since 2026-06-01,
+and every contractor grants the scope for it at setup. So every rating on a
+Hosted company was reported failed against a permission already given.
+
+The payload is mapped rather than forwarded — string ids to integers, and the
+1-5 star rating doubled to ServiceTitan's 0-10 scale. Forwarding it unmapped
+would have posted every five-star review as 5/10: a wrong number that looks
+right.
+
+### Idempotency is now keyed by `(product, idempotency_key)`
+
+Three apps mint keys with no coordination, so a collision was a question of when.
+The `_outbox_ledger` tab gains a `product` column; existing four-column rows are
+read as TradeRated's (they are, by construction) rather than skipped as
+malformed, which is what stops an upgrade re-creating every referral.
+
+### Profit Wizard
+
+Its outbox is live and its lane drains — claim, ledger, report, isolation, and
+its `200 + matched:false` case, which is treated as neither success nor a hard
+failure. The four ServiceTitan **writes** its items carry belong to ticket 15 and
+are raised as named failures until then. See KNOWN_UNVERIFIED.md before pointing
+a live Profit Wizard tenant at this.
+
 ## [Unreleased] · Financial feed
 
 `st-export --feeds financial` writes four new tabs for Profit Wizard —
