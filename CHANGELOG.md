@@ -113,6 +113,73 @@ one would leave `jobs` rows pointing at a technician missing from the tab. That
 collision is now logged with both ids, for a consumer whose schema requires
 unique emails to resolve on its side.
 
+### Fixed — a review pass on one failure class: succeeding quietly with no data
+
+Every item below is the same shape of bug. Something goes wrong, and the system
+reports success with blank or missing data instead of failing loudly. A blank
+cell is indistinguishable from a contractor who genuinely has none, and the
+consumers index tabs by column NAME, so a wrong name yields zero rows rather than
+an error.
+
+- **Transport failures now raise `TransportError`, an `STCLIError`.**
+  `ServiceTitanClient._send` wrapped nothing, so an `httpx.ReadTimeout` on the
+  report POST — the most timeout-prone call in the repo — walked straight past
+  the financial feed's per-tab guard and discarded invoices, timesheets and
+  business units that had already been fetched, leaving every `_meta` row stale.
+  Transport errors are also retried on the same budget a 429 gets, since a
+  timeout is more often a blip than a verdict. Every `except STCLIError` in the
+  repo is now a complete guard rather than one that holds until the network
+  hiccups; `st` prints a clean error instead of a traceback.
+- **A TrueQuote image upload that never reaches an HTTP status is a retryable
+  rejection, not an exception.** `upload.py` promised "401/429/5xx ends the pass,
+  not the run", but a DNS failure is neither. It aborted the run *after* four
+  pricebook tabs were written and before their `_meta` rows were, forgot every
+  upload the pass had already made, and skipped the outbox drain. The image
+  ledger now flushes in a `finally`, and the image lane as a whole is strictly
+  non-fatal: `_meta` for four tabs never depends on a side lane.
+- **The job-costing report's SHAPE is now checked, not just its name.** The
+  metadata fetched before the data POST was discarded. A contractor's namesake
+  report carrying none of the (unverified) custom markers passes the name guard
+  as a single unambiguous match; its columns then don't match, every money cell
+  comes out blank, and the tab is written with a healthy `row_count`. The
+  report's declared fields are checked against `JOB_COST_COLUMNS` — in its
+  metadata and again on the first data page — and a mismatch raises
+  `ReportColumnsMismatchError` naming the missing columns. It is equally the
+  tripwire for ServiceTitan renaming a field on the genuine built-in report.
+- **The pricebook feed gained the financial feed's per-tab isolation.** One of
+  the four fetches failing aborted all four. They are four independent full
+  replaces a consumer joins by id, so a failed tab now keeps its previous
+  contents and `_meta` row, and is named in the summary as `pricebook_failed=`.
+- **A transient image download failure no longer prunes the ledger.** A CDN 500
+  meant that key never reached `seen_keys`, `keep()` dropped it, and the next run
+  re-uploaded identical bytes. `complete` now counts `download_failed`, so "could
+  not fetch it" is never read as "it is gone".
+- **`fetch_timesheets` follows `hasMore`.** It read one page per job and ignored
+  the rest, silently dropping labour hours off the end of a long job — which
+  reads downstream as a cheaper job, not as an error.
+- **A pricebook record with no `st_id` is dropped, not written blank.** The
+  contract says `st_id` is non-empty and the category-filtered path already
+  dropped these; the unfiltered path wrote them and counted them. `row_count` is
+  now taken from the grid, so it always means what a reconciler thinks it means.
+- **`st jobs list` showed a permanently blank Number column.** `JOB_COLUMNS` read
+  `number`; ServiceTitan's JPM job object names it `jobNumber` — the same bug as
+  the exporter's, almost certainly copied from here. Fixed the same widen-only
+  way (`jobNumber` preferred, `number` kept as a fallback), and the job fixture
+  now carries the real field name. `number` on invoices and projects is untouched.
+- **`customer_phone` / `customer_email` read the settings arrays.** ServiceTitan
+  returns `phoneSettings[].phone` / `emailSettings[].email`; Profit Wizard's
+  production client treats the flat scalars only as a fallback. Reading only the
+  scalars is the `job_number` failure again. Widen-only in both
+  `st_exporter.denormalize` and `st crm customers-list`, so nothing that worked
+  before can stop working.
+- **A tripwire for the unverified date-filter parameter names.** ServiceTitan
+  ignores query parameters it does not recognise, so a wrong spelling exports the
+  tenant's entire history and says nothing. The feed now logs a WARNING naming
+  the parameter when the oldest record it saw predates the window. It only logs:
+  filtering locally would mask the very symptom that proves the name is wrong.
+- **Deleted three tests that asserted `f(x) == f(x)`** and replaced them with
+  tests that fail when the behaviour regresses.
+
 ## [Unreleased] · Financial feed
 
 `st-export --feeds financial` writes four new tabs for Profit Wizard —

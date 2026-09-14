@@ -17,7 +17,11 @@ app = typer.Typer(help="Jobs — jobs, appointments, projects")
 
 JOB_COLUMNS: list[Column] = [
     ("ID", "id"),
-    ("Number", "number"),
+    # ServiceTitan's JPM job object names this `jobNumber`; reading only `number`
+    # showed a permanently blank Number column on every `st jobs list` ever run.
+    # The exporter hit the identical bug (see `denormalize.build_job_rows`).
+    # Widen-only: `number` stays as a fallback, so nothing that worked stops.
+    ("Number", "jobNumber|number"),
     ("Customer ID", "customerId"),
     ("Status", "jobStatus"),
     ("Type", "jobTypeName"),

@@ -137,12 +137,34 @@ def _envelope(data, has_more=False):
     return {"data": data, "hasMore": has_more, "totalCount": len(data)}
 
 
-def register(api_base: str, *, report_present: bool = True) -> None:
+#: The columns a contractor's own "Job Costing Summary" happens to carry. Nothing
+#: wrong with them — they are simply not the ones ``JOB_COST_COLUMNS`` names, so
+#: every money cell would come out blank if this report were used.
+NAMESAKE_FIELDS = [
+    {"name": "Job"},
+    {"name": "Revenue"},
+    {"name": "Cost"},
+]
+NAMESAKE_DATA = [["J-7", 900, 500]]
+
+
+def register(
+    api_base: str,
+    *,
+    report_present: bool = True,
+    custom_marked: bool = True,
+) -> None:
     """Register every route the `financial` feed calls.
 
     ``report_present=False`` removes the built-in Job Costing Summary report and
     leaves only a contractor's custom namesake — the case the exporter must
     REFUSE rather than fall back to.
+
+    ``custom_marked=False`` strips the ``isCustom`` marker off that namesake.
+    ServiceTitan's real marker spelling is unverified (KNOWN_UNVERIFIED.md), so
+    an unmarked contractor report is the case the NAME guard cannot see at all:
+    it comes back as a single unambiguous match and only its COLUMNS give it
+    away.
     """
     base = api_base.rstrip("/")
 
@@ -182,12 +204,30 @@ def register(api_base: str, *, report_present: bool = True) -> None:
         return_value=httpx.Response(200, json=_envelope(builtin if report_present else []))
     )
     # A contractor's own report carrying the exact same name. Must never be used.
+    namesake: dict = {"id": int(CUSTOM_REPORT_ID), "name": "Job Costing Summary"}
+    if custom_marked:
+        namesake["isCustom"] = True
     respx.get(f"{reporting}/report-category/{CUSTOM_CATEGORY_ID}/reports").mock(
+        return_value=httpx.Response(200, json=_envelope([namesake]))
+    )
+    # ...and it answers about itself, with its own columns, exactly like a real
+    # report would. Nothing about the transport says it is the wrong report.
+    respx.get(f"{reporting}/report-category/{CUSTOM_CATEGORY_ID}/reports/{CUSTOM_REPORT_ID}").mock(
         return_value=httpx.Response(
             200,
-            json=_envelope(
-                [{"id": int(CUSTOM_REPORT_ID), "name": "Job Costing Summary", "isCustom": True}]
-            ),
+            json={
+                "id": int(CUSTOM_REPORT_ID),
+                "name": "Job Costing Summary",
+                "fields": NAMESAKE_FIELDS,
+                "parameters": [],
+            },
+        )
+    )
+    respx.post(
+        f"{reporting}/report-category/{CUSTOM_CATEGORY_ID}/reports/{CUSTOM_REPORT_ID}/data"
+    ).mock(
+        return_value=httpx.Response(
+            200, json={"fields": NAMESAKE_FIELDS, "data": NAMESAKE_DATA, "hasMore": False}
         )
     )
     respx.get(

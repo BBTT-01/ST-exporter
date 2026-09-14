@@ -133,6 +133,11 @@ class ExportSummary:
     # selected this run. None and {} are different: {} would mean "ran, wrote
     # nothing", which never happens (a tab always gets at least its header).
     pricebook_row_counts: dict[str, int] | None = None
+    # Tab name -> why it was skipped, for the pricebook tabs that failed. Same
+    # contract as `financial_failures`: a failed tab is absent from
+    # `pricebook_row_counts` and present here, and its previous contents and
+    # `_meta` row are left untouched in the Sheet.
+    pricebook_failures: dict[str, str] | None = None
     # What the image upload pass did, or None when it didn't run (pricebook feed
     # not selected, no `image_upload` machine token configured, or dry-run).
     images: ImageUploadSummary | None = None
@@ -282,12 +287,14 @@ def _run(
         new_meta_rows.append(meta_rows["technicians"])
 
     pricebook_row_counts: dict[str, int] | None = None
+    pricebook_failures: dict[str, str] | None = None
     image_summary: ImageUploadSummary | None = None
     if "pricebook" in feeds:
-        pricebook_row_counts, image_summary = _run_pricebook_feed(
+        pricebook_row_counts, pricebook_failures, image_summary = _run_pricebook_feed(
             client,
             export_store,
             raw_cache_store,
+            meta_rows=meta_rows,
             new_meta_rows=new_meta_rows,
             run_at=run_at,
             category_ids=pricebook_category_ids,
@@ -336,6 +343,7 @@ def _run(
         skipped_no_job=skipped_no_job,
         dry_run=dry_run,
         pricebook_row_counts=pricebook_row_counts,
+        pricebook_failures=pricebook_failures,
         images=image_summary,
         financial_row_counts=financial_row_counts,
         financial_failures=financial_failures,
@@ -493,18 +501,98 @@ def _run_technicians_feed(
     return technician_rows
 
 
+class _TabGuard:
+    """Per-tab isolation for a feed that writes several independent tabs.
+
+    One tab failing must cost exactly that tab. A guarded tab that succeeds is
+    written and gets a fresh `_meta` row; one that fails is NOT written — its
+    previous contents stay exactly as they were and its previous `_meta` row is
+    carried forward unchanged, so ``last_run_at`` still says when that tab was
+    last genuinely refreshed rather than claiming a run that produced nothing.
+
+    Only ``STCLIError`` is caught — which, since ``st_cli.client`` wraps httpx
+    transport failures in ``TransportError``, really is every way ServiceTitan
+    can let us down, plus every ``ReportUnavailableError``. A ``KeyError`` or
+    ``TypeError`` out of the row-mapping code is a bug in this repo, not a
+    tenant's bad day, and must still crash loudly rather than quietly emptying a
+    tab.
+
+    ``row_count`` is derived from the GRID, never from the fetched record list:
+    the builders drop keyless records, so counting the records would report rows
+    that were never written.
+    """
+
+    def __init__(
+        self,
+        *,
+        label: str,
+        contract_version: str,
+        meta_rows: dict[str, MetaRow],
+        new_meta_rows: list[MetaRow],
+        run_at: str,
+    ) -> None:
+        self._label = label
+        self._contract_version = contract_version
+        self._meta_rows = meta_rows
+        self._new_meta_rows = new_meta_rows
+        self._run_at = run_at
+        self.grids: dict[str, list[list[str]]] = {}
+        self.row_counts: dict[str, int] = {}
+        self.failures: dict[str, str] = {}
+
+    def attempt(self, tab_name: str, build: Any) -> Any:
+        """Build one tab's grid behind the guard. Returns whatever ``build`` did."""
+        try:
+            grid, carried = build()
+        except STCLIError as exc:
+            self.failures[tab_name] = str(exc)
+            logger.warning(
+                "%s: %s was NOT written this run (%s). Its previous contents "
+                "and _meta row are unchanged; the other tabs are unaffected.",
+                self._label,
+                tab_name,
+                exc,
+            )
+            if tab_name in self._meta_rows:
+                self._new_meta_rows.append(self._meta_rows[tab_name])
+            return None
+        self.grids[tab_name] = grid
+        # The header row is not data — a tab with only a header is zero rows.
+        self.row_counts[tab_name] = max(len(grid) - 1, 0)
+        self._new_meta_rows.append(
+            MetaRow(
+                feed=tab_name,
+                last_run_at=self._run_at,
+                # Full replace, re-derived every run: nothing to carry forward,
+                # so no cursor.
+                last_cursor="",
+                row_count=self.row_counts[tab_name],
+                exporter_version=EXPORTER_VERSION,
+                contract_version=self._contract_version,
+            )
+        )
+        return carried
+
+    def write(self, export_store: SheetsPort, *, dry_run: bool) -> None:
+        if dry_run:
+            return
+        for tab_name, grid in self.grids.items():
+            export_store.replace_grid(tab_name, grid)
+
+
 def _run_pricebook_feed(
     client: ServiceTitanClient,
     export_store: SheetsPort,
     raw_cache_store: SheetsPort,
     *,
+    meta_rows: dict[str, MetaRow],
     new_meta_rows: list[MetaRow],
     run_at: str,
     category_ids: tuple[str, ...] = (),
     image_client: TrueQuoteImageClient | None = None,
     dry_run: bool,
-) -> tuple[dict[str, int], ImageUploadSummary | None]:
-    """Write the four `pricebook.*` tabs; append one MetaRow per tab.
+) -> tuple[dict[str, int], dict[str, str], ImageUploadSummary | None]:
+    """Write the four `pricebook.*` tabs; append one MetaRow per tab that succeeded.
 
     A full replace every run, with no window and no cursor: pricebook is a
     catalogue, so re-deriving every row from a fresh full list is both the simplest
@@ -513,50 +601,58 @@ def _run_pricebook_feed(
 
     The three item tabs are built from ONE code path (``build_item_grid``) because
     they share one column set; only the tab name differs.
+
+    **The four tabs are independent**, behind the same ``_TabGuard`` the financial
+    feed uses. ``equipment`` failing while ``services`` and ``categories`` were
+    read perfectly well is a real ServiceTitan afternoon, and there is no
+    atomicity to protect: the tabs are four separate full replaces that a
+    consumer joins by id, and a tab left at last run's contents is a strictly
+    better answer than four tabs left at last run's contents. The failed tab is
+    named in the run summary.
     """
-    row_counts: dict[str, int] = {}
-    grids: dict[str, list[list[str]]] = {}
+    guard = _TabGuard(
+        label="pricebook",
+        contract_version=CONTRACT_VERSION,
+        meta_rows=meta_rows,
+        new_meta_rows=new_meta_rows,
+        run_at=run_at,
+    )
 
     item_records: list[dict[str, Any]] = []
 
-    for tab_name, resource in PRICEBOOK_TABS.items():
+    def build_items(resource: str) -> tuple[list[list[str]], list[dict[str, Any]]]:
         records = fetch_pricebook_items(client, resource, category_ids=category_ids)
-        grids[tab_name] = build_item_grid(records)
-        row_counts[tab_name] = len(records)
-        item_records.extend(records)
+        return build_item_grid(records), records
 
-    categories = fetch_pricebook_categories(client)
-    grids[PRICEBOOK_CATEGORIES_TAB] = build_category_grid(categories)
-    row_counts[PRICEBOOK_CATEGORIES_TAB] = len(categories)
+    for tab_name, tab_resource in PRICEBOOK_TABS.items():
+        fetched = guard.attempt(tab_name, lambda r=tab_resource: build_items(r))
+        if fetched:
+            item_records.extend(fetched)
+
+    guard.attempt(
+        PRICEBOOK_CATEGORIES_TAB,
+        lambda: (build_category_grid(fetch_pricebook_categories(client)), None),
+    )
 
     logger.info(
         "pricebook: %s",
-        " ".join(f"{tab}={count}" for tab, count in sorted(row_counts.items())),
+        " ".join(f"{tab}={count}" for tab, count in sorted(guard.row_counts.items()))
+        or "nothing written",
     )
 
-    for tab_name, count in row_counts.items():
-        new_meta_rows.append(
-            MetaRow(
-                feed=tab_name,
-                last_run_at=run_at,
-                last_cursor="",
-                row_count=count,
-                exporter_version=EXPORTER_VERSION,
-                contract_version=CONTRACT_VERSION,
-            )
-        )
+    guard.write(export_store, dry_run=dry_run)
 
-    if not dry_run:
-        for tab_name, grid in grids.items():
-            export_store.replace_grid(tab_name, grid)
-
-    return row_counts, _upload_pricebook_images(
-        client,
-        raw_cache_store,
-        item_records,
-        image_client=image_client,
-        run_at=run_at,
-        dry_run=dry_run,
+    return (
+        guard.row_counts,
+        guard.failures,
+        _upload_pricebook_images(
+            client,
+            raw_cache_store,
+            item_records,
+            image_client=image_client,
+            run_at=run_at,
+            dry_run=dry_run,
+        ),
     )
 
 
@@ -580,93 +676,66 @@ def _run_financial_feed(
     a tenant where invoices and business units are perfectly readable. So each tab
     is built behind its own guard:
 
-    - a tab that succeeds is written and gets a fresh `_meta` row;
-    - a tab that fails is NOT written — its previous contents stay exactly as they
-      were, and its previous `_meta` row is carried forward unchanged, so
-      ``last_run_at`` still says when that tab was last genuinely refreshed rather
-      than claiming a run that produced nothing;
-    - either way the other three land.
-
-    Only ``STCLIError`` (which covers every ServiceTitan HTTP failure and every
-    ``ReportUnavailableError``) is caught. A ``KeyError`` or ``TypeError`` out of the
-    row-mapping code is a bug in this repo, not a tenant's bad day, and must still
-    crash loudly rather than quietly emptying a money tab.
+    ``_TabGuard`` (shared with the pricebook feed) is what makes that true — see
+    its docstring for the carry-forward and the deliberately narrow ``except``.
 
     Unlike the pricebook feed this one is **window-bounded** — invoices and
     timesheets grow without limit. See ``window.FINANCIAL_WINDOW_DAYS``.
     """
-    row_counts: dict[str, int] = {}
-    failures: dict[str, str] = {}
-    grids: dict[str, list[list[str]]] = {}
-
-    def attempt(tab_name: str, build: Any) -> None:
-        try:
-            grid = build()
-        except STCLIError as exc:
-            failures[tab_name] = str(exc)
-            logger.warning(
-                "financial: %s was NOT written this run (%s). Its previous contents "
-                "and _meta row are unchanged; the other tabs are unaffected.",
-                tab_name,
-                exc,
-            )
-            if tab_name in meta_rows:
-                new_meta_rows.append(meta_rows[tab_name])
-            return
-        grids[tab_name] = grid
-        # The header row is not data — a tab with only a header is zero rows.
-        row_counts[tab_name] = max(len(grid) - 1, 0)
-        new_meta_rows.append(
-            MetaRow(
-                feed=tab_name,
-                last_run_at=run_at,
-                # Window-bounded full replace, re-derived every run exactly like
-                # the jobs tab: the window is time-relative, so a row's membership
-                # has to be re-decided each run regardless of what changed. Nothing
-                # to carry forward, so no cursor.
-                last_cursor="",
-                row_count=row_counts[tab_name],
-                exporter_version=EXPORTER_VERSION,
-                contract_version=FINANCIAL_CONTRACT_VERSION,
-            )
-        )
-
-    attempt(
-        FINANCIAL_INVOICES_TAB,
-        lambda: build_invoice_grid(fetch_invoices(client, today=today, window_days=window_days)),
+    guard = _TabGuard(
+        label="financial",
+        # Window-bounded full replace, re-derived every run exactly like the jobs
+        # tab: the window is time-relative, so a row's membership has to be
+        # re-decided each run regardless of what changed.
+        contract_version=FINANCIAL_CONTRACT_VERSION,
+        meta_rows=meta_rows,
+        new_meta_rows=new_meta_rows,
+        run_at=run_at,
     )
-    attempt(
-        FINANCIAL_TIMESHEETS_TAB,
-        lambda: build_timesheet_grid(
-            fetch_timesheets(
-                client,
-                fetch_completed_job_ids(
-                    client, today=today, window_days=window_days, max_jobs=max_jobs
-                ),
-            )
+
+    guard.attempt(
+        FINANCIAL_INVOICES_TAB,
+        lambda: (
+            build_invoice_grid(fetch_invoices(client, today=today, window_days=window_days)),
+            None,
         ),
     )
-    attempt(
-        FINANCIAL_BUSINESS_UNITS_TAB,
-        lambda: build_business_unit_grid(fetch_business_unit_list(client)),
+    guard.attempt(
+        FINANCIAL_TIMESHEETS_TAB,
+        lambda: (
+            build_timesheet_grid(
+                fetch_timesheets(
+                    client,
+                    fetch_completed_job_ids(
+                        client, today=today, window_days=window_days, max_jobs=max_jobs
+                    ),
+                )
+            ),
+            None,
+        ),
     )
-    attempt(
+    guard.attempt(
+        FINANCIAL_BUSINESS_UNITS_TAB,
+        lambda: (build_business_unit_grid(fetch_business_unit_list(client)), None),
+    )
+    guard.attempt(
         FINANCIAL_JOB_COSTS_TAB,
-        lambda: build_job_cost_grid(fetch_job_costs(client, today=today, window_days=window_days)),
+        lambda: (
+            build_job_cost_grid(fetch_job_costs(client, today=today, window_days=window_days)),
+            None,
+        ),
     )
 
     logger.info(
         "financial (window=%dd): %s",
         window_days,
-        " ".join(f"{tab}={count}" for tab, count in sorted(row_counts.items()))
+        " ".join(f"{tab}={count}" for tab, count in sorted(guard.row_counts.items()))
         or "nothing written",
     )
 
-    if not dry_run:
-        for tab_name, grid in grids.items():
-            export_store.replace_grid(tab_name, grid)
+    guard.write(export_store, dry_run=dry_run)
 
-    return row_counts, failures
+    return guard.row_counts, guard.failures
 
 
 def _upload_pricebook_images(
@@ -694,13 +763,35 @@ def _upload_pricebook_images(
         return None
 
     ledger = ImageLedger(raw_cache_store)
-    summary = upload_pricebook_images(client, image_client, ledger, item_records, now=run_at)
-    # Only prune on a pass that actually saw the whole catalogue — a run stopped
-    # by a 403 or a rate limit has "not looked at" assets that must not be
-    # mistaken for "gone" and re-uploaded next run.
-    if summary.complete:
-        ledger.keep(summary.seen_keys)
-    ledger.flush()
+    summary = ImageUploadSummary()
+    try:
+        summary = upload_pricebook_images(client, image_client, ledger, item_records, now=run_at)
+        # Only prune on a pass that actually saw the whole catalogue — a run
+        # stopped by a 403, a rate limit or a failed download has "not looked
+        # at" assets that must not be mistaken for "gone" and re-uploaded next
+        # run.
+        if summary.complete:
+            ledger.keep(summary.seen_keys)
+    except Exception as exc:
+        # The image lane is a SIDE lane. The four pricebook tabs are already
+        # written by the time it runs, and the `_meta` rows that describe them
+        # are written after it — so anything escaping here would leave four
+        # fresh tabs described by stale `_meta` (wrong row_count, wrong
+        # last_run_at), forget every upload this pass had already made, and
+        # skip the outbox drain. Whatever it is, it is logged with its
+        # traceback, named in the summary, and does not decide whether the
+        # export succeeded.
+        summary.stopped = f"image pass aborted: {type(exc).__name__}: {exc}"
+        logger.exception(
+            "pricebook image pass aborted (%s). Every pricebook tab and its _meta row "
+            "were still written; the images are retried next run.",
+            exc,
+        )
+    finally:
+        # In a `finally` because the uploads this pass DID make are recorded in
+        # this ledger and nowhere else: losing it re-sends bytes TrueQuote
+        # already has, every run, forever.
+        ledger.flush()
 
     logger.info("pricebook images: %s", summary.as_log_fields())
     if summary.permission_denied:

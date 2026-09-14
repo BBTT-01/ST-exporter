@@ -6,6 +6,8 @@ these fails, the wire format has drifted, not the taste.
 
 from __future__ import annotations
 
+import time_machine
+
 from st_exporter.images.assets import (
     idempotency_key,
     is_displayable,
@@ -153,13 +155,20 @@ class TestIdempotencyKey:
         assert idempotency_key(self._asset(), PNG) != idempotency_key(other, PNG)
 
     def test_key_is_independent_of_the_clock(self) -> None:
-        # Nothing time-varying may enter it: the whole point is that a later run
-        # recomputes the identical value.
-        assert idempotency_key(self._asset(), PNG) == (
-            idempotency_key(
-                select_uploadable_asset(
-                    {"id": 100, "assets": [{"id": "a1", "url": "https://x/a1.jpg"}]}
-                ),
-                PNG,
-            )  # type: ignore[arg-type]
+        # Nothing time-varying may enter it: a run a year later must recompute
+        # the identical value, or the ledger never matches and every image is
+        # re-uploaded on every run forever.
+        with time_machine.travel("2026-09-14T12:00:00Z"):
+            today = idempotency_key(self._asset(), PNG)
+        with time_machine.travel("2027-04-01T03:17:00Z"):
+            next_year = idempotency_key(self._asset(), PNG)
+        assert today == next_year
+
+    def test_the_source_url_is_part_of_the_key(self) -> None:
+        # Same asset id, same bytes, moved CDN: TrueQuote stores at a path
+        # derived from the source url, so this is a different stored object.
+        moved = select_uploadable_asset(
+            {"id": 100, "assets": [{"id": "a1", "url": "https://y/a1.jpg"}]}
         )
+        assert moved is not None
+        assert idempotency_key(self._asset(), PNG) != idempotency_key(moved, PNG)

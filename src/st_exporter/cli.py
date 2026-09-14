@@ -130,6 +130,13 @@ def _summary_line(summary: ExportSummary | None, outcomes: list[LaneOutcome]) ->
                 f" {tab.replace('.', '_')}={count}"
                 for tab, count in sorted(summary.pricebook_row_counts.items())
             )
+        if summary.pricebook_failures:
+            # Named in the run's output, not only in the log — a pricebook tab
+            # left at last run's contents is a fact whoever reads the catalogue
+            # needs, and it must not be something you have to go digging for.
+            message += " pricebook_failed=" + ",".join(
+                _tab_key(tab) for tab in sorted(summary.pricebook_failures)
+            )
         if summary.financial_row_counts is not None:
             message += "".join(
                 f" {_tab_key(tab)}={count}"

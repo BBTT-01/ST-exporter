@@ -123,3 +123,68 @@ class TestTimesheets:
     def test_a_job_without_an_id_is_dropped(self, mock_client) -> None:
         mock_client.get.return_value = _envelope([{"name": "no id"}, {"id": 5}])
         assert fetch_completed_job_ids(mock_client, today=TODAY) == ["5"]
+
+    def test_every_page_of_one_jobs_timesheets_is_read(self, mock_client) -> None:
+        # A crew working a job over several days exceeds one page. Reading only
+        # the first silently drops labour hours off the end, which reads
+        # downstream as a cheaper job rather than as an error.
+        mock_client.get.side_effect = [
+            _envelope([{"id": 1, "jobId": 7}], has_more=True),
+            _envelope([{"id": 2, "jobId": 7}], has_more=True),
+            _envelope([{"id": 3, "jobId": 7}]),
+        ]
+        assert [s["id"] for s in fetch_timesheets(mock_client, ["7"])] == [1, 2, 3]
+        pages = [c.kwargs["params"]["page"] for c in mock_client.get.call_args_list]
+        assert pages == [1, 2, 3]
+
+    def test_an_endless_hasmore_stops_rather_than_looping_forever(self, mock_client) -> None:
+        mock_client.get.return_value = _envelope([{"id": 1, "jobId": 7}], has_more=True)
+        segments = fetch_timesheets(mock_client, ["7"])
+        assert mock_client.get.call_count <= 21
+        assert len(segments) == mock_client.get.call_count
+
+    def test_a_bare_array_is_by_definition_the_whole_answer(self, mock_client) -> None:
+        mock_client.get.return_value = [{"id": 1, "jobId": 7}]
+        fetch_timesheets(mock_client, ["7"])
+        assert mock_client.get.call_count == 1
+
+
+class TestDateFilterTripwire:
+    """ServiceTitan IGNORES query parameters it does not recognise.
+
+    `invoicedOnOrAfter` / `completedOnOrAfter` are unverified spellings
+    (KNOWN_UNVERIFIED.md), so a wrong one does not fail — it quietly returns the
+    tenant's entire history and the feed exports all of it as if that were the
+    window. The only signal available is the data itself.
+    """
+
+    def test_an_invoice_older_than_the_window_is_warned_about(self, mock_client, caplog) -> None:
+        import logging
+
+        mock_client.get.return_value = _envelope(
+            [{"id": 1, "invoiceDate": "2020-01-01"}, {"id": 2, "invoiceDate": "2026-09-01"}]
+        )
+        with caplog.at_level(logging.WARNING, logger="st_exporter"):
+            records = fetch_invoices(mock_client, today=TODAY)
+
+        assert "invoicedOnOrAfter" in caplog.text
+        assert "2020-01-01" in caplog.text
+        # Logged only. Filtering locally would hide the very symptom that proves
+        # the parameter name is wrong.
+        assert len(records) == 2
+
+    def test_records_inside_the_window_say_nothing(self, mock_client, caplog) -> None:
+        import logging
+
+        mock_client.get.return_value = _envelope([{"id": 1, "invoiceDate": "2026-09-01"}])
+        with caplog.at_level(logging.WARNING, logger="st_exporter"):
+            fetch_invoices(mock_client, today=TODAY)
+        assert "predates" not in caplog.text
+
+    def test_the_job_window_has_the_same_tripwire(self, mock_client, caplog) -> None:
+        import logging
+
+        mock_client.get.return_value = _envelope([{"id": 5, "completedOn": "2019-05-05T00:00:00Z"}])
+        with caplog.at_level(logging.WARNING, logger="st_exporter"):
+            assert fetch_completed_job_ids(mock_client, today=TODAY) == ["5"]
+        assert "completedOnOrAfter" in caplog.text

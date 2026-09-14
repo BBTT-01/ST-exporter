@@ -34,9 +34,12 @@ class ImageLedgerEntry:
 class ImageLedger:
     """Read-modify-write wrapper around the `_image_ledger` tab.
 
-    Loads lazily so constructing one issues no Sheets read, and ``flush()`` is a
-    no-op until something touched it — a pricebook run with no images makes zero
-    Sheets calls.
+    Loads lazily, so constructing one issues no Sheets read and ``flush()`` is a
+    no-op until something touched it. "Touched" includes ``keep()`` and every
+    read — ``has()`` loads, and so does the ``keep()`` that prunes — so a
+    pricebook run that reaches the image pass at all will read and rewrite this
+    tab even when it uploads nothing. Only a run with NO image pass (no image
+    client, or a dry run) makes zero Sheets calls here.
     """
 
     def __init__(self, store: SheetsPort) -> None:

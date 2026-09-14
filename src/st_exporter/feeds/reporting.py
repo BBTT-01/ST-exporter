@@ -21,7 +21,12 @@ deliberately has **no such fallback**:
   the name matches, because a contractor can name their own report anything;
 - no match at all raises :class:`JobCostingReportNotFoundError`;
 - more than one distinct match raises :class:`JobCostingReportAmbiguousError` rather
-  than picking one.
+  than picking one;
+- and because none of the above can catch a contractor's namesake report that
+  carries no marker at all, the report we settle on must also DECLARE the
+  columns the tab is built from — ``require_columns`` — or it is refused. A
+  wrong report with a plausible name is otherwise indistinguishable from the
+  right one until every money cell comes out blank.
 
 Refusing is the correct outcome: the ``reporting.jobCosts`` tab is simply not
 written that run, the other three financial tabs still land, and nobody reconciles
@@ -36,7 +41,7 @@ write by a future guard.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from st_cli.client import ServiceTitanClient
 from st_cli.exceptions import RateLimitError, STCLIError
@@ -76,6 +81,24 @@ class JobCostingReportAmbiguousError(ReportUnavailableError):
 
 class ReportRateLimitedError(ReportUnavailableError):
     """ServiceTitan throttled the report run even after the client's own retries."""
+
+
+class ReportColumnsMismatchError(ReportUnavailableError):
+    """The report we found does not declare the columns this tab is built from.
+
+    The name guard alone cannot catch every wrong report. A contractor's own
+    report carrying **no** user-defined marker — and the marker spellings are
+    unverified, see KNOWN_UNVERIFIED.md — passes ``find_builtin_report`` as a
+    single unambiguous match. Its columns then don't line up, every money cell
+    comes out blank, and the tab is written with a healthy ``row_count``: wrong
+    money, reported as success. So the report's own declared field names are
+    checked against the frozen column set, and a mismatch refuses the tab in
+    exactly the same loud, per-tab, non-fatal way a missing report does.
+
+    It is equally the tripwire for the other direction: if ServiceTitan renames
+    a field on the genuine built-in report, this fires instead of the tab going
+    quietly empty forever.
+    """
 
 
 @dataclass(frozen=True)
@@ -143,12 +166,56 @@ def find_builtin_report(client: ServiceTitanClient, report_name: str) -> ReportR
     return next(iter(matches.values()))
 
 
+def field_names(metadata: dict[str, Any]) -> list[str]:
+    """The field names a report metadata document declares, in order.
+
+    Empty when the document carries no ``fields`` at all — which is treated as
+    "could not check here", not as "no columns": ``fetch_report_rows`` checks
+    the first data page's own ``fields`` regardless, so the guard still bites.
+    """
+    fields = metadata.get("fields")
+    if not isinstance(fields, list):
+        return []
+    return [str(field.get("name")) for field in fields if isinstance(field, dict)]
+
+
+def require_columns(
+    ref: ReportRef,
+    declared: Sequence[str],
+    required: Sequence[str],
+    *,
+    source: str,
+) -> None:
+    """Refuse unless ``declared`` covers every one of ``required``.
+
+    ``source`` names where the column list came from (the metadata document or
+    the first data page) so the failure message says which half disagreed.
+    Nothing is checked when ``declared`` is empty — see :func:`field_names`.
+    """
+    if not declared:
+        return
+    missing = [column for column in required if column not in set(declared)]
+    if not missing:
+        return
+    raise ReportColumnsMismatchError(
+        f"the report named {ref.name!r} (category {ref.category_id}/report "
+        f"{ref.report_id}) does not have the column(s) {', '.join(missing)} "
+        f"that this tab is built from; its {source} declares "
+        f"{', '.join(declared) or '(none)'}. Refusing to write the tab: every "
+        "missing column would export as a blank money cell, which reads as "
+        "'this contractor has no costs' rather than as an error. This is most "
+        "likely a contractor-authored report that shares the built-in report's "
+        "name and carries no marker saying so."
+    )
+
+
 def fetch_report_rows(
     client: ServiceTitanClient,
     ref: ReportRef,
     *,
     parameters: list[dict[str, Any]],
     page_size: int = _PAGE_SIZE,
+    required_columns: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
     """Run the report and return every row as a dict keyed by field name.
 
@@ -166,7 +233,7 @@ def fetch_report_rows(
     body = {"parameters": parameters}
 
     rows: list[dict[str, Any]] = []
-    field_names: list[str] = []
+    names: list[str] = []
     page = 1
     while True:
         try:
@@ -183,10 +250,14 @@ def fetch_report_rows(
                 f"unaffected. Detail: {exc}"
             ) from exc
 
-        if not field_names:
-            field_names = [str(field.get("name")) for field in envelope.get("fields") or []]
+        if not names:
+            names = [str(field.get("name")) for field in envelope.get("fields") or []]
+            # Checked on the FIRST page, before a single row is kept: the
+            # metadata GET and the data POST can disagree, and it is the data
+            # response's own columns that decide what lands in the tab.
+            require_columns(ref, names, required_columns, source="first data page")
         for data_row in envelope.get("data") or []:
-            rows.append(dict(zip(field_names, data_row)))
+            rows.append(dict(zip(names, data_row)))
 
         if not envelope.get("hasMore", False):
             break

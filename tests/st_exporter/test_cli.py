@@ -125,6 +125,30 @@ class TestSuccessPath:
             "s", "e", feeds=frozenset({"pricebook"}), dry_run=False, image_client=None
         )
 
+    def test_a_failed_pricebook_tab_is_named_in_the_run_output(self, monkeypatch, capsys) -> None:
+        # Not only in the log: a tab left at last run's contents is a fact the
+        # reader of the catalogue needs, and must not take digging to find.
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "pricebook"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch(
+                "st_exporter.cli.TradeRatedSettings",
+                return_value=MagicMock(configured=False, images_configured=False),
+            ),
+            patch(
+                "st_exporter.cli.run_export",
+                return_value=_summary(
+                    pricebook_row_counts={"pricebook.services": 2},
+                    pricebook_failures={"pricebook.equipment": "HTTP 500: boom"},
+                ),
+            ),
+            pytest.raises(SystemExit),
+        ):
+            main()
+
+        assert "pricebook_failed=pricebook_equipment" in capsys.readouterr().out
+
 
 class TestFeedsFlag:
     def test_feeds_flag_is_parsed_and_passed_through(self, monkeypatch) -> None:

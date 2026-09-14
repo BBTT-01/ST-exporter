@@ -10,7 +10,7 @@ import respx
 
 from st_cli.client import ServiceTitanClient
 from st_cli.config import Environment, Settings
-from st_cli.exceptions import APIError, NotFoundError, RateLimitError
+from st_cli.exceptions import APIError, NotFoundError, RateLimitError, STCLIError, TransportError
 
 
 @pytest.fixture()
@@ -149,3 +149,57 @@ class TestServiceTitanClient:
         client.get("crm", "customers", params={"name": "Acme"})
         request = route.calls[0].request
         assert "name=Acme" in str(request.url)
+
+
+class TestTransportFailures:
+    """A request that never reaches an HTTP status still leaves as an STCLIError.
+
+    This is what makes ``except STCLIError`` a complete guard. It is not a
+    theoretical tidiness: the exporter's financial feed guards each of its four
+    money tabs with exactly that clause, and a bare ``httpx.ReadTimeout`` on the
+    report POST used to walk straight past it and discard three tabs that had
+    already been fetched successfully.
+    """
+
+    @respx.mock
+    def test_a_read_timeout_is_raised_as_a_transport_error(self, client):
+        respx.get("/crm/v2/tenant/12345/customers").mock(side_effect=httpx.ReadTimeout("timed out"))
+        with patch("st_cli.client.time.sleep"):
+            with pytest.raises(TransportError) as excinfo:
+                client.get("crm", "customers")
+        assert isinstance(excinfo.value, STCLIError)
+        # The original cause is chained, never swallowed.
+        assert isinstance(excinfo.value.__cause__, httpx.ReadTimeout)
+        assert "customers" in str(excinfo.value)
+
+    @respx.mock
+    def test_a_connect_error_is_retried_before_it_is_raised(self, client):
+        route = respx.get("/crm/v2/tenant/12345/customers").mock(
+            side_effect=httpx.ConnectError("no route to host")
+        )
+        with patch("st_cli.client.time.sleep"):
+            with pytest.raises(TransportError):
+                client.get("crm", "customers")
+        # A timeout is far more often a blip than a verdict, so it gets the same
+        # retry budget a 429 does: the first attempt plus _MAX_RETRIES.
+        assert route.call_count == 4
+
+    @respx.mock
+    def test_a_transient_transport_failure_recovers_without_raising(self, client):
+        respx.get("/crm/v2/tenant/12345/customers").mock(
+            side_effect=[
+                httpx.ConnectError("no route to host"),
+                httpx.Response(200, json={"data": [{"id": 1}]}),
+            ]
+        )
+        with patch("st_cli.client.time.sleep"):
+            assert client.get("crm", "customers") == {"data": [{"id": 1}]}
+
+    @respx.mock
+    def test_get_bytes_is_guarded_too(self, client):
+        respx.get("/pricebook/v2/tenant/12345/images").mock(
+            side_effect=httpx.ConnectTimeout("timed out")
+        )
+        with patch("st_cli.client.time.sleep"):
+            with pytest.raises(TransportError):
+                client.get_bytes("pricebook", "images", params={"path": "x.jpg"})

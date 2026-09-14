@@ -17,11 +17,14 @@ from st_exporter.feeds.reporting import (
     JOB_COSTING_SUMMARY_REPORT_NAME,
     JobCostingReportAmbiguousError,
     JobCostingReportNotFoundError,
+    ReportColumnsMismatchError,
     ReportRateLimitedError,
     ReportRef,
     ReportUnavailableError,
     fetch_report_rows,
+    field_names,
     find_job_costing_summary,
+    require_columns,
 )
 
 
@@ -118,6 +121,7 @@ class TestDiscovery:
         assert issubclass(JobCostingReportNotFoundError, ReportUnavailableError)
         assert issubclass(JobCostingReportAmbiguousError, ReportUnavailableError)
         assert issubclass(ReportRateLimitedError, ReportUnavailableError)
+        assert issubclass(ReportColumnsMismatchError, ReportUnavailableError)
 
 
 class TestReportData:
@@ -170,3 +174,66 @@ class TestReportData:
         with pytest.raises(ReportRateLimitedError):
             fetch_report_rows(client, self.ref, parameters=[])
         assert client.post.call_count <= 51
+
+
+class TestColumnGuard:
+    """The name guard's blind spot: a namesake report that carries no marker.
+
+    ``find_builtin_report`` returns it as a single unambiguous match, so nothing
+    upstream refuses. Its columns are the only thing that gives it away, and
+    without this check every money cell is blank, the tab is written, and
+    `_meta` reports a healthy row_count — wrong money, reported as success.
+    """
+
+    ref = ReportRef(category_id="7", report_id="42", name="Job Costing Summary")
+    required = ("JobNumber", "TotalCosts", "TotalRevenue")
+
+    def test_a_report_missing_our_columns_is_refused_by_name(self) -> None:
+        with pytest.raises(ReportColumnsMismatchError) as excinfo:
+            require_columns(self.ref, ["Job", "Revenue", "Cost"], self.required, source="metadata")
+        message = str(excinfo.value)
+        # The message has to name what is missing, or the operator cannot act.
+        assert "JobNumber" in message and "TotalCosts" in message and "TotalRevenue" in message
+        assert "Job Costing Summary" in message
+
+    def test_extra_columns_are_fine_because_the_tab_narrows_anyway(self) -> None:
+        require_columns(
+            self.ref,
+            ["JobNumber", "TotalCosts", "TotalRevenue", "TechnicianName"],
+            self.required,
+            source="metadata",
+        )
+
+    def test_a_metadata_document_with_no_fields_defers_rather_than_refusing(self) -> None:
+        # "Could not check here" is not "no columns" — the first data page's own
+        # `fields` still gets checked, so the guard is not lost, only deferred.
+        assert field_names({}) == []
+        require_columns(self.ref, [], self.required, source="metadata")
+
+    def test_field_names_reads_the_metadata_documents_own_order(self) -> None:
+        assert field_names({"fields": [{"name": "A"}, {"name": "B"}]}) == ["A", "B"]
+        assert field_names({"fields": "not a list"}) == []
+
+    def test_the_data_response_is_checked_too_and_no_rows_are_kept(self) -> None:
+        # Metadata and the data POST can disagree; it is the data response's own
+        # columns that decide what lands in the tab.
+        client = MagicMock()
+        client.post.return_value = {
+            "fields": [{"name": "Job"}, {"name": "Revenue"}],
+            "data": [["J-7", 900]],
+            "hasMore": True,
+        }
+        with pytest.raises(ReportColumnsMismatchError):
+            fetch_report_rows(client, self.ref, parameters=[], required_columns=self.required)
+        # Refused on the FIRST page — never paged on into a throttled endpoint.
+        assert client.post.call_count == 1
+
+    def test_the_right_report_passes_straight_through(self) -> None:
+        client = MagicMock()
+        client.post.return_value = {
+            "fields": [{"name": n} for n in self.required],
+            "data": [["J-7", 500, 900]],
+            "hasMore": False,
+        }
+        rows = fetch_report_rows(client, self.ref, parameters=[], required_columns=self.required)
+        assert rows == [{"JobNumber": "J-7", "TotalCosts": 500, "TotalRevenue": 900}]

@@ -43,6 +43,7 @@ from st_cli.client import ServiceTitanClient
 from st_cli.exceptions import APIError
 from st_cli.pagination import fetch_all
 from st_exporter.feeds import reporting
+from st_exporter.financial import JOB_COST_COLUMNS
 from st_exporter.logging_setup import logger
 from st_exporter.window import FINANCIAL_WINDOW_DAYS
 
@@ -73,6 +74,11 @@ _PAGE_SIZE = 200
 #: a cap, and hitting it is logged rather than silently truncating.
 DEFAULT_MAX_TIMESHEET_JOBS = 500
 
+#: A single job's timesheets are a handful of segments per technician per visit.
+#: This cap exists only so a server that answers ``hasMore: true`` forever cannot
+#: hang a run; reaching it is logged loudly rather than passed off as the answer.
+_MAX_TIMESHEET_PAGES = 20
+
 
 def window_start(today: date, *, window_days: int = FINANCIAL_WINDOW_DAYS) -> datetime:
     """The inclusive start of the financial window, as a UTC instant.
@@ -92,10 +98,18 @@ def fetch_invoices(
     window_days: int = FINANCIAL_WINDOW_DAYS,
 ) -> list[dict[str, Any]]:
     """Invoices invoiced on or after the window's start, line items included."""
-    params = {INVOICE_DATE_PARAM: _iso(window_start(today, window_days=window_days))}
-    return list(
-        fetch_all(client, INVOICES_MODULE, INVOICES_RESOURCE, params=params, page_size=_PAGE_SIZE)
+    start = window_start(today, window_days=window_days)
+    records = list(
+        fetch_all(
+            client,
+            INVOICES_MODULE,
+            INVOICES_RESOURCE,
+            params={INVOICE_DATE_PARAM: _iso(start)},
+            page_size=_PAGE_SIZE,
+        )
     )
+    warn_if_older_than_window(records, field="invoiceDate", start=start, param=INVOICE_DATE_PARAM)
+    return records
 
 
 def fetch_business_units(client: ServiceTitanClient) -> list[dict[str, Any]]:
@@ -136,9 +150,11 @@ def fetch_completed_job_ids(
         "sort": "-completedOn",
     }
     job_ids: list[str] = []
+    seen: list[dict[str, Any]] = []
     for record in fetch_all(
         client, JOBS_MODULE, JOBS_RESOURCE, params=params, page_size=_PAGE_SIZE
     ):
+        seen.append(record)
         job_id = record.get("id")
         if job_id is None or str(job_id) == "":
             continue
@@ -151,6 +167,12 @@ def fetch_completed_job_ids(
                 max_jobs,
             )
             break
+    warn_if_older_than_window(
+        seen,
+        field="completedOn",
+        start=window_start(today, window_days=window_days),
+        param=JOB_COMPLETED_PARAM,
+    )
     return job_ids
 
 
@@ -168,22 +190,50 @@ def fetch_timesheets(
     A 404 on one job is skipped, not raised: a job can be deleted between the
     list call and this one, and losing the entire tab over one missing job would
     be a self-inflicted outage that repeats every run.
+
+    Every page is read. The envelope form carries ``hasMore``, and a job worked
+    by a large crew over several days genuinely exceeds one page — stopping at
+    the first would silently drop labour hours off the end, which reads
+    downstream as a cheaper job rather than as an error.
     """
     segments: list[dict[str, Any]] = []
     missing = 0
     for job_id in job_ids:
-        try:
-            result = client.get(TIMESHEETS_MODULE, f"jobs/{job_id}/timesheets")
-        except APIError as exc:
-            if exc.status_code != 404:
-                raise
-            missing += 1
-            continue
-        for segment in _as_records(result):
-            segments.append({**segment, "jobId": segment.get("jobId") or job_id})
+        page = 1
+        while True:
+            try:
+                result = client.get(
+                    TIMESHEETS_MODULE,
+                    f"jobs/{job_id}/timesheets",
+                    params={"page": page, "pageSize": _PAGE_SIZE},
+                )
+            except APIError as exc:
+                if exc.status_code != 404:
+                    raise
+                missing += 1
+                break
+            for segment in _as_records(result):
+                segments.append({**segment, "jobId": segment.get("jobId") or job_id})
+            if not _has_more(result):
+                break
+            page += 1
+            if page > _MAX_TIMESHEET_PAGES:
+                logger.warning(
+                    "financial: job %s still reported hasMore after %d pages of "
+                    "timesheets; stopping rather than looping forever. Its later "
+                    "segments are NOT in this run's payroll.timesheets tab.",
+                    job_id,
+                    _MAX_TIMESHEET_PAGES,
+                )
+                break
     if missing:
         logger.info("financial: %d job(s) had no timesheets endpoint response (404)", missing)
     return segments
+
+
+def _has_more(result: Any) -> bool:
+    """``hasMore`` from an envelope. A bare array is by definition the whole answer."""
+    return bool(result.get("hasMore")) if isinstance(result, dict) else False
 
 
 def fetch_job_costs(
@@ -195,7 +245,8 @@ def fetch_job_costs(
     """Run the built-in Job Costing Summary report over the financial window.
 
     Raises a :class:`reporting.ReportUnavailableError` subclass — never returns a
-    partial or best-guess result. See ``feeds/reporting.py``.
+    partial or best-guess result, and never a result whose columns are not the
+    ones ``financial.JOB_COST_COLUMNS`` names. See ``feeds/reporting.py``.
     """
     ref = reporting.find_job_costing_summary(client)
     # Replaying the report's metadata GET before POSTing its data is not
@@ -204,9 +255,17 @@ def fetch_job_costs(
     # this token's session. Profit Wizard hit this the hard way on its cached
     # report-id path; the exporter discovers fresh every run, but the ordering
     # is cheap to keep and the failure it prevents is opaque.
-    reporting.report_metadata(client, ref)
+    metadata = reporting.report_metadata(client, ref)
+    # And the answer is USED, not discarded. Name matching cannot tell a
+    # contractor's unmarked namesake report from the built-in one; its columns
+    # can. Checking here refuses before the (throttled) data POST is even made.
+    reporting.require_columns(
+        ref, reporting.field_names(metadata), JOB_COST_COLUMNS, source="metadata"
+    )
     parameters = job_cost_parameters(today, window_days=window_days)
-    return reporting.fetch_report_rows(client, ref, parameters=parameters)
+    return reporting.fetch_report_rows(
+        client, ref, parameters=parameters, required_columns=JOB_COST_COLUMNS
+    )
 
 
 def job_cost_parameters(
@@ -226,6 +285,56 @@ def job_cost_parameters(
         {"name": "From", "value": start},
         {"name": "To", "value": today.isoformat()},
     ]
+
+
+def warn_if_older_than_window(
+    records: list[dict[str, Any]],
+    *,
+    field: str,
+    start: datetime,
+    param: str,
+) -> None:
+    """Log loudly when a record predates the window we asked ServiceTitan for.
+
+    A tripwire for the one thing the server will not tell us. ``INVOICE_DATE_PARAM``
+    and ``JOB_COMPLETED_PARAM`` are unverified spellings (see KNOWN_UNVERIFIED.md),
+    and ServiceTitan **ignores query parameters it does not recognise** rather
+    than rejecting them — so a misspelling does not fail, it quietly returns the
+    tenant's entire history and the feed exports all of it as if that were the
+    window.
+
+    This only LOGS. Filtering the rows out locally would hide exactly the symptom
+    that proves the parameter name is wrong, and would also make the exporter
+    silently paper over a server-side filter that stopped working.
+    """
+    oldest: datetime | None = None
+    for record in records:
+        moment = _moment(record.get(field))
+        if moment is not None and (oldest is None or moment < oldest):
+            oldest = moment
+    if oldest is None or oldest >= start:
+        return
+    logger.warning(
+        "financial: the oldest %s seen is %s, which predates the requested window "
+        "start %s. ServiceTitan ignores query parameters it does not recognise, so "
+        "%r may be the wrong spelling and this feed may be exporting the tenant's "
+        "entire history. Verify the parameter name against the live API.",
+        field,
+        oldest.isoformat(),
+        start.isoformat(),
+        param,
+    )
+
+
+def _moment(value: Any) -> datetime | None:
+    """An ISO date or timestamp as a UTC-aware datetime, or None if unparseable."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _as_records(result: Any) -> list[dict[str, Any]]:

@@ -173,8 +173,47 @@ class TestCategoryRows:
         assert row["active"] == "false"
 
 
-def test_the_three_item_tabs_share_one_code_path() -> None:
-    # services / equipment / materials differ only by tab name. Same record in,
-    # byte-identical row out — that is the "one parser, three tabs" guarantee.
-    record = _item()
-    assert build_item_grid([record]) == build_item_grid([record])
+class TestTheKeyColumnIsNeverBlank:
+    """``st_id`` is non-empty by contract, so a record with no id is DROPPED.
+
+    Writing it instead produces a row whose key column is blank — which a
+    consumer keyed on ``st_id`` discards anyway, while the run's ``row_count``
+    still counted it, and which at a glance is indistinguishable from real data.
+    The category-filtered fetch path already drops id-less records when it
+    merges them; this is the same rule where every path meets.
+    """
+
+    def test_an_item_with_no_id_is_not_written(self) -> None:
+        grid = build_item_grid([_item(), {**_item(), "id": None}])
+        assert len(grid) == 2  # header + the one real item
+        assert grid[1][0] == "1"
+
+    def test_an_item_with_an_empty_string_id_is_not_written(self) -> None:
+        assert build_item_grid([{**_item(), "id": ""}]) == [list(ITEM_COLUMNS)]
+
+    def test_a_category_with_no_id_is_not_written(self) -> None:
+        grid = build_category_grid([{"id": 10, "name": "Doors"}, {"name": "orphan"}])
+        assert [row[0] for row in grid[1:]] == ["10"]
+
+    def test_a_real_zero_id_is_still_a_real_id(self) -> None:
+        # Guards the difference between "falsy" and "absent" — the same
+        # distinction `price` turns on everywhere else in this module.
+        assert build_item_grid([{**_item(), "id": 0}])[1][0] == "0"
+
+
+def test_every_item_tab_is_built_by_the_same_parser() -> None:
+    """ "One parser, three tabs": the tab name carries the meaning, the code does not.
+
+    ``run.py`` must build services, equipment and materials through
+    ``build_item_grid`` — if one of them ever grows its own path, this is what
+    notices. Asserted on the wiring, not on ``f(x) == f(x)``.
+    """
+    from st_exporter import run
+
+    assert set(run.PRICEBOOK_TABS) == {
+        "pricebook.services",
+        "pricebook.equipment",
+        "pricebook.materials",
+    }
+    assert run.build_item_grid is build_item_grid
+    assert run.build_category_grid is build_category_grid

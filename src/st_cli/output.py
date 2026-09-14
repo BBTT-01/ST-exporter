@@ -14,12 +14,34 @@ console = Console()
 
 
 def _resolve(record: dict[str, Any], key: str) -> Any:
-    """Resolve a potentially nested key like 'address.city'."""
-    parts = key.split(".")
+    """Resolve a column key against one record.
+
+    Three forms, each there for a reason a column once went permanently blank:
+
+    - ``'address.city'`` — a nested path.
+    - ``'phoneSettings.0.phone'`` — a numeric segment indexes a list, because
+      ServiceTitan returns a customer's contact details as arrays of setting
+      objects rather than as scalars.
+    - ``'jobNumber|number'`` — alternatives, left to right, first non-``None``
+      wins. This is how a spelling is WIDENED without narrowing: the new, right
+      spelling goes first and the old one stays as a fallback, so no tenant that
+      worked before can stop working.
+    """
+    for alternative in key.split("|"):
+        value = _resolve_one(record, alternative)
+        if value is not None:
+            return value
+    return None
+
+
+def _resolve_one(record: dict[str, Any], key: str) -> Any:
     val: Any = record
-    for part in parts:
+    for part in key.split("."):
         if isinstance(val, dict):
             val = val.get(part)
+        elif isinstance(val, list) and part.isdigit():
+            index = int(part)
+            val = val[index] if index < len(val) else None
         else:
             return None
     return val

@@ -77,6 +77,38 @@ def _first_present(*sources: dict[str, Any] | None, keys: tuple[str, ...]) -> An
     return None
 
 
+def _contact_detail(
+    customer: dict[str, Any] | None,
+    *,
+    settings_key: str,
+    field: str,
+) -> Any:
+    """One customer phone/email, preferring the settings ARRAY over the scalar.
+
+    ServiceTitan's CRM customer carries its contact details as
+    ``phoneSettings: [{phone: ...}]`` / ``emailSettings: [{email: ...}]``. Profit
+    Wizard's production client reads exactly those and treats the flat ``phone``
+    / ``email`` scalars only as a fallback (``lib/crm/servicetitan.ts:903-906``),
+    so reading only the scalars is the same shape of mistake that left
+    ``job_number`` blank on every row ever exported — a column that is empty on
+    every row, which reads as "this contractor has no phone numbers".
+
+    Widen-only, so it cannot regress: the array is preferred when it has a
+    usable entry and the old scalar behaviour is preserved underneath it. The
+    tab has one cell, not a list, so the FIRST non-empty entry wins — that is
+    the customer's primary number in ServiceTitan's own ordering.
+    """
+    if not customer:
+        return None
+    for entry in customer.get(settings_key) or []:
+        if not isinstance(entry, dict):
+            continue
+        value = entry.get(field)
+        if value is not None and str(value).strip():
+            return value
+    return customer.get(field)
+
+
 def _coordinate(location: dict[str, Any] | None) -> tuple[Any, Any]:
     """Latitude/longitude for a location, or (None, None) if ServiceTitan has none.
 
@@ -246,8 +278,12 @@ def build_job_rows(
                     "job_number": _first_present(job, keys=("jobNumber", "number")),
                     "st_technician_id": technician_id,
                     "customer_name": customer.get("name") if customer else None,
-                    "customer_phone": customer.get("phone") if customer else None,
-                    "customer_email": customer.get("email") if customer else None,
+                    "customer_phone": _contact_detail(
+                        customer, settings_key="phoneSettings", field="phone"
+                    ),
+                    "customer_email": _contact_detail(
+                        customer, settings_key="emailSettings", field="email"
+                    ),
                     "service_address": build_service_address(location.get("address"))
                     if location
                     else "",

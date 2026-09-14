@@ -54,7 +54,11 @@ class ImageUploadAccepted:
 
 @dataclass(frozen=True)
 class ImageUploadRejected:
-    """A non-200. ``retryable`` decides whether the run gives up on this pass."""
+    """A non-200. ``retryable`` decides whether the run gives up on this pass.
+
+    ``status_code`` is ``NO_HTTP_STATUS`` (0) when the request never reached a
+    status at all — a DNS failure, a refused connection, a timeout.
+    """
 
     status_code: int
     error: str
@@ -66,6 +70,10 @@ class ImageUploadRejected:
 
 
 ImageUploadResult = ImageUploadAccepted | ImageUploadRejected
+
+# A rejection carrying status 0 is a transport failure — no HTTP status was ever
+# received. It is always retryable: nothing about the ASSET was judged.
+NO_HTTP_STATUS = 0
 
 # 422 is TrueQuote saying "this asset is not acceptable" — the same bytes will
 # be rejected again next run, so it is counted and not retried. 401/429/503 are
@@ -116,15 +124,27 @@ class TrueQuoteImageClient:
         if is_default:
             params["is_default"] = "true"
 
-        resp = self._http.post(
-            _PATH,
-            params=params,
-            content=payload,
-            headers={
-                "Content-Type": content_type,
-                "Idempotency-Key": idempotency_key,
-            },
-        )
+        try:
+            resp = self._http.post(
+                _PATH,
+                params=params,
+                content=payload,
+                headers={
+                    "Content-Type": content_type,
+                    "Idempotency-Key": idempotency_key,
+                },
+            )
+        except httpx.HTTPError as exc:
+            # A DNS failure or a read timeout is the same KIND of fact as a 503:
+            # TrueQuote is unreachable right now, and the next scheduled run
+            # retries these bytes. Returning it as a retryable rejection rather
+            # than raising is what keeps the promise this module's docstring
+            # makes — the image pass ends, the pricebook run does not.
+            return ImageUploadRejected(
+                status_code=NO_HTTP_STATUS,
+                error=f"transport_error: {type(exc).__name__}: {exc}",
+                retryable=True,
+            )
 
         if resp.status_code == 200:
             body = _json_object(resp)

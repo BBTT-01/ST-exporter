@@ -149,3 +149,43 @@ class TestContacts:
         }
         result = invoke(["crm", "contacts-get", "1"])
         assert result.exit_code == 0
+
+
+class TestCustomerContactColumns:
+    """ServiceTitan carries contact details as settings ARRAYS, not scalars.
+
+    Profit Wizard's production client reads `c.phoneSettings[].phone` /
+    `c.emailSettings[].email` and treats the flat scalars only as a fallback
+    (`lib/crm/servicetitan.ts:903-906`). Reading only the scalar is the same
+    mistake that left `job_number` blank on every row ever exported.
+    """
+
+    def test_the_settings_arrays_are_read(self, invoke, mock_client):
+        mock_client.get.return_value = make_envelope(
+            [
+                {
+                    "id": 1,
+                    "name": "Acme",
+                    "emailSettings": [{"email": "primary@acme.test"}],
+                    "phoneSettings": [{"phone": "555-0100"}],
+                }
+            ]
+        )
+        result = invoke(["crm", "customers-list"])
+        assert "primary@acme.test" in result.output
+        assert "555-0100" in result.output
+
+    def test_the_scalars_still_work_as_a_fallback(self, invoke, mock_client):
+        # Widen-only: nothing that showed a phone number before stops doing so.
+        mock_client.get.return_value = make_envelope(
+            [{"id": 1, "name": "Acme", "email": "flat@acme.test", "phone": "555-0199"}]
+        )
+        result = invoke(["crm", "customers-list"])
+        assert "flat@acme.test" in result.output
+        assert "555-0199" in result.output
+
+    def test_an_empty_settings_array_falls_back_rather_than_blanking(self, invoke, mock_client):
+        mock_client.get.return_value = make_envelope(
+            [{"id": 1, "name": "Acme", "phoneSettings": [], "phone": "555-0199"}]
+        )
+        assert "555-0199" in invoke(["crm", "customers-list"]).output

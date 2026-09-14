@@ -25,10 +25,13 @@ Failure policy, in one place because it is the whole point of the module:
   did not) and the run reports it; public HTTPS assets keep uploading.
 - Any single asset failing — download or upload — is counted and stepped over.
   A pricebook run must not end because one image is a broken link.
-- 401/429/5xx from TrueQuote ends the *pass*, not the run: those are about the
-  connection, and every unsent asset is simply retried by the next scheduled
-  run. Nothing is lost because nothing here is a queue — the catalogue is the
-  queue.
+- 401/429/5xx from TrueQuote — **and a TrueQuote request that never reached a
+  status at all**, a DNS failure or a timeout — ends the *pass*, not the run:
+  those are about the connection, and every unsent asset is simply retried by
+  the next scheduled run. Nothing is lost because nothing here is a queue — the
+  catalogue is the queue. ``images/client.py`` converts the transport failure
+  into a retryable rejection so this stays a promise about *outcomes*, not one
+  about HTTP status codes that an exception could walk straight past.
 """
 
 from __future__ import annotations
@@ -89,8 +92,16 @@ class ImageUploadSummary:
 
     @property
     def complete(self) -> bool:
-        """True when the pass saw every asset it set out to see."""
-        return self.stopped is None and not self.permission_denied
+        """True when the pass saw every asset it set out to see, and saw it WHOLE.
+
+        ``download_failed`` counts too. A CDN 500 on one image means that
+        image's key never reached ``seen_keys``, so pruning the ledger against
+        ``seen_keys`` would forget an upload that genuinely happened and re-send
+        identical bytes on the next run. "Could not fetch it" is not "it is
+        gone" — the same distinction ``permission_denied`` already makes, one
+        asset at a time instead of tenant-wide.
+        """
+        return self.stopped is None and not self.permission_denied and self.download_failed == 0
 
     def as_log_fields(self) -> str:
         return (

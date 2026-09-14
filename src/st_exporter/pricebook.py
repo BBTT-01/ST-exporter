@@ -9,6 +9,8 @@ The column sets and cell rules come from ``CONTRACT-pricebook-tabs.md``
 (`pricebook.v1`, frozen 2026-09-14). The rules that are easiest to break, and are
 therefore enforced here in one place:
 
+- ``st_id`` is never blank: a record with no ServiceTitan id is dropped rather
+  than written as a keyless row that ``row_count`` would nevertheless count.
 - Every cell is text. A blank cell means empty; a missing column means absent.
   Those are never collapsed — in particular ``price`` is **blank when null, never
   ``0``**, because a real zero-priced item and an item with no price are
@@ -50,13 +52,27 @@ CATEGORY_COLUMNS: tuple[str, ...] = ("st_id", "name", "active", "parent_id")
 
 
 def build_item_grid(records: list[dict[str, Any]]) -> list[list[str]]:
-    """Header row + one row per item, for any of the three item tabs."""
-    return [list(ITEM_COLUMNS)] + [format_item_row(build_item_row(r)) for r in records]
+    """Header row + one row per item with an ``st_id``, for any of the three item tabs.
+
+    A record with no id is DROPPED here rather than written as a row with a blank
+    key. The contract says ``st_id`` is non-empty, a consumer keyed on it would
+    discard the row anyway, and — the reason it matters — a blank key column in a
+    written tab is indistinguishable from real data at a glance, while the run's
+    ``row_count`` would still have counted it. The category-filtered fetch path
+    already drops id-less records when it merges them (``feeds/pricebook``); this
+    is the same rule on the unfiltered path, applied where every path meets.
+    """
+    rows = [build_item_row(r) for r in records]
+    return [list(ITEM_COLUMNS)] + [format_item_row(row) for row in rows if row["st_id"]]
 
 
 def build_category_grid(records: list[dict[str, Any]]) -> list[list[str]]:
-    """Header row + one row per category, for the `pricebook.categories` tab."""
-    return [list(CATEGORY_COLUMNS)] + [format_category_row(build_category_row(r)) for r in records]
+    """Header row + one row per category with an ``st_id``, for `pricebook.categories`.
+
+    Same non-empty-key rule as :func:`build_item_grid`.
+    """
+    rows = [build_category_row(r) for r in records]
+    return [list(CATEGORY_COLUMNS)] + [format_category_row(row) for row in rows if row["st_id"]]
 
 
 def build_item_row(record: dict[str, Any]) -> dict[str, str]:

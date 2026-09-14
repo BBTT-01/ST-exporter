@@ -17,8 +17,13 @@ app = typer.Typer(help="CRM — customers, locations, bookings, contacts")
 CUSTOMER_COLUMNS: list[Column] = [
     ("ID", "id"),
     ("Name", "name"),
-    ("Email", "email"),
-    ("Phone", "phone"),
+    # ServiceTitan returns a customer's contact details as `emailSettings[]` /
+    # `phoneSettings[]`; the flat scalars are the fallback, not the source —
+    # Profit Wizard's production client reads them the same way round
+    # (`lib/crm/servicetitan.ts:903-906`). Reading only the scalar leaves the
+    # column blank on every row, which looks like a customer with no phone.
+    ("Email", "emailSettings.0.email|email"),
+    ("Phone", "phoneSettings.0.phone|phone"),
     ("Active", "active"),
     ("Created", "createdOn"),
 ]

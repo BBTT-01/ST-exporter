@@ -343,3 +343,197 @@ def test_no_image_client_means_no_upload_pass_at_all(st_settings, exporter_setti
 
     # None, not an empty summary: "didn't look" and "nothing to send" differ.
     assert summary.images is None
+
+
+# --- per-tab isolation -------------------------------------------------------
+
+
+@respx.mock
+def test_one_failing_tab_does_not_cost_the_other_three(st_settings, exporter_settings) -> None:
+    """The same bar the financial feed meets: a tab failing costs that tab.
+
+    There is no atomicity to protect between the four — they are four separate
+    full replaces a consumer joins by id — so losing services, materials AND
+    categories because equipment 500'd is pure self-inflicted damage.
+    """
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    respx.get(f"{st_settings.api_base}/pricebook/v2/tenant/12345/equipment").mock(
+        return_value=httpx.Response(500, text="pricebook is unwell")
+    )
+    export_store = InMemorySheetsStore()
+
+    summary = _run(st_settings, exporter_settings, export_store)
+
+    assert set(summary.pricebook_row_counts) == {
+        "pricebook.services",
+        "pricebook.materials",
+        "pricebook.categories",
+    }
+    assert "pricebook.equipment" in summary.pricebook_failures
+    assert "pricebook.equipment" not in export_store.tabs
+    assert export_store.tabs["pricebook.services"][0] == list(ITEM_COLUMNS)
+
+
+@respx.mock
+def test_a_failed_tab_keeps_its_previous_contents_and_meta_row(
+    st_settings, exporter_settings
+) -> None:
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    export_store = InMemorySheetsStore()
+    # Run once cleanly so there is a previous state to preserve.
+    _run(st_settings, exporter_settings, export_store)
+    before = [row[:] for row in export_store.tabs["pricebook.equipment"]]
+
+    respx.get(f"{st_settings.api_base}/pricebook/v2/tenant/12345/equipment").mock(
+        side_effect=httpx.ConnectError("no route to host")
+    )
+    with patch("st_cli.client.time.sleep"):
+        summary = _run(st_settings, exporter_settings, export_store)
+
+    # Untouched, not emptied — and its _meta row still says when it was last
+    # genuinely refreshed rather than claiming a run that produced nothing.
+    assert export_store.tabs["pricebook.equipment"] == before
+    meta = parse_meta_grid(export_store.tabs["_meta"])
+    assert meta["pricebook.equipment"].row_count == 1
+    assert "pricebook.equipment" in summary.pricebook_failures
+    # A transport failure, which is not an HTTP status, is caught like any other.
+    assert "ConnectError" in summary.pricebook_failures["pricebook.equipment"]
+
+
+@respx.mock
+def test_a_clean_run_reports_no_failures(st_settings, exporter_settings) -> None:
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    summary = _run(st_settings, exporter_settings, InMemorySheetsStore())
+    assert summary.pricebook_failures == {}
+
+
+@respx.mock
+def test_an_item_with_no_st_id_is_neither_written_nor_counted(
+    st_settings, exporter_settings
+) -> None:
+    # `st_id` is non-empty by contract, and a blank key column in a written tab
+    # is indistinguishable from real data at a glance while `row_count` counts
+    # it anyway. The category-FILTERED fetch path already drops these.
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(
+        st_settings.api_base,
+        services=[tenant_pricebook.SERVICE_1, {**tenant_pricebook.SERVICE_2_NO_PRICE, "id": None}],
+        categories=[tenant_pricebook.CATEGORY_10, {"name": "orphan", "active": True}],
+    )
+    export_store = InMemorySheetsStore()
+
+    summary = _run(st_settings, exporter_settings, export_store)
+
+    assert [row[0] for row in export_store.tabs["pricebook.services"][1:]] == ["1"]
+    assert summary.pricebook_row_counts["pricebook.services"] == 1
+    assert summary.pricebook_row_counts["pricebook.categories"] == 1
+    # The count in `_meta` is what was actually written, not what was fetched.
+    meta = parse_meta_grid(export_store.tabs["_meta"])
+    assert meta["pricebook.services"].row_count == 1
+
+
+# --- the image lane is a SIDE lane -------------------------------------------
+
+
+class _RefusingLedgerStore(InMemorySheetsStore):
+    """A raw-cache Sheet that fails exactly on the image ledger tab."""
+
+    def read_grid(self, tab_name: str):
+        if tab_name == "_image_ledger":
+            raise RuntimeError("the raw cache sheet is unreachable")
+        return super().read_grid(tab_name)
+
+
+@respx.mock
+def test_an_exploding_image_lane_never_costs_the_four_tabs_their_meta(
+    st_settings, exporter_settings
+) -> None:
+    """Four fresh tabs described by a STALE `_meta` row is the worst outcome here.
+
+    The tabs are written before the image pass and `_meta` after it, so anything
+    escaping the image lane leaves wrong `row_count`/`last_run_at` for all four,
+    forgets every upload the pass already made, and skips the outbox drain.
+    """
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    respx.get(EQUIPMENT_IMAGE_URL).mock(return_value=httpx.Response(200, content=PNG))
+    respx.post(TQ_UPLOAD).mock(
+        return_value=httpx.Response(
+            200, json={"asset_key": "k", "storage_path": "p", "status": "stored"}
+        )
+    )
+    export_store, raw_cache_store = InMemorySheetsStore(), _RefusingLedgerStore()
+
+    client = _image_client()
+    try:
+        summary = _run_with_images(
+            st_settings, exporter_settings, export_store, raw_cache_store, client
+        )
+    finally:
+        client.close()
+
+    meta = parse_meta_grid(export_store.tabs["_meta"])
+    for tab in PRICEBOOK_TABS:
+        assert meta[tab].last_run_at == FIXED_NOW.isoformat()
+    assert summary.pricebook_row_counts["pricebook.equipment"] == 1
+    # Named, not swallowed: the failure is reported on the summary.
+    assert summary.images is not None and summary.images.stopped is not None
+
+
+@respx.mock
+def test_uploads_already_made_are_flushed_even_when_the_pass_dies(
+    st_settings, exporter_settings
+) -> None:
+    """The ledger is the ONLY record of what has already crossed the wire.
+
+    Losing it re-sends bytes TrueQuote already has, every run, forever — so the
+    flush belongs in a `finally`, not on the happy path.
+    """
+    mock_auth_token(st_settings.auth_url)
+    service_image_url = "https://cdn.example.com/service-1.jpg"
+    tenant_pricebook.register(
+        st_settings.api_base,
+        # Two uploadable items, so there IS a first upload to lose.
+        services=[
+            {
+                **tenant_pricebook.SERVICE_1,
+                "assets": [{"id": "s1", "url": service_image_url, "isDefault": True}],
+            }
+        ],
+    )
+    respx.get(service_image_url).mock(return_value=httpx.Response(200, content=PNG))
+    respx.get(EQUIPMENT_IMAGE_URL).mock(return_value=httpx.Response(200, content=PNG))
+    respx.get(f"{st_settings.api_base}/pricebook/v2/tenant/12345/images").mock(
+        return_value=httpx.Response(200, content=PNG)
+    )
+    respx.post(TQ_UPLOAD).mock(
+        return_value=httpx.Response(
+            200, json={"asset_key": "k", "storage_path": "p", "status": "stored"}
+        )
+    )
+    export_store, raw_cache_store = InMemorySheetsStore(), InMemorySheetsStore()
+
+    client = _image_client()
+    original = client.upload
+    calls = {"n": 0}
+
+    def explode_after_the_first(**kwargs):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("something nobody predicted")
+        return original(**kwargs)
+
+    client.upload = explode_after_the_first  # type: ignore[method-assign]
+    try:
+        summary = _run_with_images(
+            st_settings, exporter_settings, export_store, raw_cache_store, client
+        )
+    finally:
+        client.close()
+
+    # The first upload really happened, so it must be remembered.
+    assert len(raw_cache_store.tabs["_image_ledger"]) == 2
+    assert summary.images is not None and summary.images.stopped is not None

@@ -15,6 +15,7 @@ import pytest
 import respx
 
 from st_exporter.images.client import (
+    NO_HTTP_STATUS,
     ImageUploadAccepted,
     ImageUploadRejected,
     TrueQuoteImageClient,
@@ -175,3 +176,39 @@ class TestResponses:
         respx.post(UPLOAD_URL).mock(return_value=httpx.Response(502, text="<html>bad gateway"))
         result = _upload(client)
         assert result == ImageUploadRejected(status_code=502, error="http_502", retryable=True)
+
+
+class TestTransportFailures:
+    """No HTTP status ever came back. That is a connection fact, not an asset fact."""
+
+    @respx.mock
+    def test_a_timeout_becomes_a_retryable_rejection_rather_than_an_exception(self, client) -> None:
+        respx.post(UPLOAD_URL).mock(side_effect=httpx.ReadTimeout("slow"))
+
+        result = client.upload(
+            external_item_id="100",
+            source_url="https://cdn.example.com/a1.png",
+            content_type="image/png",
+            payload=PNG,
+            idempotency_key="k",
+        )
+
+        assert isinstance(result, ImageUploadRejected)
+        assert result.retryable is True
+        assert result.kind == "retryable"
+        assert result.status_code == NO_HTTP_STATUS
+        assert "ReadTimeout" in result.error
+
+    @respx.mock
+    def test_a_connect_error_is_reported_the_same_way(self, client) -> None:
+        respx.post(UPLOAD_URL).mock(side_effect=httpx.ConnectError("no dns"))
+
+        result = client.upload(
+            external_item_id="100",
+            source_url="https://cdn.example.com/a1.png",
+            content_type="image/png",
+            payload=PNG,
+            idempotency_key="k",
+        )
+
+        assert isinstance(result, ImageUploadRejected) and result.retryable

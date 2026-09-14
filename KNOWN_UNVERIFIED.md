@@ -22,6 +22,12 @@ unknown query parameters rather than rejecting them, so the feed would quietly
 export the **entire** invoice or job history instead of the window. Check the
 row counts against the window on the first real run.
 
+There is now a tripwire for exactly this: after fetching, the feed logs a
+WARNING naming the parameter if the oldest `invoiceDate` / `completedOn` it saw
+predates the window start (`warn_if_older_than_window`). It **only logs** — it
+deliberately does not filter the rows out locally, because doing so would hide
+the one symptom that proves the parameter name is wrong.
+
 `sort: "-completedOn"` on the job list is likewise inferred; if it is rejected or
 ignored, the `max_jobs` cap would truncate to an arbitrary set of jobs rather than
 the most recently completed ones.
@@ -36,10 +42,15 @@ been seen on a real tenant. Several plausible spellings are accepted (`isCustom`
 `custom`, `isUserDefined`, `userDefined`, and a `type`/`reportType`/`kind`/`source`
 of `Custom`/`UserDefined`/`Tenant`). The asymmetry is deliberate: a false positive
 costs a loud refusal, a false negative costs silently wrong money numbers. **If
-ServiceTitan marks custom reports some other way, or not at all, the only
-remaining guard is the exact-name match plus the ambiguity refusal** — which is
-still strictly stronger than Profit Wizard's current fingerprint fallback, but
-weaker than intended. Confirm on a tenant that has custom reports.
+ServiceTitan marks custom reports some other way, or not at all, the name guard
+alone cannot see an unmarked namesake** — it comes back as a single unambiguous
+match. So the report we settle on must also DECLARE the columns
+`financial.JOB_COST_COLUMNS` names, checked against both its metadata document
+and the first page of its data (`reporting.require_columns`); a mismatch raises
+`ReportColumnsMismatchError`, which skips that one tab and names the missing
+columns. That check does not depend on any unverified spelling, and it is what
+turns "wrong report, blank money, reported as success" into a loud refusal.
+Confirm on a tenant that has custom reports.
 
 ## Financial feed: the Reporting permission's portal name
 
@@ -54,9 +65,10 @@ and the other three tabs still land — the failure is visible, not silent.
 
 `payroll/v2/.../jobs/{jobId}/timesheets` has been observed answering with a bare
 JSON array on some tenants and a `{"data": [...]}` envelope on others (Profit
-Wizard accepts both). Both are accepted here. Whether it also paginates on a job
-with very many segments is unknown — this code reads one response per job and
-would silently truncate if it does.
+Wizard accepts both). Both are accepted here. Whether it paginates on a job with
+very many segments is unknown, so the envelope form is now followed while it
+reports `hasMore` (up to a 20-page stop that is logged loudly); a bare array is
+taken as the whole answer, since there is nowhere for a cursor to live.
 
 ## `appointment-assignments` "removed" status values
 

@@ -280,3 +280,79 @@ class TestFailuresDoNotAbortTheRun:
 
         assert summary.too_large == 1
         assert not upload.called
+
+
+class TestTrueQuoteUnreachable:
+    """A TrueQuote request that never reaches a status must not raise.
+
+    ``upload.py``'s failure policy promises "401/429/5xx ends the pass, not the
+    run". A DNS failure or a read timeout is an exception, not a status, so it
+    used to sail past that promise entirely — out of the image pass, out of
+    ``run_export``, and past the `_meta` write for four tabs that had already
+    been written.
+    """
+
+    @respx.mock
+    def test_a_timeout_posting_to_truequote_ends_the_pass_not_the_run(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=PNG))
+        respx.post(TQ_UPLOAD).mock(side_effect=httpx.ReadTimeout("truequote is slow"))
+
+        summary = _run(st_client, image_client, [PUBLIC_ITEM, STORAGE_ITEM])
+
+        assert summary.stopped is not None
+        assert "ReadTimeout" in summary.stopped
+        assert summary.complete is False
+        assert summary.uploaded == 0
+
+    @respx.mock
+    def test_a_dns_failure_is_retryable_never_a_verdict_on_the_asset(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=PNG))
+        respx.post(TQ_UPLOAD).mock(side_effect=httpx.ConnectError("name resolution failed"))
+
+        summary = _run(st_client, image_client, [PUBLIC_ITEM])
+
+        # Counted as "stopped", never as `upload_rejected` — nothing about the
+        # ASSET was judged, so it must be retried next run.
+        assert summary.upload_rejected == 0
+        assert summary.stopped is not None
+
+
+class TestLedgerPruning:
+    """`complete` decides whether the ledger is pruned, so it must mean "saw it all"."""
+
+    @respx.mock
+    def test_a_failed_download_makes_the_pass_incomplete(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        # A CDN 500 means this asset's key never reached `seen_keys`. Pruning
+        # against `seen_keys` anyway would forget an upload that genuinely
+        # happened and re-send identical bytes next run — breaking the "a retry
+        # of an unchanged image sends zero bytes" invariant.
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(500, text="cdn is unwell"))
+        respx.get(_images_url(st_settings)).mock(return_value=httpx.Response(200, content=JPEG))
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [PUBLIC_ITEM, STORAGE_ITEM])
+
+        assert summary.download_failed == 1
+        assert summary.uploaded == 1
+        assert summary.complete is False
+
+    @respx.mock
+    def test_a_clean_pass_is_complete_and_may_prune(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=PNG))
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [PUBLIC_ITEM, NO_IMAGE_ITEM])
+
+        assert summary.complete is True

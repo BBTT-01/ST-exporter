@@ -9,7 +9,7 @@ import httpx
 
 from st_cli.auth import TokenManager
 from st_cli.config import Settings
-from st_cli.exceptions import APIError, NotFoundError, RateLimitError
+from st_cli.exceptions import APIError, NotFoundError, RateLimitError, TransportError
 
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.0  # seconds
@@ -101,15 +101,37 @@ class ServiceTitanClient:
         Returns the raw ``httpx.Response`` so callers can decode it as JSON
         (``_request``) or as bytes (``get_bytes``) — the retry/auth/error
         behaviour must not be duplicated per decoding.
+
+        **Every** failure mode leaves here as an ``STCLIError``: a non-success
+        status as an ``APIError`` subclass, and a request that never reached a
+        status as a ``TransportError``. Nothing raw from ``httpx`` escapes, so
+        ``except STCLIError`` anywhere upstream is a complete guard rather than
+        one that holds until the network hiccups.
         """
         url = self._url(module, resource)
         retries = 0
         refreshed = False
 
         while True:
-            resp = self._http.request(
-                method, url, headers=self._headers(), params=params, json=json_body
-            )
+            try:
+                resp = self._http.request(
+                    method, url, headers=self._headers(), params=params, json=json_body
+                )
+            except httpx.HTTPError as exc:
+                # No status came back at all — DNS, connect, TLS, read timeout.
+                # Retried on the same budget as a 429 (a timeout is far more
+                # often a blip than a verdict), then raised as an STCLIError so
+                # the per-tab guards in st_exporter can catch it. Letting a bare
+                # httpx exception escape killed three already-fetched tabs.
+                if retries < _MAX_RETRIES:
+                    retries += 1
+                    time.sleep(_BACKOFF_BASE * (2 ** (retries - 1)))
+                    continue
+                raise TransportError(
+                    f"{method} {url} failed without an HTTP response after "
+                    f"{retries} retr{'y' if retries == 1 else 'ies'} "
+                    f"({type(exc).__name__}: {exc})"
+                ) from exc
 
             if resp.status_code == 401 and not refreshed:
                 self._token_manager.force_refresh()

@@ -475,3 +475,73 @@ def test_job_number_is_blank_only_when_servicetitan_sends_neither_spelling() -> 
     result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
 
     assert result.rows[0]["job_number"] is None
+
+
+def _rows_for_customer(customer: dict) -> dict:
+    """One job row for a single customer record — the contact columns under test."""
+    result = build_job_rows(
+        _cache({"id": 1, "jobNumber": "J-1", "customerId": 10}),
+        _cache({"id": 100, "jobId": 1}),
+        _cache(),
+        _cache(customer),
+        _cache(),
+    )
+    return result.rows[0]
+
+
+class TestCustomerContactColumns:
+    """ServiceTitan carries contact details as settings ARRAYS, not scalars.
+
+    Profit Wizard's production client reads `c.phoneSettings[].phone` /
+    `c.emailSettings[].email` and treats the flat scalars only as a fallback
+    (`lib/crm/servicetitan.ts:903-906`). Reading only the scalar is exactly the
+    `job_number` failure again: a column blank on every row, which reads as "this
+    contractor has no phone numbers" rather than as an error.
+    """
+
+    def test_the_settings_arrays_are_preferred(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane Doe",
+                "phoneSettings": [{"phone": "555-2222"}, {"phone": "555-3333"}],
+                "emailSettings": [{"email": "jane@settings.test"}],
+            }
+        )
+        # One cell, not a list: the first non-empty entry is ServiceTitan's own
+        # primary ordering.
+        assert row["customer_phone"] == "555-2222"
+        assert row["customer_email"] == "jane@settings.test"
+
+    def test_the_scalars_remain_the_fallback(self) -> None:
+        # Widen-only, so it cannot regress: today's behaviour is preserved
+        # underneath the array lookup.
+        row = _rows_for_customer(
+            {"id": 10, "name": "Jane", "phone": "555-1111", "email": "jane@flat.test"}
+        )
+        assert row["customer_phone"] == "555-1111"
+        assert row["customer_email"] == "jane@flat.test"
+
+    def test_an_empty_or_blank_settings_entry_falls_back_rather_than_blanking(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "phoneSettings": [{"phone": ""}],
+                "emailSettings": [],
+                "phone": "555-1111",
+                "email": "jane@flat.test",
+            }
+        )
+        assert row["customer_phone"] == "555-1111"
+        assert row["customer_email"] == "jane@flat.test"
+
+    def test_no_customer_at_all_is_still_none(self) -> None:
+        result = build_job_rows(
+            _cache({"id": 1, "jobNumber": "J-1", "customerId": 99}),
+            _cache({"id": 100, "jobId": 1}),
+            _cache(),
+            _cache(),
+            _cache(),
+        )
+        assert result.rows[0]["customer_phone"] is None

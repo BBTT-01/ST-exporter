@@ -137,9 +137,11 @@ def test_the_report_is_run_with_profit_wizards_own_parameters(
 
 
 @respx.mock
-def test_a_missing_builtin_report_costs_only_its_own_tab(st_settings, exporter_settings) -> None:
-    # The only namesake left is the contractor's custom report, which must be
-    # refused rather than used. The other three tabs still land.
+def test_a_marked_custom_namesake_is_refused_and_costs_only_its_own_tab(
+    st_settings, exporter_settings
+) -> None:
+    # The only namesake left is the contractor's custom report, MARKED as
+    # custom, which must be refused rather than used. The other three tabs land.
     mock_auth_token(st_settings.auth_url)
     tenant_financial.register(st_settings.api_base, report_present=False)
     export_store = InMemorySheetsStore()
@@ -154,6 +156,119 @@ def test_a_missing_builtin_report_costs_only_its_own_tab(st_settings, exporter_s
         FINANCIAL_TIMESHEETS_TAB,
         FINANCIAL_BUSINESS_UNITS_TAB,
     }
+
+
+@respx.mock
+def test_an_unmarked_namesake_report_is_refused_on_its_columns(
+    st_settings, exporter_settings
+) -> None:
+    """The case the NAME guard cannot see, and the one that costs real money.
+
+    ServiceTitan's marker spelling is unverified, so a contractor's own "Job
+    Costing Summary" may carry no marker at all. It then comes back as a single
+    unambiguous match and every check upstream passes. Without a column check
+    its rows zip against ITS field names, none of which are ours, so every money
+    cell in the tab is blank — and the tab is written, `_meta` gets a healthy
+    row_count, and `financial_failures` is empty. A blank cell is
+    indistinguishable from a contractor with no costs.
+    """
+    mock_auth_token(st_settings.auth_url)
+    tenant_financial.register(st_settings.api_base, report_present=False, custom_marked=False)
+    export_store = InMemorySheetsStore()
+
+    summary = _run(st_settings, exporter_settings, export_store)
+
+    assert FINANCIAL_JOB_COSTS_TAB not in export_store.tabs
+    failure = summary.financial_failures[FINANCIAL_JOB_COSTS_TAB]
+    # Named, and specific about which columns were missing.
+    assert "JobNumber" in failure and "TotalRevenue" in failure
+    assert FINANCIAL_JOB_COSTS_TAB not in summary.financial_row_counts
+    # The other three money tabs are untouched by one bad report.
+    assert len(summary.financial_row_counts) == 3
+
+
+@respx.mock
+def test_a_renamed_field_on_the_real_report_fails_loudly_not_blankly(
+    st_settings, exporter_settings
+) -> None:
+    # The other direction of the same guard: the report IS the built-in one, but
+    # ServiceTitan has renamed a field we freeze. Without the check the tab goes
+    # quietly empty forever; with it, the run says which column moved.
+    mock_auth_token(st_settings.auth_url)
+    tenant_financial.register(st_settings.api_base)
+    renamed = [
+        {"name": "JobNumber"},
+        {"name": "TotalRevenue"},
+        {"name": "TotalCost"},  # was TotalCosts
+        {"name": "MaterialEquipmentPurchaseOrderCosts"},
+        {"name": "MaterialTotals"},
+        {"name": "EquipmentCosts"},
+    ]
+    respx.get(
+        f"{st_settings.api_base}/reporting/v2/tenant/12345/report-category/operations/reports/42"
+    ).mock(
+        return_value=httpx.Response(200, json={"name": "Job Costing Summary", "fields": renamed})
+    )
+    export_store = InMemorySheetsStore()
+
+    summary = _run(st_settings, exporter_settings, export_store)
+
+    assert FINANCIAL_JOB_COSTS_TAB not in export_store.tabs
+    assert "TotalCosts" in summary.financial_failures[FINANCIAL_JOB_COSTS_TAB]
+
+
+@respx.mock
+def test_a_transport_failure_on_the_report_costs_only_its_own_tab(
+    st_settings, exporter_settings
+) -> None:
+    """A timeout is not an HTTP status, and used to escape the per-tab guard.
+
+    The report POST is the most timeout-prone call in the repo. Invoices,
+    timesheets and business units have all been fetched successfully by the time
+    it runs, so letting a bare ``httpx.ReadTimeout`` out discarded all three and
+    left every `_meta` row stale — four tabs lost to one slow report.
+    """
+    mock_auth_token(st_settings.auth_url)
+    tenant_financial.register(st_settings.api_base)
+    respx.post(
+        f"{st_settings.api_base}/reporting/v2/tenant/12345/report-category/operations"
+        f"/reports/42/data"
+    ).mock(side_effect=httpx.ReadTimeout("the report took too long"))
+    export_store = InMemorySheetsStore()
+
+    with patch("st_cli.client.time.sleep"):
+        summary = _run(st_settings, exporter_settings, export_store)
+
+    # The three tabs that DID succeed are written, with fresh _meta rows.
+    assert set(summary.financial_row_counts) == {
+        FINANCIAL_INVOICES_TAB,
+        FINANCIAL_TIMESHEETS_TAB,
+        FINANCIAL_BUSINESS_UNITS_TAB,
+    }
+    meta = parse_meta_grid(export_store.tabs["_meta"])
+    assert meta[FINANCIAL_INVOICES_TAB].last_run_at == FIXED_NOW.isoformat()
+    # ...and the one that timed out is named, not silently absent.
+    assert "ReadTimeout" in summary.financial_failures[FINANCIAL_JOB_COSTS_TAB]
+    assert FINANCIAL_JOB_COSTS_TAB not in export_store.tabs
+
+
+@respx.mock
+def test_a_transport_failure_on_invoices_costs_only_the_invoices_tab(
+    st_settings, exporter_settings
+) -> None:
+    mock_auth_token(st_settings.auth_url)
+    tenant_financial.register(st_settings.api_base)
+    respx.get(f"{st_settings.api_base}/accounting/v2/tenant/12345/invoices").mock(
+        side_effect=httpx.ConnectError("no route to host")
+    )
+    export_store = InMemorySheetsStore()
+
+    with patch("st_cli.client.time.sleep"):
+        summary = _run(st_settings, exporter_settings, export_store)
+
+    assert FINANCIAL_INVOICES_TAB in summary.financial_failures
+    assert export_store.tabs[FINANCIAL_JOB_COSTS_TAB][0] == list(JOB_COST_COLUMNS)
+    assert len(summary.financial_row_counts) == 3
 
 
 @respx.mock
