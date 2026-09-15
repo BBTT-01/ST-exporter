@@ -1,4 +1,4 @@
-# Cut a release on every merge into the integration branch: bump the three
+# Cut a release on every merge into the integration branch: bump the two
 # version literals, test them, commit, and tag the commit it just made — in one
 # ordered job that cannot be mis-sequenced.
 #
@@ -6,11 +6,16 @@
 # THE CONSTRAINT THIS FILE EXISTS TO ENFORCE
 # ===========================================================================
 #
-# The tag must point at a commit whose `EXPORTER_TAG` ALREADY NAMES THAT TAG.
-# The workflow published at tag X must itself check out X, because `export.yml`
-# checks the two against each other at runtime ("Verify the checked-out exporter
-# matches the pinned tag") and fails a contractor's run loudly when they
-# disagree — a total outage for that tenant.
+# The tagged commit must agree with itself: `pyproject.toml`'s version and the
+# five `uses:` lines in `docs/examples/connector-export.yml` must both name the
+# tag being cut, read back out of the TAGGED TREE rather than the working tree.
+#
+# It used to be a harder constraint — "the tag must point at a commit whose
+# `EXPORTER_TAG` already names that tag" — because `export.yml` carried a
+# version literal and checked it against the installed package at runtime. That
+# literal is gone (see below); `export.yml` resolves its own commit via
+# `job.workflow_sha`, so the workflow published at tag X checks out X by
+# construction and there is nothing left to mis-sequence on that axis.
 #
 # By hand that is a four-step dance (bump -> commit -> merge -> tag the MERGED
 # commit) and it has now been got wrong four times here:
@@ -43,9 +48,8 @@
 # nobody adopts costs a line in the tag list and nothing else. No tenant's
 # behaviour changes when this workflow runs. What would actually hurt is a
 # BROKEN or MIS-SEQUENCED tag, so the guards below matter more under automation,
-# not less: the suite must be green, the three literals must agree, an existing
-# tag is never overwritten, and the tag must point at a commit whose own
-# `EXPORTER_TAG` names it.
+# not less: the suite must be green, the two literals must agree, an existing
+# tag is never overwritten, and the tagged commit must agree with itself.
 #
 # The manual path is kept alongside, not replaced: `workflow_dispatch` takes an
 # explicit version, a forced bump level, a `force` for a merge the rules would
@@ -113,52 +117,50 @@
 #     and reaches no issues, packages, deployments, Actions API or OIDC identity.
 #
 # ===========================================================================
-# THE PUSH NEEDS A CREDENTIAL THIS WORKFLOW IS NOT AUTOMATICALLY GIVEN
+# THE PUSH ONCE NEEDED A CREDENTIAL THIS WORKFLOW COULD NOT BE GIVEN.
+# IT NO LONGER DOES, AND THAT IS WHY `export.yml` HAS NO VERSION LITERAL.
 # ===========================================================================
 #
-# The bump rewrites `EXPORTER_TAG:` in `.github/workflows/export.yml`, and
-# GitHub refuses any ref update from a GitHub App — which GITHUB_TOKEN is —
+# The bump used to rewrite `EXPORTER_TAG:` in `.github/workflows/export.yml`,
+# and GitHub refuses any ref update from a GitHub App — which GITHUB_TOKEN is —
 # whose commits touch `.github/workflows/**` without the *Workflows*
 # permission. That permission CANNOT be granted from the `permissions:` key
-# above; it is not one of the scopes that key exposes, and `actionlint`
-# rejects one written there. So `contents: write` is the most this job can be
-# given and it is not enough. Release run 35024004355 built the bump, ran the
-# suite, made the commit and cut the tag, and was rejected at the final push.
-# The atomic push did its job — both refs were refused together, so nothing
-# landed and no orphan tag survived.
+# below; it is not one of the scopes that key exposes, and `actionlint` rejects
+# one written there. Release runs 35024004355 and 35025492123 each built the
+# bump, ran the suite, made the commit and cut the tag, and were rejected at the
+# final push. The atomic push did its job both times — the two refs were refused
+# together, so nothing landed and no orphan tag survived — but `0.2.11` sat
+# unreleasable, holding back two merged fixes.
 #
-# `RELEASE_PUSH_TOKEN` is the seam for a credential that CAN do it. It is
-# optional and unset by default, and while it is unset this workflow refuses
-# EARLY and explains itself instead of dying at its last line. Setting it is a
-# deliberate security decision, because whatever is put in it can rewrite the
-# reusable workflow every contractor runs against their own ServiceTitan
-# tenant. The options, narrowest first:
+# THE FIX WAS TO DELETE THE LITERAL, NOT TO FIND A BIGGER TOKEN. `export.yml`
+# now checks ITSELF out using `job.workflow_sha` / `job.workflow_repository` —
+# the `job` context, which GitHub documents for a reusable workflow checking out
+# its own source. The release commit touches `pyproject.toml` and
+# `docs/examples/connector-export.yml` and nothing under `.github/workflows/`,
+# so GITHUB_TOKEN can push it. The step "Assert all two literals moved and
+# agree" enforces that by refusing any bump that touched a workflow file.
 #
-#   * A GitHub App owned by the org, installed on THIS REPOSITORY ONLY, with
-#     Contents: write + Workflows: write, minted per run via
-#     `actions/create-github-app-token`. Short-lived (1h), repository-scoped,
-#     tied to no human, revocable by uninstalling it. Recommended.
-#   * A deploy key with write access, pushing over SSH. Repository-scoped, and
-#     not a GitHub App, so the workflow-file restriction does not apply to it.
-#     Long-lived, but it can reach nothing outside this repository.
-#   * A fine-grained PAT limited to this repository with Contents + Workflows
-#     write. Bound to a human account and expires; least preferred. A CLASSIC
-#     PAT with `workflow` scope is NOT an option — it carries `repo` across
-#     every repository that human can reach.
+# WHY NOT A STORED CREDENTIAL. Whatever went into such a secret would be able to
+# rewrite the reusable workflow every contractor runs against their own live
+# ServiceTitan tenant, unattended, on a schedule. The options were, narrowest
+# first: a repo-scoped GitHub App minted per run via
+# `actions/create-github-app-token`; a deploy key pushing over SSH (not an App,
+# so the workflow-file restriction would not apply); or a fine-grained PAT
+# limited to this repository. Each is a standing ability to rewrite the exporter
+# under a customer. None of them is needed now, and none should be added back.
+# (A CLASSIC PAT with `workflow` scope was never an option — it carries `repo`
+# across every repository that human can reach.)
 #
-# The real fix is to need none of them, and it is already in flight. If
-# `EXPORTER_TAG` leaves `export.yml` — that file's verify step is now measuring
-# `job.workflow_sha`, the `job`-context property GitHub documents for a reusable
-# workflow checking out its own source — the release commit stops touching any
-# workflow file, GITHUB_TOKEN can push it, no credential is needed, and this
-# whole section goes away. Prefer waiting for that measurement over creating a
-# secret, unless a release is needed sooner than it lands.
+# `RELEASE_PUSH_TOKEN` survives as an UNSET seam: the checkout falls back to
+# `github.token`, and the refusal step below passes on its own now that
+# `export.yml` carries no literal. If a version literal ever creeps back into a
+# workflow file, that step starts refusing again and explains this.
 #
 # ===========================================================================
 # `scripts/release.sh` IS STILL THE SOURCE OF TRUTH
 # ===========================================================================
 #
-# This file CALLS it. The sed logic that knows where the three literals live is
+# This file CALLS it. The sed logic that knows where the two literals live is
 # not duplicated into YAML, so `./scripts/release.sh 0.2.10` by hand keeps
 # working exactly as before and there is only ever one definition of "bump the
 # version". What this file adds is the ordering, the refusals and the proof.
@@ -370,8 +372,9 @@ jobs:
     timeout-minutes: 20
     permissions:
       # The minimum that can push a commit and a tag, and nothing else. It is
-      # ALSO not sufficient, and no value of this block can be — see the refusal
-      # step "Refuse if this push needs a credential GITHUB_TOKEN cannot have".
+      # now also SUFFICIENT — but only because the bump no longer touches a
+      # workflow file. See the refusal step "Refuse if this push needs a
+      # credential GITHUB_TOKEN cannot have", which is what keeps it that way.
       #
       # GITHUB_TOKEN is a GitHub App installation token, and GitHub refuses any
       # ref update from an App whose commits touch `.github/workflows/**` unless
@@ -382,7 +385,9 @@ jobs:
       # pull-requests, security-events, statuses, vulnerability-alerts. There is
       # no `workflows:` among them — `actionlint` rejects one outright — so
       # "grant the job the permission it was missing" is not a fix that can be
-      # written. This is what killed release run 35024004355 at its last line.
+      # written. It is what killed release runs 35024004355 and 35025492123 at
+      # their last line, and the reason `export.yml` no longer carries a version
+      # literal for this job to rewrite.
       contents: write
     env:
       # The integration branch, as a constant. Repointing the release line is
@@ -475,7 +480,7 @@ jobs:
         run: |
           set -euo pipefail
           # A fresh checkout is clean by construction; assert it anyway, because
-          # every later assertion ("the bump changed exactly these three files")
+          # every later assertion ("the bump changed exactly these two files")
           # is only meaningful against a clean starting point.
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error::the checked-out tree is dirty before anything was bumped:"
@@ -522,11 +527,16 @@ jobs:
       # Twenty minutes, a full test run, a commit and a tag, all discarded.
       #
       # This asks the question BEFORE anything is written, and it asks it by
-      # reading rather than by knowing: if `export.yml` already names the tag
-      # being cut, the bump will not modify a workflow file and GITHUB_TOKEN can
-      # push it. That is not a hypothetical branch — it is exactly the state the
-      # repository lands in if `EXPORTER_TAG` ever leaves `export.yml`, and on
-      # that day this step stops refusing on its own, with nothing to edit here.
+      # reading rather than by knowing: if the bump will not modify a workflow
+      # file, GITHUB_TOKEN can push it.
+      #
+      # IT PASSES TRIVIALLY TODAY, AND THAT IS THE POINT. `export.yml` carries
+      # no `EXPORTER_TAG:` line at all any more — it resolves its own commit via
+      # `job.workflow_sha` — so there is nothing under `.github/workflows/` for
+      # `release.sh` to rewrite. The step is kept as the regression detector: if
+      # a version literal ever creeps back into a workflow file, this refuses
+      # here, with the explanation, instead of at the final push twenty minutes
+      # later.
       #
       # It is skipped for `dry_run`, which pushes nothing and so needs no
       # credential: a rehearsal must still be able to run the whole sequence.
@@ -537,6 +547,11 @@ jobs:
         run: |
           set -euo pipefail
           current="$(sed -n 's/^ *EXPORTER_TAG: \(.*\)/\1/p' .github/workflows/export.yml | head -1)"
+          if [ -z "$current" ]; then
+            echo "export.yml carries no EXPORTER_TAG literal — it resolves its own commit" \
+                 "via job.workflow_sha, so this bump touches no workflow file."
+            exit 0
+          fi
           if [ "$current" = "$TAG" ]; then
             echo "export.yml already names $TAG — this bump touches no workflow file."
             exit 0
@@ -560,10 +575,10 @@ jobs:
       # ------------------------------------------------------------------
       # THE BUMP — delegated, not reimplemented.
       # ------------------------------------------------------------------
-      - name: Bump all three version literals (scripts/release.sh)
+      - name: Bump all two version literals (scripts/release.sh)
         run: ./scripts/release.sh "$VERSION"
 
-      - name: Assert all three literals moved and agree
+      - name: Assert all two literals moved and agree
         run: |
           set -euo pipefail
           # `release.sh` already cross-checks these. It is asserted AGAIN here,
@@ -571,14 +586,13 @@ jobs:
           # no-op: a sed that matches nothing exits 0, and a script whose checks
           # read back the same file it failed to write is checking itself.
           py="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)"
-          wf="$(sed -n 's/^ *EXPORTER_TAG: exporter-v\(.*\)/\1/p' .github/workflows/export.yml | head -1)"
           caller="$(grep -o 'export\.yml@exporter-v[0-9.]*' docs/examples/connector-export.yml \
                     | sed 's/.*@exporter-v//' | sort -u | tr '\n' ' ' | sed 's/ $//')"
           uses_count="$(grep -c 'export\.yml@exporter-v' docs/examples/connector-export.yml)"
-          echo "pyproject=$py export.yml=$wf caller=$caller (x$uses_count uses: lines)"
-          if [ "$py" != "$VERSION" ] || [ "$wf" != "$VERSION" ] || [ "$caller" != "$VERSION" ]; then
-            echo "::error::the three literals do not all read $VERSION" \
-                 "(pyproject='$py' export.yml='$wf' caller='$caller')."
+          echo "pyproject=$py caller=$caller (x$uses_count uses: lines)"
+          if [ "$py" != "$VERSION" ] || [ "$caller" != "$VERSION" ]; then
+            echo "::error::the two literals do not both read $VERSION" \
+                 "(pyproject='$py' caller='$caller')."
             exit 1
           fi
           # A no-op bump is the other half of the same failure: nothing changed,
@@ -590,10 +604,17 @@ jobs:
             exit 1
           fi
           echo "$changed"
-          # And it must have changed ONLY the three files it is allowed to touch.
+          # And it must have changed ONLY the two files it is allowed to touch.
+          # `.github/workflows/export.yml` is DELIBERATELY NOT on this list, and
+          # its absence is the enforcement: the bump must never rewrite a
+          # workflow file, because GITHUB_TOKEN cannot push a commit that does
+          # (runs 35024004355 / 35025492123). If a literal creeps back into
+          # export.yml and release.sh starts moving it, this step fails here
+          # rather than at the push. Do not confuse this WRITE allow-list with
+          # the READ list in the `decide` job, which still watches export.yml
+          # for changes worth releasing.
           unexpected="$(git status --porcelain | awk '{print $2}' \
                         | grep -v -e '^pyproject\.toml$' \
-                                  -e '^\.github/workflows/export\.yml$' \
                                   -e '^docs/examples/connector-export\.yml$' || true)"
           if [ -n "$unexpected" ]; then
             echo "::error::release.sh touched files it should not have: $unexpected"
@@ -602,7 +623,7 @@ jobs:
 
       # ------------------------------------------------------------------
       # GREEN BEFORE TAGGED. The suite runs against the BUMPED tree, because
-      # tests/st_exporter/test_workflow.py asserts the three literals agree —
+      # tests/st_exporter/test_workflow.py asserts the two literals agree —
       # running it before the bump would be testing the previous release.
       # ------------------------------------------------------------------
       - uses: actions/setup-python@v5
@@ -633,7 +654,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml .github/workflows/export.yml docs/examples/connector-export.yml
+          git add pyproject.toml docs/examples/connector-export.yml
           # `[skip release]` is loop guard (1): this push must not cut another
           # release. `[skip ci]` is deliberately NOT used — it would also skip
           # CI's own checks on the branch.
@@ -650,32 +671,35 @@ jobs:
           # than by HEAD, so it cannot pick up anything that moved in between.
           git tag -a "$TAG" "$SHA" -m "ST exporter $VERSION"
 
-      - name: Prove the tag names a commit that already names the tag
+      - name: Prove the tagged commit agrees with itself
         run: |
           set -euo pipefail
-          # THE ORDERING CONSTRAINT, READ BACK OUT OF THE TAGGED OBJECT.
-          # Not out of the working tree — out of the committed tree the tag
-          # actually points at. This is the check a human was doing by eye, and it
-          # is the one that failed four times.
-          tagged_wf="$(git show "$TAG:.github/workflows/export.yml" \
-                       | sed -n 's/^ *EXPORTER_TAG: \(.*\)/\1/p' | head -1)"
+          # READ BACK OUT OF THE TAGGED OBJECT. Not out of the working tree — out
+          # of the committed tree the tag actually points at. This is the check a
+          # human was doing by eye, and it is the one that failed four times.
           tagged_py="$(git show "$TAG:pyproject.toml" \
                        | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
           tagged_caller="$(git show "$TAG:docs/examples/connector-export.yml" \
                            | grep -o 'export\.yml@exporter-v[0-9.]*' | sed 's/.*@//' \
                            | sort -u | tr '\n' ' ' | sed 's/ $//')"
-          echo "tag=$TAG  EXPORTER_TAG=$tagged_wf  pyproject=$tagged_py  caller=$tagged_caller"
-          if [ "$tagged_wf" != "$TAG" ]; then
-            echo "::error::$TAG points at a commit whose EXPORTER_TAG is '$tagged_wf'." \
-                 "Every contractor run at this tag would fail the runtime guard."
-            exit 1
-          fi
+          echo "tag=$TAG  pyproject=$tagged_py  caller=$tagged_caller"
           if [ "$tagged_py" != "$VERSION" ] || [ "$tagged_caller" != "$TAG" ]; then
             echo "::error::the tagged commit disagrees with itself" \
                  "(pyproject='$tagged_py' caller='$tagged_caller')."
             exit 1
           fi
-          echo "ordering constraint holds: the commit $TAG points at already names $TAG"
+          # THE LITERAL MUST NEVER COME BACK. A version string under
+          # `.github/workflows/` is what made runs 35024004355 and 35025492123
+          # unpushable. Checked against the TAGGED tree, so a bump that
+          # reintroduced one could not be published even if every other guard
+          # were edited away.
+          if git show "$TAG:.github/workflows/export.yml" | grep -q '^ *EXPORTER_TAG:'; then
+            echo "::error::$TAG points at a commit whose export.yml carries an" \
+                 "EXPORTER_TAG literal again. A version literal in a workflow file makes" \
+                 "the release unpushable by GITHUB_TOKEN — that is why it was deleted."
+            exit 1
+          fi
+          echo "the tagged commit agrees with itself, and carries no workflow literal"
 
       # ------------------------------------------------------------------
       # PUBLISH. Atomically, so a half-push cannot leave a tag without its commit
@@ -714,8 +738,9 @@ jobs:
             echo "| commit | \`${SHA:-not reached}\` |"
             echo "| branch | \`$INTEGRATION_BRANCH\` |"
             echo
-            echo "The tag points at that commit, and that commit's \`EXPORTER_TAG\` names the"
-            echo "tag — checked by reading them back out of the tagged tree."
+            echo "The tag points at that commit, and that commit's \`pyproject.toml\` and"
+            echo "example caller both name the tag — checked by reading them back out of"
+            echo "the tagged tree."
             echo
             echo "**Contractors do not move until somebody repins them.**"
             echo "\`docs/examples/connector-export.yml\` in this repository is already at"

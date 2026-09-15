@@ -178,78 +178,98 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-    env:
-      # ---------------------------------------------------------------------
-      # THE ONE VERSION LITERAL IN THIS FILE.
-      # Bump it and pyproject.toml together via `scripts/release.sh <version>`,
-      # in the same commit the new tag is cut from. Everything else — the
-      # checkout ref and the expected version the guard asserts — is derived
-      # from this string.
-      # ---------------------------------------------------------------------
-      EXPORTER_TAG: exporter-v0.2.10
     steps:
+      # =====================================================================
+      # THIS WORKFLOW CHECKS ITSELF OUT. THERE IS NO VERSION LITERAL HERE.
+      # =====================================================================
+      #
       # A reusable (workflow_call) workflow runs in the CALLER's context, so a
       # bare checkout would fetch the caller's repo (which has no pyproject.toml)
-      # and `pip install -e .` would fail. This repo and ref are pinned explicitly.
+      # and `pip install -e .` would fail. The repo and the ref are therefore
+      # explicit — but they are now RESOLVED, not written down.
       #
-      # `EXPORTER_TAG` (job env, top of this job) is the ONE version literal in
-      # this file. The checkout ref and the expected version are both derived from
-      # it, so they cannot disagree with each other — only with the code, which is
-      # exactly what the guard below is for.
+      # WHY THE LITERAL IS GONE. There used to be one `EXPORTER_TAG:` here, and
+      # `scripts/release.sh` rewrote it as part of every version bump. That made
+      # every release commit a commit that touches `.github/workflows/**`, and
+      # GITHUB_TOKEN — a GitHub App installation token — is refused any ref
+      # update carrying such a commit. Release runs 35024004355 and 35025492123
+      # both built the bump, ran the suite, made the commit, cut the tag, and
+      # were rejected at the final push (atomically, so nothing landed and no
+      # orphan tag survived). There is no `permissions:` entry that fixes it:
+      # `workflows` is not a scope that key can grant, at any level. The only
+      # alternative to deleting the literal was a STORED CREDENTIAL able to
+      # rewrite this file — the file every contractor runs against their own
+      # live ServiceTitan tenant, on a schedule, unattended. Deleting the
+      # literal removes that credential from the design entirely.
       #
-      # It is still a literal, and it is still a literal ON EVIDENCE. Both
-      # candidates tried so far were properties of the `github` context, and both
+      # WHAT REPLACES IT: the `job` context. `job.workflow_sha` is documented as
+      # "the commit SHA of the workflow file that defines the current job", and
+      # `job.workflow_repository` as its owner/repo; GitHub's contexts reference
+      # carries a worked example titled "check out its own source code, rather
+      # than the caller's", which is exactly this job. `actions/checkout`
+      # accepts a full SHA for `ref:`, so the exporter that runs is always the
+      # exporter this file was published with — by construction, with nothing to
+      # keep in sync and nothing for a release to rewrite.
+      #
+      # DO NOT SUBSTITUTE ANYTHING FROM THE `github` CONTEXT. All of `github.*`
+      # describes the CALLER, by design, and two attempts died on that. Both
       # were measured on a real customer run (Pioneer, run 34392888158,
       # 2026-09-09):
       #
-      #   github.job_workflow_ref = <EMPTY>
+      #   github.job_workflow_ref = <EMPTY>   (not a `github` property at all —
+      #                                        it is an OIDC claim)
       #   github.workflow_ref     = BBTT-01/tr-pioneer-overhead-door/
       #                             .github/workflows/export.yml@refs/heads/main
       #
-      # `workflow_ref` names the CALLER — deriving from it on 2026-09-08 checked
-      # out this repo's `main` and ran an exporter with no `--feeds` flag.
-      # `job_workflow_ref` is documented to name the reusable workflow itself, but
-      # is simply empty here, so deriving from it yields an empty ref. Neither is
-      # usable. Do not try a third time without re-measuring first.
+      # Deriving from `workflow_ref` on 2026-09-08 checked out THIS repo's
+      # `main` and ran an exporter with no `--feeds` flag, against a live
+      # tenant. `job.*` is a different mechanism, not a third guess at the same
+      # one.
       #
-      # THE THIRD CANDIDATE IS NOT IN THE `github` CONTEXT AT ALL. It is the
-      # `job` context — `job.workflow_sha`, `job.workflow_repository`,
-      # `job.workflow_ref`, `job.workflow_file_path` — which GitHub documents
-      # for precisely this job: a reusable workflow checking out its OWN source
-      # rather than the caller's. `github.*` is always the caller's; that is why
-      # both earlier attempts failed, and it is why neither of them was ever
-      # going to work. This one is a different mechanism, not a third guess at
-      # the same one.
+      # CAVEAT, recorded so nobody rediscovers it: `job.workflow_sha` and its
+      # siblings are documented as NOT available on GitHub Enterprise Server.
+      # Every contractor here is on github.com, so this is fine; it would not be
+      # if a connector ever moved to GHES.
       #
-      # IT IS NOT WIRED UP YET, DELIBERATELY. An unmeasured ref is how v0.2.1
-      # shipped: an empty `ref:` does not fail, it silently checks out the
-      # default branch and runs the wrong exporter successfully, against a live
-      # tenant. So the verify step below MEASURES it and WARNS on disagreement
-      # instead, on real customer runs, without anything depending on it. When
-      # it has agreed on a run or two, `ref:` becomes `${{ job.workflow_sha }}`,
-      # EXPORTER_TAG is deleted, and the note below stops applying.
-      #
-      # WHAT THE LITERAL COSTS WHILE IT STAYS, which is the reason this is worth
-      # finishing: the cost is not paid here, it is paid by
-      # `.github/workflows/release.yml`. Because the literal lives in a file
-      # under `.github/workflows/`, every release bump rewrites a workflow file,
-      # and GITHUB_TOKEN may not push one — and there is no `permissions:` entry
-      # that changes that. So the release cannot publish itself without a stored
-      # credential that can rewrite THIS file, the one every contractor runs
-      # against their own tenant. Release run 35024004355 is where that
-      # surfaced. Removing this literal removes that credential entirely.
-      #
-      # `scripts/release.sh <version>` bumps this and pyproject.toml together.
-      # Do not hand-edit one of them.
-      #
-      # The guard exists because the bump was missed once and the failure was
-      # invisible — v0.2.1 was cut, the caller repointed, and the run logged
-      # `Uses: ...@exporter-v0.2.1` while `HEAD is now at c96d08a` named v0.2.0's
-      # commit. The wrong code ran successfully.
+      # THE GUARD BELOW COMES BEFORE THE CHECKOUT, AND THAT ORDER IS THE WHOLE
+      # SAFETY STORY. An empty `ref:` does not error. `actions/checkout`
+      # silently fetches the default branch and the wrong exporter runs
+      # successfully against a live customer tenant — which is precisely how
+      # v0.2.1 shipped wrong: the run logged `Uses: ...@exporter-v0.2.1` while
+      # `HEAD is now at c96d08a` named v0.2.0's commit, and nothing errored. So
+      # the resolution is asserted non-empty and asserted to name THIS
+      # repository before a single line of code is fetched.
+      - name: Self-discovery resolved
+        env:
+          # `job.*`, NOT `github.*`. See the block above before changing these.
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: |
+          set -euo pipefail
+          echo "job.workflow_sha        = '${JOB_WORKFLOW_SHA}'"
+          echo "job.workflow_repository = '${JOB_WORKFLOW_REPOSITORY}'"
+          echo "job.workflow_ref        = '${JOB_WORKFLOW_REF}'"
+          if [ -z "$JOB_WORKFLOW_SHA" ] || [ -z "$JOB_WORKFLOW_REPOSITORY" ]; then
+            echo "::error::this workflow could not resolve its own source" \
+                 "(sha='$JOB_WORKFLOW_SHA' repository='$JOB_WORKFLOW_REPOSITORY')." \
+                 "An empty ref does not fail the checkout — it takes the default branch" \
+                 "and runs the WRONG exporter against this tenant, which is how v0.2.1" \
+                 "shipped. Refusing before anything is fetched."
+            exit 1
+          fi
+          if [ "$JOB_WORKFLOW_REPOSITORY" != "BBTT-01/ST-exporter" ]; then
+            echo "::error::self-discovery resolved to '$JOB_WORKFLOW_REPOSITORY', not" \
+                 "BBTT-01/ST-exporter. The checkout below would fetch code from somewhere" \
+                 "this repository does not publish. Refusing."
+            exit 1
+          fi
+          echo "resolved own source: $JOB_WORKFLOW_REPOSITORY @ $JOB_WORKFLOW_SHA"
+
       - uses: actions/checkout@v4
         with:
-          repository: BBTT-01/ST-exporter
-          ref: ${{ env.EXPORTER_TAG }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
 
       - uses: actions/setup-python@v5
         with:
@@ -258,68 +278,25 @@ jobs:
       - name: Install
         run: pip install -e .
 
-      # The pinned tag above and the code it fetches can drift, and when they do
-      # nothing errors — the wrong exporter just runs. This turns that into a hard
-      # failure: EXPORTER_VERSION is bumped in the same commit a tag is cut from,
-      # so a mismatch means `ref:` points somewhere other than this file's own tag.
-      # It is also the version stamped into the Export Store's `_meta` tab, so the
-      # Sheet itself records which exporter wrote it.
-      - name: Verify the checked-out exporter matches the pinned tag
-        env:
-          # THE MEASUREMENT, riding a step that already runs and already prints
-          # rather than taking a line of its own in every customer's run list —
-          # the last diagnostic was its own step and was removed for exactly
-          # that. NOTHING BELOW DEPENDS ON THESE VALUES; they are compared to
-          # what the literal already produced, and a disagreement warns.
-          #
-          # `actionlint` 1.7.7 does not know the `job` context has these (its
-          # model predates them) and will flag the four lines below. That is a
-          # stale linter, not a bad expression: they are documented properties.
-          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
-          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
-          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
-          JOB_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
+      # THE VERSION IS RECORDED, NOT CROSS-CHECKED, AND THAT IS THE POINT.
+      #
+      # This step used to compare the checked-out code's EXPORTER_VERSION against
+      # a tag literal written at the top of this file, because those two could
+      # drift and nothing errored when they did (v0.2.1). There is no second name
+      # to disagree with any more: the checkout ref IS this file's own commit, so
+      # "the code that ran" and "the workflow that ran it" cannot be different
+      # things. The guard that replaced the cross-check is the self-discovery
+      # refusal above, which runs before the fetch rather than after it.
+      #
+      # What is still worth doing is saying out loud which exporter ran. A
+      # contractor's failure arrives as a link to a finished run, and the same
+      # version is stamped into the Export Store's `_meta` tab, so the Sheet and
+      # the run log can be lined up after the fact.
+      - name: Record the exporter version
         run: |
-          # ---- measurement only: warns, never fails, nothing reads the result --
-          echo "job.workflow_sha        = '${JOB_WORKFLOW_SHA}'"
-          echo "job.workflow_repository = '${JOB_WORKFLOW_REPOSITORY}'"
-          echo "job.workflow_ref        = '${JOB_WORKFLOW_REF}'"
-          echo "job.workflow_file_path  = '${JOB_WORKFLOW_FILE_PATH}'"
-          resolved="$(git rev-parse "HEAD" 2>/dev/null || echo "")"
-          if [ -z "$JOB_WORKFLOW_SHA" ]; then
-            echo "::warning title=job.workflow_sha::empty on this run — EXPORTER_TAG" \
-                 "cannot be replaced by it. Record this in export.yml and stop trying."
-          elif [ "$JOB_WORKFLOW_SHA" = "$resolved" ]; then
-            # NB: do not write an Actions expression anywhere in this run block,
-            # not even inside a comment like this one. GitHub substitutes them
-            # before bash sees the script, so a half-written one is a syntax
-            # error at runtime and a whole one prints its value when the message
-            # is about the expression itself.
-            echo "::notice title=job.workflow_sha::agrees with the commit ${EXPORTER_TAG}" \
-                 "resolves to ($resolved). Once this has held for a run or two, the" \
-                 "checkout 'ref:' can become the job.workflow_sha expression and" \
-                 "EXPORTER_TAG can be deleted — which also removes the release" \
-                 "workflow's need for a stored push credential."
-          else
-            echo "::warning title=job.workflow_sha::is '$JOB_WORKFLOW_SHA' but ${EXPORTER_TAG}" \
-                 "resolves to '$resolved'. They must agree before anything depends on it."
-          fi
-          # ---- the actual guard, unchanged -------------------------------------
-          # Derived from the single literal, not typed a second time.
-          EXPECTED_EXPORTER_VERSION="${EXPORTER_TAG#exporter-v}"
-          if [ "$EXPECTED_EXPORTER_VERSION" = "$EXPORTER_TAG" ]; then
-            echo "::error::EXPORTER_TAG ('$EXPORTER_TAG') is not of the form" \
-                 "exporter-vX.Y.Z, so the expected version cannot be derived."
-            exit 1
-          fi
+          set -euo pipefail
           actual="$(python -c 'from st_exporter import EXPORTER_VERSION; print(EXPORTER_VERSION)')"
-          if [ "$actual" != "$EXPECTED_EXPORTER_VERSION" ]; then
-            echo "::error::exporter version mismatch — this workflow expects" \
-                 "$EXPECTED_EXPORTER_VERSION but the checked-out code is $actual." \
-                 "The 'ref:' in the checkout step is pointing at the wrong commit."
-            exit 1
-          fi
-          echo "exporter $actual matches the pinned tag"
+          echo "::notice title=Exporter version::$actual"
 
       # THE DRAIN ANNOUNCES ITSELF. The one-drain rule is enforced structurally
       # (the drain needs `feeds: outbox`, and only the drain job is given a
