@@ -51,8 +51,11 @@ there is genuinely no evidence it ever worked.
 
 And a real outage is never mistaken for "not bought": **only HTTP 403 takes this
 path.** A 400 (see `KNOWN_UNVERIFIED.md` on `active=Any`), a 401, a 404, a 429 or
-a transport error keeps the behaviour it has always had — the per-tab guard fails
-that tab loudly, or the exception ends the run. Widening this to any error class
+a transport error is still a FAILURE, never a purchase — the per-tab guard fails
+that tab loudly and leaves the run green, while a whole top-level feed failing is
+recorded in `feed_failures`, annotated at `::error` and reds the run (`cli.py`).
+It no longer ends the run by raising: that crash is what used to throw past the
+`_meta` write and discard a committed feed's cursor. Widening this to any error class
 would turn an outage into a silent skip, which is the exact bug this branch exists
 to eliminate.
 """
@@ -123,10 +126,13 @@ def feed_ever_ran(meta_rows: Mapping[str, MetaRow], tab_names: Sequence[str]) ->
 class ScopeLedger:
     """Classifies each TAB's 403 once, and carries that tab's `_meta` row forward.
 
-    One per run. ``deny`` is called from wherever a tab's fetch can fail — the
-    bare try/except around the single-tab jobs and technicians feeds, and
-    ``_TabGuard`` for the two multi-tab ones — and answers the only question that
-    matters: is this a permission the tenant never had, or one they have lost?
+    One per run. ``deny`` is called from wherever a tab's fetch can fail —
+    ``run._guarded_feed`` for the single-tab jobs and technicians feeds, and
+    ``run._TabGuard`` for the two multi-tab ones — and answers the only question
+    that matters: is this a permission the tenant never had, or one they have
+    lost? Anything it declines (``None``) is that guard's own failure to record;
+    neither caller lets the exception out, so a non-403 reds the run through the
+    exit code rather than by ending it.
     """
 
     def __init__(

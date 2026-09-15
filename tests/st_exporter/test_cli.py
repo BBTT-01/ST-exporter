@@ -625,3 +625,114 @@ class TestScopeOutcomesInTheRunsOwnOutput:
             main()
         assert exc_info.value.code == 0
         mock_run.assert_not_called()
+
+
+class TestAFailedFeedRedsTheRun:
+    """A top-level feed that was asked for and did not export must not end green.
+
+    Ticket 21 put `jobs` and `technicians` behind ``_guarded_feed`` so that a
+    dying feed could no longer throw past the `_meta` write and discard another
+    feed's cursor. Catching the exception was right; what shipped with it was
+    not — the run then exited 0, and the ONLY trace of a feed that exported
+    nothing was a `feed_failed=` token in the summary line. A reader who does not
+    know that token sees `jobs=0` and a green tick, which is precisely the
+    silence the per-feed repository variables were deleted to eliminate.
+
+    Exiting non-zero costs nothing now: `_meta` is written inside `_run`, before
+    the CLI decides the exit code, and the drain has already finished. No cursor
+    lost, no tab lost, no outbox item redelivered — the same reasons the original
+    crash was tolerable, minus the crash.
+
+    The other direction is a regression too, and is held below: a pricebook or
+    financial PER-TAB failure was green before this change and stays green.
+    """
+
+    def _run(self, monkeypatch, summary, feeds="jobs,technicians"):  # type: ignore[no-untyped-def]
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", feeds])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch(
+                "st_exporter.cli.TradeRatedSettings",
+                return_value=MagicMock(configured=False, images_configured=False),
+            ),
+            patch("st_exporter.cli.run_export", return_value=summary),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        return exc_info.value.code
+
+    def test_a_failed_jobs_feed_exits_one(self, monkeypatch, capsys) -> None:
+        """The reproduction from the review, at the CLI: a non-403 on the jobs
+        feed gave `EXIT: 0`, `jobs=0 technicians=1 ... feed_failed=jobs`."""
+        code = self._run(
+            monkeypatch,
+            _summary(
+                jobs_row_count=0,
+                technicians_row_count=1,
+                feed_failures={"jobs": "HTTP 500: upstream is down"},
+            ),
+        )
+        assert code == 1
+        assert "feed_failed=jobs" in capsys.readouterr().out
+
+    def test_a_failed_technicians_feed_exits_one_too(self, monkeypatch, capsys) -> None:
+        """Both feeds `_guarded_feed` covers, not only the one in the report."""
+        code = self._run(
+            monkeypatch,
+            _summary(feed_failures={"technicians": "HTTP 400: Unknown parameter 'active'"}),
+        )
+        assert code == 1
+        assert "feed_failed=technicians" in capsys.readouterr().out
+
+    def test_a_clean_run_is_still_green(self, monkeypatch) -> None:
+        """The marker must not cry wolf: no `feed_failures`, no red run."""
+        assert self._run(monkeypatch, _summary()) == 0
+
+    def test_a_failed_pricebook_tab_still_exits_zero(self, monkeypatch, capsys) -> None:
+        """The regression in the OTHER direction, guarded explicitly.
+
+        One tab of the four-tab catalogue feed left at last run's contents is a
+        warning and was green on 0.2.9. Reddening it here would be a new
+        regression of exactly the kind this change is fixing, in reverse — and
+        `pricebook.materials` 403ing on a TrueQuote-only tenant is the ordinary
+        every-cycle state, so a red run there would be noise forever.
+        """
+        code = self._run(
+            monkeypatch,
+            _summary(
+                pricebook_row_counts={"pricebook.services": 2},
+                pricebook_failures={"pricebook.equipment": "HTTP 500: boom"},
+            ),
+            feeds="pricebook",
+        )
+        assert code == 0
+        assert "pricebook_failed=pricebook_equipment" in capsys.readouterr().out
+
+    def test_a_failed_financial_tab_still_exits_zero(self, monkeypatch, capsys) -> None:
+        code = self._run(
+            monkeypatch,
+            _summary(
+                financial_row_counts={"accounting.invoices": 5},
+                financial_failures={"reporting.jobCosts": "HTTP 429: slow down"},
+            ),
+            feeds="financial",
+        )
+        assert code == 0
+        assert "financial_failed=reporting.jobCosts" in capsys.readouterr().out
+
+    def test_a_feed_failure_and_a_healthy_pricebook_still_reds_the_run(
+        self, monkeypatch, capsys
+    ) -> None:
+        """Mixed run: only `feed_failures` decides, and it decides on its own."""
+        code = self._run(
+            monkeypatch,
+            _summary(
+                feed_failures={"jobs": "HTTP 429: slow down"},
+                pricebook_row_counts={"pricebook.services": 2},
+            ),
+            feeds="jobs,pricebook",
+        )
+        assert code == 1
+        out = capsys.readouterr().out
+        assert "feed_failed=jobs" in out and "pricebook_failed" not in out

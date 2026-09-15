@@ -22,11 +22,14 @@ the cursor is always the trailing edge. Both directions are tested here.
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
+import gspread
 import httpx
 import pytest
+import requests
 import respx
 
 from st_cli.exceptions import APIError, STCLIError
@@ -45,6 +48,22 @@ FIXED_NOW_RUN2 = datetime(2026, 9, 3, 13, 0, tzinfo=timezone.utc)
 
 def _frozen_now(now: datetime = FIXED_NOW):
     return patch("st_exporter.run.datetime", **{"now.return_value": now})
+
+
+def _gspread_api_error(status: int, message: str) -> gspread.exceptions.APIError:
+    """Exactly what gspread raises when the Sheets API refuses a write.
+
+    Built from a real ``requests.Response`` because that is what
+    ``APIError.__init__`` parses; nothing in the exporter wraps or translates it,
+    which is the fact the test below exists to pin.
+    """
+    response = requests.Response()
+    response.status_code = status
+    response._content = json.dumps(
+        {"error": {"code": status, "message": message, "status": "RESOURCE_EXHAUSTED"}}
+    ).encode()
+    response.headers["Content-Type"] = "application/json"
+    return gspread.exceptions.APIError(response)
 
 
 def _technicians_url(api_base: str) -> str:
@@ -108,6 +127,10 @@ def _second_run_with_broken_technicians(
         # `fetch_technicians` retries without the parameter; this response rejects
         # that too, so the feed genuinely fails and the guard has to hold. Not a
         # 403, so it never reaches the scope ledger: an outage is not a purchase.
+        # Loud in the same two ways as the 403 above — a red `::error` and a
+        # non-zero exit from `cli.py`, which reds any run with `feed_failures`
+        # (see `test_cli.TestAFailedFeedRedsTheRun`). The guard changed the
+        # channel, not the volume: what it bought is the `_meta` write below.
         (400, "feed_failures"),
     ],
 )
@@ -146,6 +169,8 @@ def test_a_broken_technicians_feed_leaves_the_jobs_cursor_advanced(
 
     # 3. The run reports the failure rather than exiting 0 looking healthy —
     #    through whichever of the two channels fits what actually happened.
+    #    Either way `cli.py` exits 1 on this summary: `scope_revoked` for the
+    #    403, `feed_failures` for the 400.
     if ledger == "scope_revoked":
         assert summary.feed_failures is None
         assert set(summary.scope_revoked) == {"technicians"}
@@ -191,7 +216,11 @@ def test_a_broken_technicians_feed_is_announced_where_a_human_will_see_it(
         )
 
     annotation = capsys.readouterr().out
-    assert "::warning title=Feed failed::" in annotation
+    # `::error`, not `::warning`. A whole top-level feed did not export and the
+    # CLI now exits non-zero for it, so a yellow annotation on a red run would
+    # read as a suspicion to look at later rather than as the reason it failed.
+    assert "::error title=Feed failed::" in annotation
+    assert "::warning title=Feed failed::" not in annotation
     assert "technicians" in annotation
 
     step_summary = summary_file.read_text()
@@ -210,6 +239,15 @@ def test_a_failing_jobs_feed_never_advances_its_own_cursor(st_settings, exporter
     was never written loses those changes permanently, because nothing fetches
     them again. So the jobs cursor is appended only once the tab is on disk —
     here the tab write itself fails, and the old cursor must survive intact.
+
+    **What the injected exception models.** ``_guarded_feed`` catches
+    ``STCLIError``, so an ``STCLIError`` out of the store is what per-feed
+    isolation is defined against — and it is what a store that classifies its own
+    failures raises. The REAL ``SheetsClient`` does not: gspread raises
+    ``gspread.exceptions.APIError``, which is not an ``STCLIError`` and is not
+    caught here. That is deliberate and is pinned by the test below — read the
+    two together, because this one on its own reads as a guarantee production
+    does not make.
     """
     export_store, raw_cache_store = _first_run(st_settings, exporter_settings)
     before = [row[:] for row in export_store.tabs["jobs"]]
@@ -371,3 +409,68 @@ class TestActiveAnyFallback:
         assert caught.value.status_code == 403
         assert len(calls) == 1
         assert calls[0].url.params.get("active") == "Any"
+
+
+@respx.mock
+def test_a_real_sheets_outage_ends_the_run_and_still_leaves_the_cursor_where_it_was(
+    st_settings, exporter_settings
+) -> None:
+    """The honest behaviour of the guard against the exception production throws.
+
+    ``SheetsClient`` does no wrapping: a Google Sheets 429 or 503 surfaces as
+    ``gspread.exceptions.APIError``, which is NOT an ``STCLIError``, so
+    ``_guarded_feed`` does not catch it and the run ends on it. The test above
+    injects an ``STCLIError`` and gets per-feed isolation; this one injects what
+    gspread actually raises and gets a crash. Both are true, and the difference
+    is the point.
+
+    It was left that way on purpose rather than wrapped, and the reasoning is
+    worth keeping next to the test. Wrapping gspread into an ``STCLIError``
+    subclass would make the isolation guarantee real, but it would widen every
+    ``except STCLIError`` in the exporter at once — including ``_TabGuard``,
+    whose per-tab failures are WARNINGS that exit 0. A Sheets outage is not a
+    per-tab fact; it is the whole store being unavailable, and filing it as four
+    stale pricebook tabs behind a green run is the exact silence this release is
+    fixing. Ending the run says the true thing.
+
+    And ending the run is safe in the one way that matters here: `_meta` is
+    appended only once a feed's tab is on disk, so whatever the run dies on, the
+    cursor still trails the data. That is what the assertions below hold — the
+    jobs cursor is run 1's, and the jobs tab is run 1's, exactly as when the
+    store was healthy.
+    """
+    export_store, raw_cache_store = _first_run(st_settings, exporter_settings)
+    before_jobs = [row[:] for row in export_store.tabs["jobs"]]
+    before_meta = [row[:] for row in export_store.tabs["_meta"]]
+
+    class SheetsOutage(InMemorySheetsStore):
+        """What the real `SheetsClient` does on a 429: it lets gspread through."""
+
+        def replace_grid(self, tab_name: str, grid: list[list[str]]) -> None:
+            if tab_name == "jobs":
+                raise _gspread_api_error(429, "Quota exceeded for quota metric 'Write requests'")
+            super().replace_grid(tab_name, grid)
+
+    broken = SheetsOutage()
+    for name, grid in export_store.tabs.items():
+        broken.tabs[name] = [row[:] for row in grid]
+
+    tenant_run2.register(st_settings.api_base, today_iso=FIXED_TODAY.isoformat())
+    with _frozen_now(FIXED_NOW_RUN2), pytest.raises(gspread.exceptions.APIError):
+        run_export(
+            st_settings,
+            exporter_settings,
+            export_store=broken,
+            raw_cache_store=raw_cache_store,
+        )
+
+    # The guard did not swallow it, so `_meta` was never rewritten this run and
+    # the technicians feed was never attempted. Identical to 0.2.9 — not a
+    # regression, and not the per-feed isolation the test above describes.
+    assert broken.tabs["_meta"] == before_meta
+    assert broken.tabs["jobs"] == before_jobs
+    # The invariant that actually protects the contractor's data holds anyway:
+    # the cursor never advanced past a tab that was not written.
+    meta = parse_meta_grid(broken.tabs["_meta"])
+    assert CursorBundle.decode(meta["jobs"].last_cursor).get("jobs") == tenant_run1.JOBS_CURSOR
+    assert meta["jobs"].last_run_at == FIXED_NOW.isoformat()

@@ -743,8 +743,16 @@ class TestNotEveryFailureIsAPurchase:
         of every feed that had ALREADY committed its tab — silently, forever
         re-draining. So the exception no longer propagates; the feed is named in
         `feed_failures`, announced on the run itself by ``_announce_feed_failure``
-        (annotation + step summary + log), echoed in the summary line as
-        `feed_failed=jobs`, and `_meta` is reached and written.
+        (a red `::error` annotation + step summary + log), echoed in the summary
+        line as `feed_failed=jobs`, and `_meta` is reached and written.
+
+        The volume includes the EXIT CODE. `cli.py` reds any run with
+        `feed_failures`, so a non-403 here is a failed Actions run exactly as it
+        was before the guard existed — see
+        `test_cli.TestAFailedFeedRedsTheRun::test_a_failed_jobs_feed_exits_one`
+        and the end-to-end
+        `test_writeback_integration.test_a_failed_jobs_feed_is_not_advised_to_change_the_feeds_it_already_has`.
+        What the guard changed is that the `_meta` write below still happens.
 
         What this class defends is untouched: a feed that is DOWN is NOT filed as
         a feed that was never bought. Both ledgers stay empty, whatever the

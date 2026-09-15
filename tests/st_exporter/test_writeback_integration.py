@@ -66,12 +66,23 @@ def _lane(items, perform=None):
 class _Harness:
     """One run of `st-export --feeds jobs,outbox` with real internals."""
 
-    def __init__(self, lane, *, feeds: str = "jobs,outbox", forbid_jobs: bool = False) -> None:
+    def __init__(
+        self,
+        lane,
+        *,
+        feeds: str = "jobs,outbox",
+        forbid_jobs: bool = False,
+        fail_jobs: int | None = None,
+    ) -> None:
         self.export_store = InMemorySheetsStore()
         self.raw_cache_store = InMemorySheetsStore()
         self.lane = lane
         self.feeds = feeds
         self.forbid_jobs = forbid_jobs
+        #: An HTTP status other than 403 for the jobs feed's first call — an
+        #: outage, not a permission. `_guarded_feed` records it in
+        #: `feed_failures` instead of letting it end the run.
+        self.fail_jobs = fail_jobs
         self.drained: list = []
 
     def _export(self, st_settings, exporter_settings, **kwargs):
@@ -103,6 +114,11 @@ class _Harness:
                 f"{st_settings.api_base.rstrip('/')}"
                 f"/crm/v2/tenant/{st_settings.tenant_id}/export/customers"
             ).mock(return_value=httpx.Response(403, text="Scope validation failed"))
+        if self.fail_jobs is not None:
+            respx.get(
+                f"{st_settings.api_base.rstrip('/')}"
+                f"/crm/v2/tenant/{st_settings.tenant_id}/export/customers"
+            ).mock(return_value=httpx.Response(self.fail_jobs, text="upstream is down"))
         mock_auth_token(st_settings.auth_url)
         with (
             _frozen_now(),
@@ -334,3 +350,37 @@ def test_a_revoked_jobs_tab_is_left_exactly_as_the_last_good_run_left_it(
     out = capsys.readouterr().out
     assert "write_back_applied" not in out
     assert "write_back_scope_denied=1" in out
+
+
+@respx.mock
+def test_a_failed_jobs_feed_is_not_advised_to_change_the_feeds_it_already_has(
+    monkeypatch, capsys, caplog, st_settings, exporter_settings
+) -> None:
+    """The jobs feed RAN in this run and failed with something that is not a 403.
+
+    This path exists only because `_guarded_feed` swallows non-403s — before
+    ticket 21 the exception ended the run and never reached the write-back. Left
+    to fall through, it lands on the DEFERRED branch, whose advice is "the drain
+    job's feeds must be `jobs,outbox`" — which is exactly what this run's feeds
+    already are. An operator following it changes a setting that is already
+    correct and learns nothing about the outage.
+
+    So it gets its own branch, its own token, and a pointer at the thing that is
+    actually wrong: `feed_failed=jobs`. And the run is RED, because a top-level
+    feed did not export.
+    """
+    harness = _Harness(_lane([_assignment_item()]), fail_jobs=500)
+    with caplog.at_level(logging.WARNING):
+        harness.run(monkeypatch, st_settings, exporter_settings)
+
+    assert harness.exit_code == 1
+    out = capsys.readouterr().out
+    assert "feed_failed=jobs" in out
+    assert "write_back_feed_failed=1" in out
+    assert "write_back_deferred" not in out and "write_back_applied" not in out
+    # The misleading advice, by its distinctive phrase, must not be in the log.
+    assert "jobs,outbox" not in caplog.text
+    assert "feed_failed=jobs" in caplog.text
+    # The item is still performed, reported succeeded, and never redelivered.
+    assert harness.drained[0].summary.succeeded == 1
+    harness.lane.report_failure.assert_not_called()

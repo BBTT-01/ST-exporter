@@ -129,6 +129,26 @@ def run_once(
         # line above and nowhere else.
         run_failed = True
 
+    if summary is not None and summary.feed_failures:
+        # A top-level feed (`jobs` or `technicians`) that was asked for and did
+        # not export. Before ticket 21 the exception ended the run, so this was
+        # always red; `_guarded_feed` then caught it so that a dying feed could
+        # no longer throw past the `_meta` write and discard another feed's
+        # cursor — and the run went GREEN, with nothing but a `feed_failed=`
+        # token in the summary line to say otherwise. A reader who does not know
+        # that token sees `jobs=0` and a tick.
+        #
+        # Catching the exception is still right; ending green is not. `_meta` is
+        # written inside `_run` before this line is reached and the drain has
+        # already finished, so a red exit here costs nothing that the original
+        # crash cost: no cursor lost, no tab lost, no outbox item redelivered.
+        #
+        # Only `feed_failures` — the pricebook and financial PER-TAB failures
+        # stay warnings. One tab of a four-tab catalogue feed left at last run's
+        # contents was already green before this change, and reddening it now
+        # would be a new regression in the other direction.
+        run_failed = True
+
     if run_failed:
         raise typer.Exit(code=1)
 
@@ -136,7 +156,7 @@ def run_once(
 def _write_back(summary: ExportSummary | None, outcomes: list[LaneOutcome]) -> str:
     """Write this run's own outbox writes into the `jobs` tab; return a summary suffix.
 
-    Four outcomes, and none of them can touch an item's reported result:
+    Five outcomes, and none of them can touch an item's reported result:
 
     - **Applied** — the jobs feed ran in this same invocation, so the tab and the
       denormalised rows behind it belong to this run, and the affected rows are
@@ -150,6 +170,13 @@ def _write_back(summary: ExportSummary | None, outcomes: list[LaneOutcome]) -> s
       before this feature existed. Naming the fix in the log is the point: a
       contractor whose drain job asks for `feeds: "jobs,outbox"` gets the
       write-back, at the cost of sharing the export lock.
+    - **Feed-failed** — the `jobs` feed ran and failed for a reason that is not a
+      permission (a 400, a 429 storm, a transport error). There is no fresh jobs
+      output to write the rows into, and the run is already red for the feed
+      failure itself. Called out separately from "deferred" because the deferred
+      advice — set the drain job's feeds to `jobs,outbox` — is exactly what a
+      `--feeds jobs,outbox` run already did, and repeating it back sends an
+      operator to change a setting that is already correct.
     - **Scope-denied** — ServiceTitan refused the `jobs` feed this run. No tab
       exists (never granted) or the tab is frozen as evidence (revoked); either
       way the write-back must not be the thing that writes it.
@@ -185,6 +212,28 @@ def _write_back(summary: ExportSummary | None, outcomes: list[LaneOutcome]) -> s
             len(effects),
         )
         return f" write_back_scope_denied={len(effects)}"
+
+    if summary is not None and "jobs" in (summary.feed_failures or {}):
+        # The jobs feed RAN and failed with something that is not a 403 — a 400,
+        # a 429 storm, a transport error. `_guarded_feed` swallows it now, so
+        # this path only exists as of ticket 21; before that the exception ended
+        # the run and never reached here.
+        #
+        # It must not fall through to the `handle is None` branch below, which
+        # advises setting the drain job's feeds to `jobs,outbox` — advice that is
+        # actively misleading in a `--feeds jobs,outbox` run, because that is
+        # already exactly what this run was. Nothing about the feeds is wrong;
+        # the feed is down, the run is red for it, and the fix is the failure
+        # named by `feed_failed=`.
+        logger.warning(
+            "%d outbox write(s) performed this run change the jobs tab, but the `jobs` feed "
+            "FAILED this run (see `feed_failed=jobs` in the run output), so the tab was not "
+            "updated in it. The writes are live in ServiceTitan and the next successful "
+            "`jobs` run exports them. Nothing about this run's `feeds:` needs changing — fix "
+            "the feed failure.",
+            len(effects),
+        )
+        return f" write_back_feed_failed={len(effects)}"
 
     handle = summary.jobs_write_back if summary is not None else None
     if handle is None:
