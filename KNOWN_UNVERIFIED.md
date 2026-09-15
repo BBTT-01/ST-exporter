@@ -489,3 +489,25 @@ Also unverified: Profit Wizard's **claim response field names**. The client read
 several spellings for each field (`item_id`/`itemId`/`id`, `payload`/`body`/`data`,
 and so on) rather than assuming one, in the same widen-don't-narrow posture their
 result endpoint takes. Confirm the real names on the first live claim.
+
+## The general tripwire: whole-column-blank detection
+
+`src/st_exporter/blank_columns.py`
+
+Every guess on this list fails the same silent way: the exporter reads a field by
+a guessed name, the hand-written fixture spells it the same way, the suite goes
+green, and a real tenant's Sheet carries a **whole blank column** that looks
+exactly like a contractor with no data. That is how `job_number` reached 2431 live
+rows undetected.
+
+So every feed now runs `check_blank_columns` over the grid it just built — the
+`jobs` and `technicians` tabs directly, the eight pricebook/financial tabs through
+`_TabGuard.attempt`. If a column is in the header and empty on **every** data row
+across at least 25 rows, it logs a WARNING naming the tab, the column and the row
+count. It only logs: a genuinely empty column on a real tenant must still export,
+so nothing is filtered and no tab is ever failed.
+
+Columns that are legitimately blank for a whole tenant are listed in `ALL_BLANK_OK`
+with the reason, per tab. **Add to that list only for a column that is optional by
+contract** — never to quiet a column from this document, which is precisely what
+the detector exists to find.

@@ -110,27 +110,53 @@ jobs:
   export:
     runs-on: ubuntu-latest
     if: ${{ inputs.target == 'sheets' }}
-    # The jobs feed runs every 5 minutes and technicians every 30, and a large
-    # tenant's first full drain can exceed 5 minutes — so runs really can
-    # overlap. They write the same `_meta` grid and the same `_outbox_ledger`
-    # tab (one tab shared by all three products' lanes), each via
-    # read-then-full-replace, so an overlapping run can read stale state and
-    # silently roll back the other's cursor/ledger writes. Serialize instead.
+    # TWO LOCKS, NOT ONE, AND NOT ONE PER FEED. Which one a run takes is decided
+    # by what that run WRITES, not by which caller job asked for it.
+    #
     # `github.repository` is the CALLING repo, so each customer gets their own
-    # group: a customer never collides with themselves, and different customers
+    # pair: a customer never collides with themselves, and different customers
     # never block each other.
     #
-    # This group spans EVERY caller job, because every one of them calls this
-    # same reusable workflow. That is the second guarantee behind the one-drain
-    # rule: even if somebody did add `feeds: outbox` to a second job, the two
-    # drains could never run at the same time and could never interleave their
-    # ledger writes — the damage would be a doubled drain RATE, not a corrupted
-    # ledger or a duplicated ServiceTitan write (every app's claim is
-    # skip-locked, so two drainers never receive the same row).
+    #   ...-export  every run with at least one EXPORT feed (jobs, technicians,
+    #               pricebook, financial). All of them read the whole `_meta`
+    #               grid and write the whole `_meta` grid back — carrying over
+    #               the rows for the feeds they did not run. Two such runs
+    #               overlapping therefore roll each other's cursors, row counts
+    #               and `last_run_at` back, whatever feeds they asked for. They
+    #               MUST stay serialised with each other. This is why there is
+    #               no per-feed key here: a per-feed key would make exactly that
+    #               race possible, and the fix for it is a merge-on-write
+    #               `_meta` in Python, not a YAML change (see docs/examples/
+    #               connector-export.yml, "Why pricebook can still delay jobs").
+    #
+    #   ...-outbox  a run that asks for `outbox` AND NOTHING ELSE. `cli.py` does
+    #               not call `run_export` at all for such a run: it touches no
+    #               export tab, does not read `_meta`, does not write `_meta`,
+    #               and makes no Export Store round-trip. The only tab it
+    #               read-modify-writes is `_outbox_ledger`, on the private
+    #               raw-cache Sheet, which no export feed writes. So it is safe
+    #               to run beside an export — and taking its own lock is what
+    #               keeps the 5-minute drain off the back of an hourly
+    #               pricebook run.
+    #
+    # The comparison is against the exact string `outbox` and nothing fancier,
+    # because the SAFE side of any ambiguity is the shared export lock. A run
+    # asking for `jobs,outbox`, or for ` outbox ` with a stray space, writes
+    # `_meta` (or might) and lands in `...-export` with everything else. Adding
+    # a `contains()` here would move the fail-safe to the wrong side.
+    #
+    # This split does NOT weaken the one-drain rule. Every drain names the same
+    # feeds string, so every drain takes the same `...-outbox` lock: even if
+    # somebody did add `feeds: outbox` to a second job, the two drains could
+    # never run at the same time and could never interleave their ledger writes
+    # — the damage would be a doubled drain RATE, not a corrupted ledger or a
+    # duplicated ServiceTitan write (every app's claim is skip-locked, so two
+    # drainers never receive the same row).
+    #
     # cancel-in-progress: false — killing a run mid-drain is exactly the
     # crash the ledger has to recover from; better to just queue.
     concurrency:
-      group: st-export-${{ github.repository }}
+      group: st-export-${{ github.repository }}-${{ inputs.feeds == 'outbox' && 'outbox' || 'export' }}
       cancel-in-progress: false
     timeout-minutes: 10
     permissions:
@@ -212,6 +238,38 @@ jobs:
             exit 1
           fi
           echo "exporter $actual matches the pinned tag"
+
+      # THE DRAIN ANNOUNCES ITSELF. The one-drain rule is enforced structurally
+      # (the drain needs `feeds: outbox`, and only the drain job is given a
+      # product's MACHINE TOKEN), but "structurally impossible" is a claim that
+      # has to stay checkable by a human looking at the Actions tab. A comment
+      # explaining the rule was already deleted once from a live connector repo;
+      # a notice on every drain cannot be deleted from there at all, because it
+      # is printed from this file, in this repository, at a tag the connector
+      # pins.
+      #
+      # So: exactly one notice per cycle is correct. Two notices in the same
+      # five minutes is a second drain, visible in the run list without reading
+      # anyone's YAML.
+      - name: Announce the drain
+        if: ${{ contains(inputs.feeds, 'outbox') }}
+        env:
+          FEEDS: ${{ inputs.feeds }}
+        run: |
+          echo "::notice title=Outbox drain::This run drains the outbox queues (feeds: $FEEDS)." \
+               "EXACTLY ONE job in ${{ github.repository }}'s caller workflow may do this." \
+               "Two of these notices in one cycle means the queues are being drained twice."
+          {
+            echo "### Outbox drain"
+            echo
+            echo "This run asked for \`$FEEDS\`, so it drained the outbox queue of every"
+            echo "product whose **machine token** is set on this job."
+            echo
+            echo "Exactly one caller job may do this. If you are looking at two of these"
+            echo "summaries for the same cycle, a second job has been given \`outbox\` in"
+            echo "its \`feeds:\` **and** a product machine token, and the queues are being"
+            echo "drained twice."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run export
         env:

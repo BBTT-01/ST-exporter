@@ -16,6 +16,7 @@ from st_cli.client import ServiceTitanClient
 from st_cli.config import Settings
 from st_cli.exceptions import ConfigError, STCLIError
 from st_exporter import EXPORTER_VERSION
+from st_exporter.blank_columns import check_blank_columns
 from st_exporter.config import ExporterSettings
 from st_exporter.denormalize import build_job_rows
 from st_exporter.feeds.appointments import fetch_appointments_delta
@@ -456,6 +457,7 @@ def _run_jobs_feed(
         )
 
     jobs_grid = [list(JOB_COLUMNS)] + [format_job_row(row) for row in windowed_rows]
+    check_blank_columns("jobs", jobs_grid)
 
     new_cursor_bundle = CursorBundle(
         {
@@ -513,10 +515,11 @@ def _run_technicians_feed(
             exporter_version=EXPORTER_VERSION,
         )
     )
+    technicians_grid = [list(TECHNICIAN_COLUMNS)] + [
+        format_technician_row(row) for row in technician_rows
+    ]
+    check_blank_columns("technicians", technicians_grid)
     if not dry_run:
-        technicians_grid = [list(TECHNICIAN_COLUMNS)] + [
-            format_technician_row(row) for row in technician_rows
-        ]
         export_store.replace_grid("technicians", technicians_grid)
     return technician_rows
 
@@ -577,6 +580,7 @@ class _TabGuard:
                 self._new_meta_rows.append(self._meta_rows[tab_name])
             return None
         self.grids[tab_name] = grid
+        check_blank_columns(tab_name, grid)
         # The header row is not data — a tab with only a header is zero rows.
         self.row_counts[tab_name] = max(len(grid) - 1, 0)
         self._new_meta_rows.append(
