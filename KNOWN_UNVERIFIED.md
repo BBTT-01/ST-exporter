@@ -218,6 +218,23 @@ settings list endpoints default to active-only without an explicit filter, and
 inactive technicians. Neither half of that assumption is confirmed against a
 real tenant — see the PR #1 review's finding #6.
 
+**Still unverified, but no longer able to fail a run (ticket 21).** The guess is
+deliberately NOT removed: dropping the parameter would silently make the tab
+active-only, and that is no better founded than the guess it replaces — a
+deactivated technician missing from the tab is indistinguishable, downstream,
+from one who never existed. What changed is the failure mode. On an HTTP **400**,
+and only a 400 — ServiceTitan saying it does not accept this filter — the list is
+re-fetched without the parameter, and both a WARNING and a GitHub Actions
+annotation say that the tab may now be active-only. Every other status (403 on a
+missing Settings → Technicians permission, 429, 5xx, a transport failure) is about
+the request's fate rather than the parameter and is re-raised for the feed guard
+in `run.py` to handle.
+
+**What a tenant still needs to settle:** whether `active=Any` is accepted at all,
+and if not, what the real spelling is. If the annotation ever fires on a real run,
+that is the answer — the fallback path is a degradation, not a fix, and it should
+be deleted in favour of the confirmed parameter.
+
 ## `modified_on` sourced from the appointment, falling back to the job
 
 `src/st_exporter/denormalize.py` —

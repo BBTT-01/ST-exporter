@@ -721,28 +721,46 @@ class TestNotEveryFailureIsAPurchase:
         assert "pricebook.categories" in (summary.pricebook_row_counts or {})
 
     @respx.mock
-    def test_a_400_on_the_jobs_feed_still_ends_the_run(
-        self, st_settings, exporter_settings
+    @pytest.mark.parametrize(
+        ("status", "why"),
+        [
+            # `KNOWN_UNVERIFIED.md` records a 400 from `active=Any` on some tenants.
+            (400, "a filter ServiceTitan rejects"),
+            # Bad credentials look nothing like an unbought product, and the client
+            # has already retried once with a fresh token by the time we see one.
+            (401, "credentials the client already retried"),
+        ],
+    )
+    def test_a_non_403_fails_the_jobs_feed_loudly_instead(
+        self, status, why, st_settings, exporter_settings
     ) -> None:
-        """`KNOWN_UNVERIFIED.md` records a 400 from `active=Any` on some tenants.
-        It is a sibling branch's problem, and it must still be loud here."""
-        mock_auth_token(st_settings.auth_url)
-        _register_tenant(st_settings.api_base)
-        _status(st_settings.api_base, TAB_FIRST_CALL["jobs"], 400)
-        with pytest.raises(APIError) as exc:
-            _run(st_settings, exporter_settings, InMemorySheetsStore(), "jobs")
-        assert exc.value.status_code == 400
+        """It must still be LOUD, and it must still not be filed as a purchase.
 
-    @respx.mock
-    def test_a_401_is_not_a_purchase_decision_either(self, st_settings, exporter_settings) -> None:
-        """Bad credentials look nothing like an unbought product, and the client
-        has already retried once with a fresh token by the time we see one."""
+        Ticket 21 changed the channel, not the volume. `jobs` and `technicians`
+        now run behind ``_guarded_feed`` for a reason that has nothing to do with
+        scopes: `_meta` is written ONCE, at the end, for every feed, so an
+        exception escaping a feed threw past that write and discarded the cursor
+        of every feed that had ALREADY committed its tab — silently, forever
+        re-draining. So the exception no longer propagates; the feed is named in
+        `feed_failures`, announced on the run itself by ``_announce_feed_failure``
+        (annotation + step summary + log), echoed in the summary line as
+        `feed_failed=jobs`, and `_meta` is reached and written.
+
+        What this class defends is untouched: a feed that is DOWN is NOT filed as
+        a feed that was never bought. Both ledgers stay empty, whatever the
+        status, because only a 403 ever reaches ``ScopeLedger.deny``.
+        """
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _status(st_settings.api_base, TAB_FIRST_CALL["jobs"], 401)
-        with pytest.raises(APIError) as exc:
-            _run(st_settings, exporter_settings, InMemorySheetsStore(), "jobs")
-        assert exc.value.status_code == 401
+        _status(st_settings.api_base, TAB_FIRST_CALL["jobs"], status)
+        store = InMemorySheetsStore()
+
+        summary = _run(st_settings, exporter_settings, store, "jobs")
+
+        assert not summary.scope_not_granted and not summary.scope_revoked, why
+        assert str(status) in (summary.feed_failures or {})["jobs"]
+        # And the write the old behaviour threw past actually happened.
+        assert "_meta" in store.tabs
 
 
 class TestAFirstEverRun:

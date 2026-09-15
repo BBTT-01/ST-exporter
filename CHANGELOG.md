@@ -4,6 +4,48 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed: a failing feed no longer discards a committed feed's cursor
+
+`_meta` carries the cursors and is written once, after every feed has run. The
+`jobs` feed commits five raw-cache grids and the `jobs` tab well before that, so
+anything throwing in between — an unguarded `fetch_technicians` returning 403 on
+a missing Settings → Technicians permission, or 400 on the unverified `active=Any`
+parameter — left the tab freshly written and the cursors exactly where they were.
+Every later run then re-drained every change feed from the beginning, forever, and
+nothing said so: it presented as a slow exporter rather than as an error. This was
+live for two contractors.
+
+- `jobs` and `technicians` now run behind the same per-feed guard the pricebook
+  and financial tabs already had. A failing feed is not written, its previous
+  `_meta` row (cursor included) is carried forward unchanged, and the feeds that
+  already succeeded keep theirs.
+- Each feed appends its `_meta` row **after** its tab is on disk, and the guard
+  discards any row a feed appended before it threw. The cursor is always the
+  trailing edge: a re-drain is slow but correct, whereas a cursor that led the
+  data would skip a window of changes permanently.
+- A feed that fails now emits a GitHub Actions annotation and a step-summary line
+  naming the **consequence** ("its cursor did NOT advance… every run re-drains"),
+  the same channel the blank-column detector uses, and the run's summary line
+  gains `feed_failed=…`.
+- `fetch_job_types` / `fetch_business_units` degrade to an empty lookup instead of
+  killing the whole jobs feed — `denormalize` uses both only as a fallback.
+- `fetch_technicians` retries without `active=Any` on a 400 (and only a 400),
+  announcing that the tab may be active-only. The parameter itself is still
+  unverified; see `KNOWN_UNVERIFIED.md`.
+- The guard and the per-tab **scope** classification added in 0.2.9 are one path,
+  not two. A **403** on `jobs` or `technicians` still goes to `ScopeLedger` — a
+  tab never granted is skipped quietly, one whose permission was revoked is loud
+  and reds the run — and every other `STCLIError` is the feed failure above. The
+  guard rolls back any `_meta` row the feed had already recorded *before* either
+  door carries the previous row forward, because `MetaRowSet.carry` is a
+  `setdefault` and a half-written fresh row would otherwise silently beat it.
+- Consequently a 400 or a 401 on `jobs` no longer ends the run by exception: it
+  is guarded, named in `feed_failures`, annotated, echoed as `feed_failed=jobs`,
+  and — the whole point — the single `_meta` write is reached. It is still never
+  filed as a scope answer; only a 403 is.
+
 ## [0.2.9] · Every feed declares a contract version, and the fixtures prove it
 
 Released as **0.2.9**, chosen by the owner over 0.3.0. Note for anyone bumping a

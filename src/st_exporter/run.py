@@ -10,11 +10,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from st_cli.client import ServiceTitanClient
 from st_cli.config import Settings
-from st_cli.exceptions import APIError, ConfigError, STCLIError
+from st_cli.exceptions import ConfigError, STCLIError
 from st_exporter import EXPORTER_VERSION
 from st_exporter.blank_columns import check_blank_columns
 from st_exporter.config import ExporterSettings
@@ -57,7 +57,7 @@ from st_exporter.format import (
 from st_exporter.images.client import TrueQuoteImageClient
 from st_exporter.images.ledger import ImageLedger
 from st_exporter.images.upload import ImageUploadSummary, upload_pricebook_images
-from st_exporter.logging_setup import configure_logging, logger
+from st_exporter.logging_setup import announce_to_actions, configure_logging, logger
 from st_exporter.meta import (
     CursorBundle,
     MetaRow,
@@ -164,6 +164,11 @@ class ExportSummary:
     # Tab name -> why it was skipped, for the financial tabs that failed. Its
     # previous contents and its `_meta` row are left untouched in the Sheet.
     financial_failures: dict[str, str] | None = None
+    # Feed name -> why it failed, for the two top-level feeds (`jobs`,
+    # `technicians`). A feed named here was NOT written this run and its `_meta`
+    # row — cursor included — was carried forward unchanged, so the next run
+    # re-fetches from the same point. None when both ran (or weren't selected).
+    feed_failures: dict[str, str] | None = None
     # TAB -> the ServiceTitan permission it needs, for a tab this tenant has NEVER
     # been granted (403, and no `_meta` row and no tab in the Sheet has ever
     # evidenced a successful run of it). Keyed per tab, not per feed, because
@@ -297,13 +302,26 @@ def _run(
         tab_exists=lambda tab: bool(export_store.read_grid(tab)),
     )
 
+    # `jobs` and `technicians` are independent feeds behind the same guard the
+    # pricebook and financial tabs already had. Before ticket 21 they were
+    # unguarded, and because `_meta` is written ONCE for all feeds at the end, a
+    # failure in the later of the two threw past the `_meta` write and discarded
+    # the cursor of the earlier one — whose tab was already on disk.
+    feed_failures: dict[str, str] = {}
+
     windowed_rows: list[dict[str, Any]] = []
     skipped_no_job = 0
     jobs_row_count = meta_rows["jobs"].row_count if "jobs" in meta_rows else 0
 
     if "jobs" in feeds:
-        try:
-            windowed_rows, skipped_no_job = _run_jobs_feed(
+        jobs_outcome = _guarded_feed(
+            "jobs",
+            meta_rows=meta_rows,
+            new_meta_rows=new_meta_rows,
+            failures=feed_failures,
+            consequence=_CURSOR_STUCK,
+            scopes=scopes,
+            run=lambda: _run_jobs_feed(
                 client,
                 export_store,
                 raw_cache_store,
@@ -313,34 +331,39 @@ def _run(
                 run_at=run_at,
                 window_days=window_days,
                 dry_run=dry_run,
-            )
-        except APIError as exc:
-            # A 403 and nothing else. `deny` returns None for every other status,
-            # and the raise below is what keeps a 400, a 404 or a 429 behaving
-            # exactly as it did before this feed could be scope-skipped at all.
-            if scopes.deny("jobs", exc) is None:
-                raise
-            # No tab is written and `jobs_row_count` keeps the carried-forward
-            # `_meta` count, which is what the untouched tab still holds.
-        else:
+            ),
+        )
+        if jobs_outcome is not None:
+            windowed_rows, skipped_no_job = jobs_outcome
             jobs_row_count = len(windowed_rows)
+        # Otherwise no tab was written — because the feed failed, or because a 403
+        # ruled the tab out — and `jobs_row_count` keeps the carried-forward
+        # `_meta` count, which is what the untouched tab still holds.
     elif "jobs" in meta_rows:
         new_meta_rows.carry(meta_rows["jobs"])
 
     technicians_row_count = meta_rows["technicians"].row_count if "technicians" in meta_rows else 0
 
     if "technicians" in feeds:
-        try:
-            technicians_row_count = _run_technicians_feed(
+        technicians_outcome = _guarded_feed(
+            "technicians",
+            meta_rows=meta_rows,
+            new_meta_rows=new_meta_rows,
+            failures=feed_failures,
+            # A full-replace feed with no cursor of its own: nothing re-drains,
+            # the tab simply stays at its previous contents.
+            consequence=_TAB_STALE,
+            scopes=scopes,
+            run=lambda: _run_technicians_feed(
                 client,
                 export_store,
                 new_meta_rows=new_meta_rows,
                 run_at=run_at,
                 dry_run=dry_run,
-            )
-        except APIError as exc:
-            if scopes.deny("technicians", exc) is None:
-                raise
+            ),
+        )
+        if technicians_outcome is not None:
+            technicians_row_count = technicians_outcome
     elif "technicians" in meta_rows:
         new_meta_rows.carry(meta_rows["technicians"])
 
@@ -400,6 +423,12 @@ def _run(
             financial_row_counts,
         )
     else:
+        # ONE write for every feed, and every feed above is guarded, so this line
+        # is now reached whatever ServiceTitan does. That is what makes a
+        # committed feed's cursor survive a later feed's failure — and it is why
+        # the guards matter more than this line's position: moving the `_meta`
+        # write earlier, per feed, would let a cursor land for a tab whose write
+        # had not happened yet. The safe shape is "always reached, always last".
         export_store.replace_grid("_meta", build_meta_grid(new_meta_rows))
 
     # The image pass runs AFTER `_meta`, deliberately and structurally. It is a
@@ -433,6 +462,7 @@ def _run(
         )
 
     return ExportSummary(
+        feed_failures=feed_failures or None,
         jobs_row_count=jobs_row_count,
         technicians_row_count=technicians_row_count,
         skipped_no_job=skipped_no_job,
@@ -445,6 +475,137 @@ def _run(
         scope_not_granted=dict(scopes.not_granted),
         scope_revoked=dict(scopes.revoked),
     )
+
+
+#: What a failing feed costs the NEXT run, per kind of feed. A cursor-tracked feed
+#: that fails does not advance its cursor, so the next run re-fetches from the same
+#: point; while the failure persists, EVERY run re-drains the whole change feed from
+#: the beginning. That is correct but unboundedly slow, and — until this text is
+#: emitted — completely invisible. See ticket 21: a 403 on technicians used to strand
+#: `_meta` after the jobs tab had already been written, and it presented as a slow
+#: exporter rather than as an error.
+_CURSOR_STUCK = (
+    "Its cursor did NOT advance, so the next run re-fetches from the same point. "
+    "While this keeps failing, every run re-drains the whole change feed from the "
+    "beginning, which presents as a slow exporter rather than as an error."
+)
+_TAB_STALE = (
+    "Its tab and its _meta row are unchanged from the last run that succeeded, so "
+    "consumers keep reading the previous contents until this is fixed."
+)
+
+_T = TypeVar("_T")
+
+
+def _announce_feed_failure(feed: str, exc: Exception, consequence: str) -> None:
+    """Log AND surface one feed's failure where a human will actually see it.
+
+    A WARNING in the log of a run that still exits 0 is invisible — the run is
+    green and nobody opens a green run. So the same message also goes out as a
+    GitHub Actions annotation and a step-summary line, exactly as the blank-column
+    detector does (``logging_setup.announce_to_actions``). Naming the CONSEQUENCE,
+    not just the error, is the point: "403 on technicians" reads as a small local
+    problem, while "the cursor did not advance and every run now re-drains" is the
+    thing somebody has to act on.
+    """
+    logger.warning("FEED FAILED: %s was not refreshed this run (%s). %s", feed, exc, consequence)
+    announce_to_actions("Feed failed", f"{feed} was not refreshed this run ({exc}). {consequence}")
+
+
+def _guarded_feed(
+    feed: str,
+    *,
+    meta_rows: dict[str, MetaRow],
+    new_meta_rows: MetaRowSet,
+    failures: dict[str, str],
+    consequence: str,
+    scopes: ScopeLedger,
+    run: Callable[[], _T],
+) -> _T | None:
+    """Run one top-level feed so that its failure costs exactly that feed.
+
+    The same contract ``_TabGuard`` gives the pricebook and financial tabs, lifted
+    to the two feeds that never had it: a feed that fails is not written, its
+    previous `_meta` row is carried forward unchanged (so ``last_run_at`` still
+    says when it was last genuinely refreshed), and — crucially — the feeds that
+    already succeeded keep the `_meta` rows they appended, including their
+    cursors. ``_run`` writes `_meta` once for all feeds, so the ONLY way a
+    committed feed could lose its cursor was a later feed throwing past this
+    point.
+
+    Only ``STCLIError`` is caught, which is complete: ``st_cli.client`` wraps
+    transport failures in ``TransportError``. A ``KeyError`` out of the row
+    mapping is a bug in this repo and must still crash the run loudly — and
+    crashing is the SAFE direction, because an unwritten `_meta` only costs a
+    re-drain.
+
+    Any `_meta` rows the feed had already recorded before it threw are DISCARDED
+    (that is what ``committed`` is for) before the previous row is carried
+    forward. Each feed records its own row last, once its tab is on disk, so
+    there should never be one to discard — but "should" is how a cursor comes to
+    describe a tab that was never written, which is the one failure this ticket
+    must not trade itself for. Belt and braces, and it matters more than it looks
+    now that ``MetaRowSet.carry`` is a ``setdefault``: a stale fresh row left in
+    place would silently BEAT the row we are trying to carry forward, which is
+    the cursor-leads-the-data direction again by another door.
+
+    A **403 is not this feed's failure but its permission**, and goes to the
+    ``ScopeLedger`` instead (a tab never granted is skipped quietly and the run
+    stays green; one whose permission was revoked is loud and reds the run). The
+    rollback happens first either way: whichever door the tab leaves by, it must
+    leave no half-written `_meta` row behind. Every other ``STCLIError`` — the
+    400 from `active=Any`, a 429 storm, a transport failure — keeps the guarded
+    behaviour above, which is what stops an outage being filed as a product the
+    contractor never bought.
+
+    Returns ``None`` when the feed did not write its tab, for either reason; the
+    caller keeps whatever it had.
+    """
+    committed = new_meta_rows.snapshot()
+    try:
+        return run()
+    except STCLIError as exc:
+        new_meta_rows.restore(committed)
+        if scopes.deny(feed, exc) is not None:
+            # Classified, announced and carried forward by the ledger. Not a
+            # failure of this feed, so it is not named in `failures`.
+            return None
+        failures[feed] = str(exc)
+        _announce_feed_failure(feed, exc, consequence)
+        if feed in meta_rows:
+            new_meta_rows.carry(meta_rows[feed])
+        return None
+
+
+def _optional_reference(
+    label: str,
+    fetch: Callable[[], dict[str, dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    """Fetch a reference lookup the jobs feed can do without; ``{}`` if it fails.
+
+    ``denormalize`` uses job types and business units only as a FALLBACK, for jobs
+    whose own record carries no ``jobTypeName``/``businessUnitName``. A 403 on
+    either endpoint used to abort the entire jobs feed — killing the run for data
+    it may not even have needed. Degrading to an empty lookup costs, at worst, a
+    blank ``job_type``/``business_unit`` column, which the blank-column detector
+    then also reports. The degradation is announced, so it is never silent.
+    """
+    try:
+        return fetch()
+    except STCLIError as exc:
+        logger.warning(
+            "DEGRADED: could not read %s (%s). The jobs feed continues without it; "
+            "job rows fall back to the name on the job record, so job_type / "
+            "business_unit may be blank for jobs that carry only an id.",
+            label,
+            exc,
+        )
+        announce_to_actions(
+            "Reference lookup degraded",
+            f"could not read {label} ({exc}). The jobs feed still ran; job_type / "
+            f"business_unit may be blank for jobs that carry only an id.",
+        )
+        return {}
 
 
 def _run_jobs_feed(
@@ -502,8 +663,8 @@ def _run_jobs_feed(
         len(assignments_delta),
     )
 
-    job_types = fetch_job_types(client)
-    business_units = fetch_business_units(client)
+    job_types = _optional_reference("job types", lambda: fetch_job_types(client))
+    business_units = _optional_reference("business units", lambda: fetch_business_units(client))
 
     denormalized = build_job_rows(
         raw_jobs,
@@ -544,17 +705,6 @@ def _run_jobs_feed(
             "assignments": assignments_cursor,
         }
     )
-    new_meta_rows.add(
-        MetaRow(
-            feed="jobs",
-            last_run_at=run_at,
-            last_cursor=new_cursor_bundle.encode(),
-            row_count=len(windowed_rows),
-            exporter_version=EXPORTER_VERSION,
-            contract_version=JOBS_CONTRACT_VERSION,
-        )
-    )
-
     if not dry_run:
         _prune_raw_caches(
             denormalized.rows,
@@ -568,6 +718,24 @@ def _run_jobs_feed(
         raw_cache_store.replace_grid(_RAW_APPOINTMENTS, raw_appointments.to_grid())
         raw_cache_store.replace_grid(_RAW_ASSIGNMENTS, raw_assignments.to_grid())
         export_store.replace_grid("jobs", jobs_grid)
+
+    # The cursor is appended only once the tab it describes is on disk, and it is
+    # the LAST thing this function does. The two directions are not symmetric: a
+    # cursor that lags the data costs a re-fetch of a window already merged (the
+    # raw caches are keyed by id, so re-merging is idempotent), while a cursor
+    # that leads the data skips a window of changes that nothing will ever fetch
+    # again. Slow is recoverable; skipped is permanent. So the cursor must always
+    # be the trailing edge.
+    new_meta_rows.add(
+        MetaRow(
+            feed="jobs",
+            last_run_at=run_at,
+            last_cursor=new_cursor_bundle.encode(),
+            row_count=len(windowed_rows),
+            exporter_version=EXPORTER_VERSION,
+            contract_version=JOBS_CONTRACT_VERSION,
+        )
+    )
 
     return windowed_rows, denormalized.skipped_no_job
 
@@ -590,6 +758,11 @@ def _run_technicians_feed(
     technicians_grid = build_technician_grid(technicians)
     # The header row is not data — a tab with only a header is zero rows.
     row_count = max(len(technicians_grid) - 1, 0)
+    check_blank_columns("technicians", technicians_grid)
+    if not dry_run:
+        export_store.replace_grid("technicians", technicians_grid)
+    # Recorded only after the tab is written, for the same reason as `jobs`: a
+    # `_meta` row must never describe a tab that isn't there.
     new_meta_rows.add(
         MetaRow(
             feed="technicians",
@@ -600,9 +773,6 @@ def _run_technicians_feed(
             contract_version=TECHNICIANS_CONTRACT_VERSION,
         )
     )
-    check_blank_columns("technicians", technicians_grid)
-    if not dry_run:
-        export_store.replace_grid("technicians", technicians_grid)
     return row_count
 
 

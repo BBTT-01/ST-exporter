@@ -94,6 +94,26 @@ class MetaRowSet:
         """Carry a previous row forward — unless this run already wrote a fresh one."""
         self._rows.setdefault(row.feed, row)
 
+    def snapshot(self) -> dict[str, MetaRow]:
+        """The rows recorded so far, for a caller that may have to undo the rest.
+
+        A feed is guarded (``run._guarded_feed``, ``run._TabGuard``): if it throws
+        part-way, anything it recorded describes a tab that is not on disk, and a
+        cursor describing a tab that was never written is the one failure worse
+        than a re-drain. Take this before running a feed and hand it to
+        ``restore`` if the feed fails.
+        """
+        return dict(self._rows)
+
+    def restore(self, snapshot: dict[str, MetaRow]) -> None:
+        """Roll back to ``snapshot``, discarding every row recorded since.
+
+        Called on the failure path only, and BEFORE the failed tab's previous row
+        is carried forward — ``carry`` never displaces an existing row, so a
+        half-written fresh row left in place would silently beat the carried one.
+        """
+        self._rows = dict(snapshot)
+
     def __contains__(self, feed: object) -> bool:
         return feed in self._rows
 
