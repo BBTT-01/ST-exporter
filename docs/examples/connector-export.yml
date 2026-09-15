@@ -108,7 +108,7 @@ on:
     - cron: "*/5 * * * *"    # jobs-feed + outbox-drain
     - cron: "*/30 * * * *"   # technicians-feed
     - cron: "7 * * * *"      # pricebook-feed
-    - cron: "37 3 * * *"     # financial-feed
+    - cron: "37 */6 * * *"     # financial-feed
   workflow_dispatch:
     inputs:
       feed:
@@ -195,7 +195,7 @@ jobs:
   financial-feed:
     if: >-
       vars.FINANCIAL_FEED == 'true' &&
-      (github.event.schedule == '37 3 * * *' || github.event.inputs.feed == 'financial')
+      (github.event.schedule == '37 */6 * * *' || github.event.inputs.feed == 'financial')
     uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.3.0
     with:
       feeds: "financial"
