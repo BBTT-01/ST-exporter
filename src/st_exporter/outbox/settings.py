@@ -46,6 +46,7 @@ from st_exporter.outbox.routes import (
     TRUEQUOTE_ROUTES,
     LaneRoutes,
 )
+from st_exporter.url_validation import validate_outbox_url
 
 # Product keys. These are also the ledger's product namespace and the prefix on
 # every log line, so they are lower-case and stable — renaming one would orphan
@@ -98,11 +99,21 @@ def load_lane_credentials(
     prefix = _ENV_PREFIXES[product]
 
     token = (environ.get(f"{prefix}_MACHINE_TOKEN") or "").strip()
-    base_url = (
-        environ.get(f"{prefix}_OUTBOX_URL") or environ.get(f"{prefix}_OUTBOX_BASE_URL") or ""
-    ).strip()
+    url_var = f"{prefix}_OUTBOX_URL"
+    raw_base_url = environ.get(url_var) or ""
+    if not raw_base_url.strip():
+        url_var = f"{prefix}_OUTBOX_BASE_URL"
+        raw_base_url = environ.get(url_var) or ""
+    base_url = raw_base_url.strip()
     if not token or not base_url:
         return None
+
+    # Only now, with a lane that would actually run: this base URL is about to
+    # receive `Authorization: Bearer <machine token>` on every claim, so a value
+    # we would not send a credential to must stop the run rather than be dialled.
+    # `url_var` is the spelling this contractor actually set, so the error names
+    # the secret they have to go and fix.
+    validate_outbox_url(base_url, url_var)
 
     default = _DEFAULT_ROUTES[product]
     return LaneCredentials(
