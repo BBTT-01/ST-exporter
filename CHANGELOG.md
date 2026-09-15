@@ -4,7 +4,15 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] · Every feed declares a contract version, and the fixtures prove it
+## [0.2.9] · Every feed declares a contract version, and the fixtures prove it
+
+Released as **0.2.9**, chosen by the owner over 0.3.0. Note for anyone bumping a
+connector: despite the patch-level number this is **not** a drop-in. The reusable
+workflow gains inputs and secrets, the `pricebook` input is **removed**, the
+outbox drain now fires on `feeds` naming `outbox` rather than on secrets being
+present, and the concurrency key changes shape. A caller workflow and this tag
+must move together.
+
 
 The shared reader package is cancelled: TradeRated, TrueQuote and Profit Wizard
 each keep their own copy of the Sheet-reading code. That is safe only with this
