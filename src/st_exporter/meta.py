@@ -6,6 +6,11 @@ tabs and the four `financial` ones — `accounting.invoices`, `payroll.timesheet
 `row_count`, `exporter_version`, `contract_version`. TradeRated reads it
 for reconciliation and support.
 
+`contract_version` is the guard every consumer checks BEFORE parsing a tab: on a
+version outside the range it understands it must stop with a named error, not
+parse optimistically and not return an empty result (see `docs/export-contract.md`
+and `st_exporter.contracts`).
+
 `last_cursor` for the `jobs` feed is not a single ServiceTitan continuation token —
 it's a JSON object bundling the five underlying feeds' tokens (customers, locations,
 jobs, appointments, assignments), because the `jobs` tab is denormalised from all
@@ -46,11 +51,15 @@ class MetaRow:
     last_cursor: str = ""
     row_count: int = 0
     exporter_version: str = ""
-    # The tab contract this row's feed was written against, e.g. "pricebook.v1"
-    # or "financial.v1".
-    # Blank for the `jobs`/`technicians` feeds, whose contract (spec.md) predates
-    # versioning and is identified by the tab shape itself. A blank cell means
-    # "no declared version" — never collapse it with an unrecognised one.
+    # The tab contract this row's feed was written against — "jobs.v2",
+    # "technicians.v1", "pricebook.v1", "financial.v1". Every feed declares one;
+    # `st_exporter.contracts` is where they are defined and what forces a bump.
+    #
+    # Blank means "written by an exporter of 0.2.8 or older, which declared no
+    # version at all". A consumer must treat blank as its OWN case: for `jobs` it
+    # specifically means the pre-0.2.7 one-row-per-appointment shape (`jobs.v1`)
+    # *or* the current one, indistinguishably. Never collapse blank with an
+    # unrecognised version, and never guess it is the current one.
     contract_version: str = ""
 
 

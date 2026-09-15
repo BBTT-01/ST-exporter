@@ -17,9 +17,10 @@ from unittest.mock import patch
 import httpx
 import respx
 
-from st_exporter.format import JOB_COLUMNS
+from st_exporter.contracts import CONTRACT_VERSIONS
+from st_exporter.format import JOB_COLUMNS, dedupe_technician_rows
 from st_exporter.meta import CursorBundle, parse_meta_grid
-from st_exporter.run import _apply_window, _dedupe_technician_rows, run_export
+from st_exporter.run import _apply_window, run_export
 from st_exporter.sheets import InMemorySheetsStore
 from tests.st_exporter.conftest import mock_auth_token
 from tests.st_exporter.fixtures import tenant_run1, tenant_run2
@@ -95,6 +96,14 @@ def test_two_runs_incremental_fetch_and_byte_identical_unchanged_rows(
     assert bundle.get("appointments") == tenant_run2.APPOINTMENTS_CURSOR
     assert bundle.get("customers") == tenant_run2.CUSTOMERS_CURSOR
     assert meta["jobs"].row_count == 2
+
+    # Both feeds declare a real contract version. Blank is what an exporter older
+    # than 0.2.9 wrote, and a consumer must be able to tell the two apart — a
+    # blank `jobs` version cannot even say whether the tab is the pre-0.2.7
+    # one-row-per-appointment shape.
+    assert meta["jobs"].contract_version == CONTRACT_VERSIONS["jobs"] == "jobs.v2"
+    technicians_version = meta["technicians"].contract_version
+    assert technicians_version == CONTRACT_VERSIONS["technicians"] == "technicians.v1"
 
 
 @respx.mock
@@ -345,7 +354,7 @@ def test_technicians_only_run_preserves_existing_jobs_tab_and_meta(
 def test_duplicate_technician_id_is_collapsed_to_one_row() -> None:
     """The list endpoint returning the same technician twice (e.g. across a page
     boundary) must not put two identical rows on the tab."""
-    rows = _dedupe_technician_rows(
+    rows = dedupe_technician_rows(
         [
             {"st_technician_id": 51, "name": "Ada", "email": "a@example.com", "active": True},
             {"st_technician_id": 52, "name": "Bo", "email": "b@example.com", "active": True},
@@ -364,7 +373,7 @@ def test_two_distinct_technician_ids_sharing_an_email_are_both_kept() -> None:
     list_handler = _ListHandler()
     st_exporter_logger.addHandler(list_handler)
     try:
-        rows = _dedupe_technician_rows(
+        rows = dedupe_technician_rows(
             [
                 {
                     "st_technician_id": 51,
@@ -390,7 +399,7 @@ def test_two_distinct_technician_ids_sharing_an_email_are_both_kept() -> None:
 
 
 def test_technicians_without_an_email_are_never_collapsed_together() -> None:
-    rows = _dedupe_technician_rows(
+    rows = dedupe_technician_rows(
         [
             {"st_technician_id": 1, "name": "Ada", "email": None, "active": True},
             {"st_technician_id": 2, "name": "Bo", "email": "", "active": True},

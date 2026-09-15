@@ -1,0 +1,28 @@
+{
+  "feed": "pricebook",
+  "contract_version": "pricebook.v1",
+  "tab": "pricebook.services",
+  "grain": "one row per pricebook item that has an st_id; id-less records are dropped",
+  "row_key": [
+    "st_id"
+  ],
+  "columns": [
+    "st_id",
+    "code",
+    "name",
+    "description",
+    "price",
+    "active",
+    "category_ids",
+    "category_names",
+    "manufacturer",
+    "model",
+    "image_refs",
+    "modified_on"
+  ],
+  "rows": [
+    ["1", "SVC-1", "Annual Tune-Up", "Yearly service", "129", "true", "10", "Service", "", "", "", "2026-09-01T00:00:00Z"],
+    ["2", "SVC-2", "Quote On Site", "", "", "false", "", "", "", "", "", "2026-09-02T00:00:00Z"],
+    ["3", "SVC-3", "Diagnostic Visit", "Active flag absent upstream", "89", "", "10", "Service", "", "", "", "2026-09-05T00:00:00Z"]
+  ]
+}

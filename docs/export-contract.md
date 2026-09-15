@@ -1,0 +1,281 @@
+# The Export Store contract
+
+**Audience: anyone who READS the Export Store spreadsheet.** Today that is
+TradeRated, TrueQuote and Profit Wizard. This page stands alone — you do not need
+to read the exporter's source to implement against it.
+
+There is deliberately **no shared reader package**. Each app keeps its own copy of
+the Sheet-reading code. That is safe only because of the two things on this page:
+a **contract version per feed**, and a **committed fixture suite** that both sides
+test against. Copies drift; fixtures are what catch the drift.
+
+## Why this exists
+
+A consumer reads a tab by column **name**. When a column is renamed, nothing
+throws. The read returns **zero rows**, and zero rows is indistinguishable from a
+contractor who had a quiet week. Two real examples, both from this system:
+
+- `job_number` was read from ServiceTitan's `number`; the field is `jobNumber`. It
+  was blank on **all 2431 rows** of a live customer's Sheet for the entire life of
+  the feature. Every test on both sides stayed green, because every fixture on
+  both sides used the same wrong key.
+- Profit Wizard's first cut at the financial columns guessed CamelCase spellings.
+  Every one was wrong. All four tabs would have parsed to zero rows, with a
+  warning.
+
+Neither would have been caught by types, by tests, or by a shared package. Both
+are caught by a fixture that the producer asserts it writes and the consumer
+asserts it reads.
+
+## Current contract versions
+
+Written into the `_meta` tab, one row per output tab, column `contract_version`,
+beside `exporter_version`.
+
+| Feed | Contract version | Tabs |
+|---|---|---|
+| `jobs` | **`jobs.v2`** | `jobs` |
+| `technicians` | **`technicians.v1`** | `technicians` |
+| `pricebook` | **`pricebook.v1`** | `pricebook.services`, `pricebook.equipment`, `pricebook.materials`, `pricebook.categories` |
+| `financial` | **`financial.v1`** | `accounting.invoices`, `payroll.timesheets`, `settings.businessUnits`, `reporting.jobCosts` |
+
+The source of truth is `src/st_exporter/contracts.py`, and
+`contracts/fixtures/manifest.json` carries the same numbers in machine-readable
+form — read them from there rather than hard-coding this table.
+
+### Why `jobs` is v2 and not v1
+
+Exporter 0.2.7 changed the `jobs` tab from **one row per appointment** to **one row
+per assigned technician**. The column set did not move an inch, so nothing looked
+like a breaking change — but `st_appointment_id` stopped being unique and a
+consumer broke in production, silently. That is precisely the event a contract
+version exists to announce.
+
+So the pre-0.2.7 shape is named `jobs.v1` and today's shape is `jobs.v2`.
+Numbering today's shape "v1" would give one name to two different tab shapes, and
+old Sheets in the field still carry the v1 shape.
+
+`technicians` has never changed shape, so it is `technicians.v1`.
+
+### A blank `contract_version`
+
+An exporter at 0.2.8 or older wrote `jobs` and `technicians` rows with a **blank**
+`contract_version`. Blank is its own case:
+
+- it is **not** the same as "a version I do not recognise", and
+- for `jobs` it does **not** tell you whether the tab is the v1 or the v2 shape.
+
+Treat blank as unsupported unless you have another way to establish the shape.
+
+## What forces a version bump
+
+Bump the feed's contract version when any of these happens to one of its tabs:
+
+1. a column is **renamed**;
+2. a column is **removed**;
+3. columns are **re-ordered** (a consumer may be reading by position);
+4. the **grain** or a **uniqueness rule** changes — the 0.2.7 `jobs` change;
+5. the **meaning of an existing cell** changes — e.g. a blank starting to mean `0`.
+
+What does **not** force a bump: **appending** a new column at the end. Consumers
+look columns up by name and ignore the rest, so an appended column is additive.
+Note it in the CHANGELOG; do not bump.
+
+## Cell rules that hold across every tab
+
+These are part of the contract, not implementation detail:
+
+- **Every cell is text.** Sheets is written with `value_input_option=RAW`, so a
+  cell is never silently reinterpreted as a number or truncated to a date.
+- **Blank is not zero.** A blank money or price cell means *absent*; `"0"` means a
+  real zero. Collapsing them turns missing cost into free work.
+- **Blank is not `false`.** A blank `active` means *unknown*; `"false"` means
+  withdrawn/retired. Guessing `false` retires live records.
+- Booleans are lowercase `true` / `false`, matching ServiceTitan's own JSON.
+- Ids are text, never coerced to integers.
+- A row with a blank key column is dropped by the exporter, not written — so
+  `_meta.row_count` means what a reconciler thinks it means.
+
+## What a consumer MUST do
+
+1. **Declare the range you understand**, per feed — e.g. "this app reads
+   `pricebook.v1`". Keep it beside the code that parses, not in a README.
+2. **Read `_meta.contract_version` for the tab before parsing it.**
+3. On a version **outside your range** (including blank), return a typed
+   `unsupported_contract` outcome. Do **not** parse. Do **not** guess. Do **not**
+   fall back to reading it optimistically.
+4. **Surface it the way you surface a failed sync** — an alert, a failed job, a
+   visible error. Never as an empty result: an empty result is indistinguishable
+   from a quiet day, which is the exact failure this whole mechanism exists to
+   prevent.
+5. **Test yourself against the committed fixtures**, in CI, on every build.
+
+Points 1–4 are the consumer half of the guard and are owned by each app. Point 5
+is what makes them real.
+
+## The fixture suite
+
+Committed in this repo under `contracts/fixtures/`:
+
+```
+contracts/fixtures/manifest.json          # versions + sha256 of every file
+contracts/fixtures/jobs.v2/jobs.json
+contracts/fixtures/technicians.v1/technicians.json
+contracts/fixtures/pricebook.v1/pricebook.services.json
+contracts/fixtures/pricebook.v1/…          (equipment, materials, categories)
+contracts/fixtures/financial.v1/accounting.invoices.json
+contracts/fixtures/financial.v1/…          (timesheets, businessUnits, jobCosts)
+```
+
+**Format is JSON**, because three of the four codebases are TypeScript and one is
+Python; anything Python-flavoured would have to be translated by hand on three
+sides, and a hand-translated fixture is a fixture that drifts. One file per tab
+per contract version. The directory is keyed by **contract version**, not by feed,
+so when `jobs.v3` lands the `jobs.v2` directory stays exactly as it is and a
+consumer still pinned to v2 keeps a fixture to test against.
+
+Each file:
+
+```jsonc
+{
+  "feed": "pricebook",
+  "contract_version": "pricebook.v1",
+  "tab": "pricebook.services",
+  "grain": "one row per pricebook item that has an st_id; …",
+  "row_key": ["st_id"],
+  "columns": ["st_id", "code", "name", …],   // the header row, verbatim
+  "rows": [ ["1", "SVC-1", "Annual Tune-Up", …], … ]   // data rows, every cell a string
+}
+```
+
+`columns` + `rows` together are exactly the grid the exporter writes to that tab.
+`grain` and `row_key` are carried too, because a consumer can read every column
+correctly and still be wrong about what a row *is* — `jobs.v1` → `jobs.v2` changed
+nothing else.
+
+### What the rows deliberately cover
+
+The rows are not a happy path. They pin the cells that have already gone wrong, or
+are one careless edit from going wrong:
+
+- a **null price** next to a real **`0`** price, and a null cost next to a `0` cost;
+- an **absent `active`** flag (blank) next to explicit `true` and `false`;
+- `category_ids` / `category_names` **index-aligned**, including a two-category item;
+- an `image_refs` list **deduped**, including an asset that is an authenticated
+  storage path rather than an HTTPS URL;
+- a **cancelled timesheet segment** beside live ones;
+- a top-level category with a **blank `parent_id`**;
+- a **multi-technician appointment** producing two rows that share one
+  `st_appointment_id` — a consumer keyed the `jobs.v1` way fails on this row, by
+  design — and an unassigned appointment with a blank `st_technician_id`;
+- `job_number` **populated**, from `jobNumber`; the regression that started all this;
+- a customer whose phone/email are in ServiceTitan's array form, not the scalars;
+- a report row **dropped** for having no `JobNumber`, and an item **dropped** for
+  having no id.
+
+## How a consumer verifies itself — without vendoring a copy that can drift
+
+**Fetch the fixtures at a pinned tag in CI. Do not commit a copy of them.**
+
+A vendored copy *is* the drift: it goes stale silently, which is the failure mode
+we are trying to eliminate. What the consumer commits is one small pin file, not
+the data:
+
+```jsonc
+// st-export-contract.json, in the consumer repo
+{
+  "exporter_tag": "exporter-v0.2.9",
+  "supported": {
+    "jobs": ["jobs.v2"],
+    "technicians": ["technicians.v1"],
+    "pricebook": ["pricebook.v1"],
+    "financial": ["financial.v1"]
+  }
+}
+```
+
+The CI step:
+
+```bash
+TAG=$(jq -r .exporter_tag st-export-contract.json)
+rm -rf .contract && git clone --depth 1 --branch "$TAG" --filter=blob:none --sparse \
+  https://github.com/BBTT-01/ST-exporter .contract
+git -C .contract sparse-checkout set contracts/fixtures
+```
+
+Then, in the consumer's own test runner:
+
+1. **Integrity** — for every entry in `contracts/fixtures/manifest.json`, re-compute
+   the file's `sha256` and compare. Guards against a hand-edited fixture.
+2. **Version agreement** — each feed's `contract_version` in the manifest must be
+   in that feed's `supported` list. When the exporter bumps a version, this is what
+   goes red, in the consumer's CI, before any Sheet changes.
+3. **Read it** — run your real parser over each tab's `columns` + `rows` and assert
+   the parsed objects, field by field. A wrong column name yields zero rows, so
+   **assert the row count as well as the values**; "no exception thrown" proves
+   nothing here.
+4. **Refuse it** — feed your parser a fixture whose `contract_version` you do *not*
+   support (mutate the string in memory) and assert you return
+   `unsupported_contract` rather than an empty list.
+
+Upgrading is then a one-line PR that changes `exporter_tag`, which cannot be merged
+green until the reader actually handles the new fixtures.
+
+If a consumer's CI genuinely cannot reach the network, vendoring is allowed only
+with a scheduled job that re-fetches the pinned tag and fails on any difference —
+the vendored copy must never be the only copy anyone checks.
+
+## Real customer data: the scrubbing rule
+
+**`BBTT-01/ST-exporter` is a public repo.** Everything under `contracts/fixtures/`
+is world-readable, permanently, including to anyone who clones an old commit. A
+real ServiceTitan response carries customer names, addresses, phone numbers, email
+addresses, job summaries and prices. Committing one unscrubbed publishes a
+contractor's customer list, and a later deletion does not unpublish it.
+
+Every fixture committed today is **synthetic**. The records they are generated from
+live in `tests/st_exporter/fixtures/` and were written by hand.
+
+**What matters for drift is the field SPELLING and the cell SHAPE, never the
+value.** So realistic-in-shape and fake-in-content loses nothing.
+
+If you ever record from a live tenant, scrub **before the recording reaches a
+branch**, not before the PR:
+
+1. Work in a scratch directory outside any git worktree.
+2. Replace every **value**, keeping every **key** exactly as ServiceTitan spelled it.
+3. Names → invented ones (`Fixture Customer Ltd`, `Tech Two`). Addresses →
+   invented street numbers on invented streets. **Emails** → a reserved domain only
+   (`example.com`, `example.org`, `example.net`, `example.invalid` — RFC 2606 /
+   6761; they cannot route). **Phones** → the `555-01xx` fictitious block.
+4. **Prices, costs and revenue are customer data too** — a contractor's margins are
+   commercially sensitive. Replace them with round invented numbers, preserving
+   only the *shape* that matters: null vs `0`, negative vs positive.
+5. Ids → small sequential integers. Never keep real ServiceTitan ids: they identify
+   a tenant's records to anyone else with access to that tenant.
+6. Free text (`summary`, `description`, memos) → a short invented sentence. This is
+   where a customer's gate code or a complaint ends up.
+7. Re-read the whole diff by eye before committing. Then run `pytest
+   tests/st_exporter/test_contract_fixtures.py`, which mechanically rejects any
+   email outside the reserved domains and any phone outside the `555` block.
+
+That mechanical check is a backstop for steps 3 and 4, not a substitute for them —
+it cannot recognise a real name, address or price.
+
+## Changing the contract (producer side)
+
+1. Make the change in the exporter.
+2. `pytest` goes red with a message naming the tab, the column, and what to do.
+3. If the change was not intended, revert it — that red test is the guard working.
+4. If it was intended, bump the feed's version in `src/st_exporter/contracts.py`
+   (or the module it reads it from) per the rules above.
+5. Regenerate deliberately: `python scripts/gen_contract_fixtures.py`. The new
+   version gets its own fixture directory; the old one stays for consumers still
+   pinned to it.
+6. Add a CHANGELOG entry that names the old and new version.
+7. **Tell the three app teams.** Each must widen its supported range and re-read
+   the fixtures. Until they do, their CI fails when they bump their pinned tag —
+   which is the intended order of events, not a problem.
+
+Fixtures are generated, never edited by hand. A hand edit is caught by the
+manifest checksums.

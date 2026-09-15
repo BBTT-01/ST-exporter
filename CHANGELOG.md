@@ -4,6 +4,71 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Every feed declares a contract version, and the fixtures prove it
+
+The shared reader package is cancelled: TradeRated, TrueQuote and Profit Wizard
+each keep their own copy of the Sheet-reading code. That is safe only with this
+in place, because **a shared package never prevented drift — fixtures do**. Apps
+pin different versions anyway; connector repos in this org already sit eight
+releases apart.
+
+### A contract version on every feed
+
+`_meta.contract_version` was blank for `jobs` and `technicians`. It no longer is:
+
+| Feed | Version |
+|---|---|
+| `jobs` | `jobs.v2` |
+| `technicians` | `technicians.v1` |
+| `pricebook` | `pricebook.v1` (unchanged) |
+| `financial` | `financial.v1` (unchanged) |
+
+**`jobs` is v2, not v1.** 0.2.7 changed that tab from one row per appointment to
+one row per assigned technician. The column set did not move, so nothing looked
+breaking — but `st_appointment_id` stopped being unique and a consumer broke in
+production, silently. Naming today's shape "v1" would give one name to two tab
+shapes; every Sheet written by 0.2.8 or older still carries the v1 shape under a
+blank version. A blank version is now explicitly its own case for consumers: not
+"unrecognised", and for `jobs` not even decidable between the two shapes.
+
+`src/st_exporter/contracts.py` is the one place a tab's columns, grain, row key
+and version are declared, so they can no longer be edited in two files and
+disagree.
+
+### A committed fixture suite — the actual guard
+
+`contracts/fixtures/<contract_version>/<tab>.json`, plus a `manifest.json` of
+versions and sha256s. Language-neutral JSON because three of the four codebases
+are TypeScript. One directory per contract version, so `jobs.v3` landing does not
+strand a consumer still pinned to `jobs.v2`.
+
+Each file pins the header row and representative data rows, chosen to cover the
+cells that have already gone wrong: null price beside a real `0`, an absent
+`active` beside explicit `true`/`false`, index-aligned `category_ids`/
+`category_names`, a deduped `image_refs`, a cancelled timesheet segment, a
+top-level category with a blank `parent_id`, a multi-technician appointment whose
+two rows share one `st_appointment_id`, and `job_number` populated from
+`jobNumber`.
+
+The exporter's tests assert it PRODUCES those bytes; each consuming app asserts it
+READS them. Rename a column without bumping the version and `pytest` goes red with
+a message naming the tab, the column, and the only two ways out — written for
+someone who did not write this code.
+
+**No real customer data.** This repo is public; every fixture is synthetic, and
+the suite mechanically rejects an email outside the reserved domains or a phone
+outside the `555` block. The full scrubbing rule for any future recording from a
+live tenant is in the contract doc.
+
+### For the three consuming apps
+
+`docs/export-contract.md` is the stand-alone document they work from: the version
+per feed, what forces a bump, how to fetch the fixtures at a pinned tag in CI
+without vendoring a copy that can itself drift, and what to do on an unknown
+version — stop with a named `unsupported_contract` error, never parse
+optimistically, never return empty. An empty result is indistinguishable from a
+quiet day, which is the whole failure this defends against.
+
 ## [Unreleased] · Three outbox lanes, one drain
 
 The exporter drained one queue. It now drains the queue of every product the

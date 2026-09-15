@@ -156,7 +156,7 @@ class TestHookedIntoTheFeeds:
         store = InMemorySheetsStore()
         new_meta_rows: list[MetaRow] = []
         with patch("st_exporter.run.fetch_technicians", return_value=technicians):
-            rows = _run_technicians_feed(
+            row_count = _run_technicians_feed(
                 Mock(),
                 store,
                 new_meta_rows=new_meta_rows,
@@ -165,7 +165,7 @@ class TestHookedIntoTheFeeds:
             )
 
         assert "BLANK COLUMN: technicians.email" in caplog.text
-        assert len(rows) == ABOVE
+        assert row_count == ABOVE
         assert store.tabs["technicians"][0] == list(TECHNICIAN_COLUMNS)
         assert len(store.tabs["technicians"]) == ABOVE + 1
 

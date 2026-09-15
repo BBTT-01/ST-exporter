@@ -1,0 +1,20 @@
+{
+  "feed": "technicians",
+  "contract_version": "technicians.v1",
+  "tab": "technicians",
+  "grain": "one row per ServiceTitan technician, deduped by st_technician_id",
+  "row_key": [
+    "st_technician_id"
+  ],
+  "columns": [
+    "st_technician_id",
+    "name",
+    "email",
+    "active"
+  ],
+  "rows": [
+    ["900", "Tech One", "tech1@example.com", "true"],
+    ["901", "Tech Two", "tech2@example.invalid", "true"],
+    ["902", "Tech Three", "", ""]
+  ]
+}

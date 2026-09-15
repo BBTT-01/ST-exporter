@@ -1,0 +1,26 @@
+{
+  "feed": "financial",
+  "contract_version": "financial.v1",
+  "tab": "accounting.invoices",
+  "grain": "one row per invoice LINE ITEM, not per invoice; an invoice with no items contributes no rows",
+  "row_key": [],
+  "columns": [
+    "JobId",
+    "ReferenceNumber",
+    "ItemType",
+    "ItemTotal",
+    "ItemCost",
+    "ItemTotalCost",
+    "ItemQuantity",
+    "InvoiceId",
+    "InvoiceDate",
+    "SkuId",
+    "SkuName",
+    "BusinessUnitId"
+  ],
+  "rows": [
+    ["7", "J-7", "Material", "120", "10", "40", "4", "500", "2026-09-01", "55", "Hinge", "3"],
+    ["7", "J-7", "Service", "300", "0", "0", "1", "500", "2026-09-01", "56", "Labour", "3"],
+    ["7", "J-7", "PriceModifier", "-50", "", "", "1", "500", "2026-09-01", "57", "Discount", "3"]
+  ]
+}

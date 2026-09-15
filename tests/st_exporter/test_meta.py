@@ -82,8 +82,9 @@ def test_build_meta_grid_has_header_and_is_sorted_by_feed() -> None:
     assert grid[0] == list(META_COLUMNS)
     assert grid[1][0] == "jobs"
     assert grid[2][0] == "technicians"
-    # Trailing "" is contract_version: blank for jobs/technicians, whose tab
-    # contract predates versioning. Only the pricebook.* feeds declare one.
+    # Trailing "" is contract_version: MetaRow defaults it to blank, which is what
+    # an exporter of 0.2.8 or older wrote. Every feed declares a real one now (see
+    # st_exporter.contracts); this test is about the grid shape, not the value.
     assert grid[1] == ["jobs", "t1", "{}", "10", "0.1.0", ""]
 
 

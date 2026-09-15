@@ -49,10 +49,10 @@ from st_exporter.financial import (
     build_timesheet_grid,
 )
 from st_exporter.format import (
-    JOB_COLUMNS,
-    TECHNICIAN_COLUMNS,
-    format_job_row,
-    format_technician_row,
+    JOBS_CONTRACT_VERSION,
+    TECHNICIANS_CONTRACT_VERSION,
+    build_job_grid,
+    build_technician_grid,
 )
 from st_exporter.images.client import TrueQuoteImageClient
 from st_exporter.images.ledger import ImageLedger
@@ -272,18 +272,16 @@ def _run(
     elif "jobs" in meta_rows:
         new_meta_rows.append(meta_rows["jobs"])
 
-    technician_rows: list[dict[str, Any]] = []
     technicians_row_count = meta_rows["technicians"].row_count if "technicians" in meta_rows else 0
 
     if "technicians" in feeds:
-        technician_rows = _run_technicians_feed(
+        technicians_row_count = _run_technicians_feed(
             client,
             export_store,
             new_meta_rows=new_meta_rows,
             run_at=run_at,
             dry_run=dry_run,
         )
-        technicians_row_count = len(technician_rows)
     elif "technicians" in meta_rows:
         new_meta_rows.append(meta_rows["technicians"])
 
@@ -456,7 +454,7 @@ def _run_jobs_feed(
             skipped_bad_timestamp,
         )
 
-    jobs_grid = [list(JOB_COLUMNS)] + [format_job_row(row) for row in windowed_rows]
+    jobs_grid = build_job_grid(windowed_rows)
     check_blank_columns("jobs", jobs_grid)
 
     new_cursor_bundle = CursorBundle(
@@ -475,6 +473,7 @@ def _run_jobs_feed(
             last_cursor=new_cursor_bundle.encode(),
             row_count=len(windowed_rows),
             exporter_version=EXPORTER_VERSION,
+            contract_version=JOBS_CONTRACT_VERSION,
         )
     )
 
@@ -502,26 +501,31 @@ def _run_technicians_feed(
     new_meta_rows: list[MetaRow],
     run_at: str,
     dry_run: bool,
-) -> list[dict[str, Any]]:
-    """Fetch technicians and (unless dry-run) write the tab; append its MetaRow."""
+) -> int:
+    """Fetch technicians and (unless dry-run) write the tab; append its MetaRow.
+
+    Returns the number of rows WRITTEN, derived from the grid rather than from the
+    fetched records — ``build_technician_grid`` dedupes, so counting the records
+    would report rows the tab does not contain (the same rule ``_TabGuard`` keeps).
+    """
     technicians = fetch_technicians(client)
-    technician_rows = _dedupe_technician_rows([_technician_row(record) for record in technicians])
+    technicians_grid = build_technician_grid(technicians)
+    # The header row is not data — a tab with only a header is zero rows.
+    row_count = max(len(technicians_grid) - 1, 0)
     new_meta_rows.append(
         MetaRow(
             feed="technicians",
             last_run_at=run_at,
             last_cursor="",
-            row_count=len(technician_rows),
+            row_count=row_count,
             exporter_version=EXPORTER_VERSION,
+            contract_version=TECHNICIANS_CONTRACT_VERSION,
         )
     )
-    technicians_grid = [list(TECHNICIAN_COLUMNS)] + [
-        format_technician_row(row) for row in technician_rows
-    ]
     check_blank_columns("technicians", technicians_grid)
     if not dry_run:
         export_store.replace_grid("technicians", technicians_grid)
-    return technician_rows
+    return row_count
 
 
 class _TabGuard:
@@ -837,71 +841,6 @@ def _upload_pricebook_images(
             "`Pricebook -> Images`. Every pricebook tab was still written."
         )
     return summary
-
-
-def _dedupe_technician_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Collapse repeats of the same technician, keeping the first occurrence.
-
-    The dedupe key is ``st_technician_id`` — the tab's own identity, and the key
-    the `jobs` tab's ``st_technician_id`` column joins against. A second row for
-    an id already emitted carries no information the first doesn't, so dropping
-    it is always safe; it also makes the tab robust against the list endpoint
-    returning a record twice across page boundaries.
-
-    It is deliberately NOT ``email``. Two DISTINCT technician ids sharing one
-    address is a real ServiceTitan state (a re-created technician record, or a
-    shop's shared inbox on several techs), and both of those technicians can be
-    assigned to jobs — so both must appear here or a `jobs` row would reference a
-    technician missing from the tab. A downstream unique-email constraint is the
-    downstream's to resolve; we log the collision rather than silently deleting a
-    real technician to satisfy it. Rows with no id are all kept, for the same
-    "never drop a real technician" reason.
-    """
-    seen_ids: set[str] = set()
-    deduped: list[dict[str, Any]] = []
-    duplicate_id_count = 0
-    for row in rows:
-        technician_id = row.get("st_technician_id")
-        if technician_id is not None:
-            key = str(technician_id)
-            if key in seen_ids:
-                duplicate_id_count += 1
-                continue
-            seen_ids.add(key)
-        deduped.append(row)
-
-    if duplicate_id_count:
-        logger.warning(
-            "technicians: dropped %d duplicate row(s) for an already-exported st_technician_id",
-            duplicate_id_count,
-        )
-
-    ids_by_email: dict[str, list[str]] = {}
-    for row in deduped:
-        email = str(row.get("email") or "").strip().lower()
-        if not email:
-            continue
-        ids_by_email.setdefault(email, []).append(str(row.get("st_technician_id")))
-    for email, ids in ids_by_email.items():
-        if len(ids) > 1:
-            logger.warning(
-                "technicians: %s is shared by %d distinct technician ids (%s); all "
-                "are exported — a consumer requiring unique emails must resolve it",
-                email,
-                len(ids),
-                ", ".join(ids),
-            )
-
-    return deduped
-
-
-def _technician_row(record: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "st_technician_id": record.get("id"),
-        "name": record.get("name"),
-        "email": record.get("email"),
-        "active": record.get("active"),
-    }
 
 
 def _apply_window(
