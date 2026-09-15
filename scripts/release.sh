@@ -19,12 +19,26 @@
 # and how v0.2.7 failed twice before it worked. Use this instead.
 #
 #   ./scripts/release.sh 0.2.8
+#
+# YOU PROBABLY DO NOT NEED TO RUN THIS BY HAND ANY MORE.
+# `.github/workflows/release.yml` runs this script on every merge into the
+# integration branch, then commits, tags the commit it just made, and pushes both
+# atomically. Merging is now the whole release. This script stays hand-runnable
+# (it is the ONE place that knows where the three literals live, and the workflow
+# calls it rather than copying its seds), but the commit/tag dance below is the
+# part that has been got wrong four times, and it is no longer yours to do:
+#
+#   * a version out of sequence, or a release of something the rules skip:
+#     Actions -> Release -> Run workflow (`version:` / `bump:` / `force:`).
+#   * a rehearsal that pushes nothing: the same, with `dry_run: true`.
+#
+# If you do run it by hand anyway, the ordering constraint is yours to satisfy:
+# the tag must point at a commit whose EXPORTER_TAG already names that tag — the
+# workflow published at tag X must itself check out X.
+#
 #   git commit -am "chore: release 0.2.8" && git push
 #   # merge, then tag the MERGED commit:
 #   gh api repos/BBTT-01/ST-exporter/git/refs -f ref=refs/tags/exporter-v0.2.8 -f sha=<sha>
-#
-# The tag must point at a commit whose EXPORTER_TAG already names that tag —
-# the workflow published at tag X must itself check out X.
 set -euo pipefail
 
 VERSION="${1:-}"
@@ -63,4 +77,5 @@ echo "  pyproject.toml          version = \"$got_py\""
 echo "  export.yml         EXPORTER_TAG: exporter-v$got_wf"
 echo "  connector-export.yml      uses: ...@exporter-v$got_caller (x$(grep -c 'export\.yml@exporter-v' "$CALLER"))"
 echo
-echo "Next: add a CHANGELOG entry, commit, merge, then tag the merged commit exporter-v$VERSION"
+echo "Next: add a CHANGELOG entry and merge. Merging into the integration branch cuts"
+echo "      exporter-v$VERSION by itself (.github/workflows/release.yml); tag nothing by hand."

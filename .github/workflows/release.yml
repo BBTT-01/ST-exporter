@@ -1,0 +1,611 @@
+# Cut a release on every merge into the integration branch: bump the three
+# version literals, test them, commit, and tag the commit it just made — in one
+# ordered job that cannot be mis-sequenced.
+#
+# ===========================================================================
+# THE CONSTRAINT THIS FILE EXISTS TO ENFORCE
+# ===========================================================================
+#
+# The tag must point at a commit whose `EXPORTER_TAG` ALREADY NAMES THAT TAG.
+# The workflow published at tag X must itself check out X, because `export.yml`
+# checks the two against each other at runtime ("Verify the checked-out exporter
+# matches the pinned tag") and fails a contractor's run loudly when they
+# disagree — a total outage for that tenant.
+#
+# By hand that is a four-step dance (bump -> commit -> merge -> tag the MERGED
+# commit) and it has now been got wrong four times here:
+#
+#   * v0.2.1  the bump was missed; the tag shipped the previous commit's code and
+#             the run logged the wrong `HEAD is now at`. Nothing errored.
+#   * v0.2.7  failed twice before it worked.
+#   * v0.3.0  `docs/examples/connector-export.yml` — the caller file every
+#             contractor copies — was pinned to a tag that never existed.
+#   * v0.2.9  tagged, then PRs #16 and #17 merged, so live contractors run an
+#             exporter WITHOUT the cursor-loss fix that was merged for them.
+#
+# Here the ordering is STRUCTURAL rather than remembered: the tag is created from
+# the commit this job just made, in the same job, from the same working tree, and
+# the literals are read back OUT OF THE TAGGED COMMIT and compared with the tag
+# before anything is pushed. There is no window for a human, or another merge, to
+# interleave.
+#
+# ===========================================================================
+# EVERY MERGE CUTS A TAG
+# ===========================================================================
+#
+# Not "a human dispatches a release when they feel ready" — that is exactly how
+# v0.2.9 went stale, with two merged fixes sitting unpublished while every
+# contractor ran the code without them, on green runs, with no symptom but the
+# bug still happening.
+#
+# The cost of the other direction is small and bounded: contractors PIN a tag by
+# name in five `uses:` lines and move only when somebody repins them, so a tag
+# nobody adopts costs a line in the tag list and nothing else. No tenant's
+# behaviour changes when this workflow runs. What would actually hurt is a
+# BROKEN or MIS-SEQUENCED tag, so the guards below matter more under automation,
+# not less: the suite must be green, the three literals must agree, an existing
+# tag is never overwritten, and the tag must point at a commit whose own
+# `EXPORTER_TAG` names it.
+#
+# The manual path is kept alongside, not replaced: `workflow_dispatch` takes an
+# explicit version, a forced bump level, a `force` for a merge the rules would
+# skip, and a `dry_run` rehearsal.
+#
+# ===========================================================================
+# WHAT DOES *NOT* CUT A TAG
+# ===========================================================================
+#
+# A release is worth cutting when the code a contractor's run EXECUTES has
+# changed. That is `src/`, `pyproject.toml` (dependencies and entry points) and
+# `.github/workflows/export.yml` (the reusable workflow itself). A merge that
+# only moves CHANGELOG.md, README.md, docs, tests, contracts fixtures or CI is
+# not something any tenant can run differently, so it does not get a version.
+#
+# The comparison is made against the NEWEST TAG, not against the previous push,
+# on purpose: if a docs-only merge lands after a code merge whose release run
+# failed, the code is still unreleased and the next merge must publish it. The
+# question asked is "is there anything unreleased that a tenant would run", not
+# "was this particular merge interesting".
+#
+# `[skip release]` (or `[no release]`) in the merge commit's SUBJECT — its first
+# line, which is where GitHub puts the PR title — overrides that and skips
+# anyway. The subject and not the whole message, because a commit whose BODY
+# explains the marker (this one's did) must still be releasable. There is no marker to force the opposite way in a commit —
+# that is `workflow_dispatch` with `force: true`, because wanting a release out
+# of nothing is rare and deserves a name attached to it.
+#
+# For the three merges already on this branch the rule would have released all
+# three: #15, #16 and #17 each changed `src/`. #16 and #17 are precisely the two
+# that went unreleased by hand.
+#
+# ===========================================================================
+# IT CANNOT RE-TRIGGER ITSELF
+# ===========================================================================
+#
+# This job pushes a commit to the branch it triggers on, which is a loop unless
+# something stops it. THREE things do, and the first two are in this file:
+#
+#   1. the bump commit's subject carries `[skip release]`, which the decision
+#      step below honours;
+#   2. the decision step skips any head commit authored by `github-actions[bot]`
+#      whose subject starts with `chore: release`;
+#   3. and GitHub itself does not start workflow runs for pushes made with the
+#      `GITHUB_TOKEN` — which is what the push at the end uses. That one is the
+#      platform's behaviour rather than this repository's, so it is relied on
+#      LAST, not first: if the push ever moves to a PAT or a deploy key, (1) and
+#      (2) are what keep it from looping.
+#
+# ===========================================================================
+# IT CANNOT TOUCH `export.yml`, AND A CONTRACTOR CANNOT CALL IT
+# ===========================================================================
+#
+#   * No `workflow_call`, so no connector repository can invoke it. No
+#     `pull_request`, so no fork's PR can reach a writable token. No `schedule`.
+#   * Refused outside `BBTT-01/ST-exporter`: a fork must not be able to publish a
+#     tag, and a fork's push to its own copy of the integration branch would
+#     otherwise try.
+#   * Refused off the integration branch.
+#   * No tenant secrets, never runs `st-export`, writes no tab, drains no outbox,
+#     and takes neither of the export workflow's concurrency locks.
+#   * Workflow-level `permissions: {}` — the token starts with NOTHING. The
+#     decision job stays read-only; only the job that pushes adds
+#     `contents: write`, which is the minimum that can push a commit and a tag,
+#     and reaches no issues, packages, deployments, Actions API or OIDC identity.
+#
+# ===========================================================================
+# `scripts/release.sh` IS STILL THE SOURCE OF TRUTH
+# ===========================================================================
+#
+# This file CALLS it. The sed logic that knows where the three literals live is
+# not duplicated into YAML, so `./scripts/release.sh 0.2.10` by hand keeps
+# working exactly as before and there is only ever one definition of "bump the
+# version". What this file adds is the ordering, the refusals and the proof.
+
+name: Release
+
+on:
+  # THE INTEGRATION BRANCH. It is spelled here and in `INTEGRATION_BRANCH` below,
+  # because GitHub does not evaluate expressions in trigger filters — and the
+  # first step of the job refuses to run if the two ever disagree, so repointing
+  # them is one edit that fails loudly when it is only half done.
+  #
+  # `main` is NOT the release line: it is 59 commits behind this branch and no
+  # `exporter-v*` tag points into it.
+  push:
+    branches: [feat/servicetitan-hosted]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Bump level. `auto` = major/minor if an unreleased commit says so, else patch."
+        type: choice
+        default: auto
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+      version:
+        description: "Exact version X.Y.Z — overrides `bump`. Blank derives it."
+        type: string
+        default: ""
+      force:
+        description: "Release even if nothing a tenant runs has changed since the newest tag"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Rehearse: every check, commit and tag built locally, nothing pushed"
+        type: boolean
+        default: false
+
+# Two merges landing a minute apart must not both compute the same next version
+# and race to push it. One release at a time, and never cancel one: a cancelled
+# run could be killed between the commit and the atomic push.
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+# The token starts with no scopes at all. Each job opts into the minimum it needs.
+permissions: {}
+
+jobs:
+  # ==========================================================================
+  # DECIDE — is a release owed, and what number is it? Read-only, so the code
+  # that parses commit messages and computes a version can never write anything.
+  # ==========================================================================
+  decide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+      previous: ${{ steps.decide.outputs.previous }}
+      level: ${{ steps.decide.outputs.level }}
+      reason: ${{ steps.decide.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history AND every tag: the base version is the newest tag, and
+          # "what is unreleased" is a diff against it.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide
+        id: decide
+        env:
+          INTEGRATION_BRANCH: feat/servicetitan-hosted
+          BUMP: ${{ inputs.bump || 'auto' }}
+          EXPLICIT: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          skip() {
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "reason=$1" >> "$GITHUB_OUTPUT"
+            echo "::notice title=No release::$1"
+            { echo "### No release"; echo; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+
+          subject="$(git log -1 --format=%s HEAD)"
+          author="$(git log -1 --format='%an <%ae>' HEAD)"
+
+          # ---- loop guard (1) and (2): this workflow's own bump commit --------
+          # THE SUBJECT LINE ONLY, not the whole message. Scanning the body made
+          # the very commit that introduced this workflow unreleasable, because
+          # its body EXPLAINS the marker — and a repository whose release
+          # automation cannot be described in a commit message without switching
+          # itself off is a trap. The marker is a decision, so it goes where a
+          # decision goes: the first line, which is also the PR title GitHub puts
+          # in a merge commit's subject.
+          case "$subject" in
+            *"[skip release]"*|*"[no release]"*)
+              skip "the head commit's subject says [skip release]: $subject" ;;
+          esac
+          # Parameter expansion rather than a `case` pattern: `[bot]` is a
+          # character class to a glob, and a loop guard that matches
+          # "github-actionsb" is not a loop guard.
+          if [ "${author#*github-actions\[bot\]}" != "$author" ] \
+             && [ "${subject#chore: release }" != "$subject" ]; then
+            skip "the head commit is this workflow's own bump commit: $subject"
+          fi
+
+          # ---- the base version: the newest tag, or pyproject if it is ahead --
+          newest_tag_version="$(git tag --list 'exporter-v*' | sed 's/^exporter-v//' \
+                                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+          pyproject_version="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)"
+          # Whichever is higher. They are normally equal; pyproject can be ahead
+          # if somebody bumped by hand without tagging, and releasing BEHIND that
+          # would produce a tag whose code claims a different version.
+          base="$(printf '%s\n%s\n' "${newest_tag_version:-0.0.0}" "${pyproject_version:-0.0.0}" \
+                  | sort -V | tail -1)"
+          echo "newest tag=${newest_tag_version:-<none>} pyproject=$pyproject_version base=$base"
+
+          # ---- is anything unreleased that a tenant would RUN? ---------------
+          # Against the newest tag, not against this push: a docs-only merge on
+          # top of an unreleased code merge must still publish the code.
+          if [ -n "$newest_tag_version" ]; then
+            range="exporter-v$newest_tag_version..HEAD"
+            changed="$(git diff --name-only "exporter-v$newest_tag_version" HEAD)"
+          else
+            range="HEAD"
+            changed="$(git ls-files)"
+          fi
+          runnable="$(echo "$changed" | grep -E \
+            -e '^src/' -e '^pyproject\.toml$' -e '^\.github/workflows/export\.yml$' || true)"
+          if [ -z "$runnable" ] && [ "$FORCE" != "true" ]; then
+            skip "nothing a tenant runs has changed since exporter-v${newest_tag_version} — only $(echo "$changed" | wc -l | tr -d ' ') file(s) outside src/, pyproject.toml and export.yml. Dispatch with force: true to release anyway."
+          fi
+
+          # ---- the level -----------------------------------------------------
+          # `auto` reads the UNRELEASED commit messages for `[major]`/`[minor]`,
+          # highest wins, else patch.
+          #
+          # A commit-message token rather than a PR label: a label is invisible
+          # from a push event without an extra API call and an extra token scope,
+          # it can be changed after the merge so the record of why a version moved
+          # stops matching the version, and it does not exist at all for a direct
+          # push. The token is in the merged history, is reviewable in the PR
+          # diff, and needs no permission to read.
+          level="$BUMP"
+          if [ "$level" = "auto" ]; then
+            messages="$(git log --format=%B "$range")"
+            case "$messages" in
+              *"[major]"*) level=major ;;
+              *"[minor]"*) level=minor ;;
+              *) level=patch ;;
+            esac
+          fi
+
+          explicit="$(echo "${EXPLICIT:-}" | tr -d '[:space:]')"
+          if [ -n "$explicit" ]; then
+            version="$explicit"
+            level=explicit
+          else
+            IFS=. read -r major minor patch <<< "$base"
+            case "$level" in
+              major) version="$((major + 1)).0.0" ;;
+              minor) version="$major.$((minor + 1)).0" ;;
+              patch) version="$major.$minor.$((patch + 1))" ;;
+              *) echo "::error::unknown bump level '$level'"; exit 1 ;;
+            esac
+          fi
+
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$version' is not of the form X.Y.Z. The tag, the checkout ref" \
+                 "and the runtime guard are all derived from it by string surgery."
+            exit 1
+          fi
+          # Strictly forwards, or the tag list stops describing the order things
+          # shipped in.
+          older="$(printf '%s\n%s\n' "$base" "$version" | sort -V | head -1)"
+          if [ "$version" = "$base" ] || [ "$older" = "$version" ]; then
+            echo "::error::$version is not ahead of $base (newest tag / pyproject.toml)."
+            exit 1
+          fi
+
+          {
+            echo "release=true"
+            echo "version=$version"
+            echo "tag=exporter-v$version"
+            echo "previous=$base"
+            echo "level=$level"
+            echo "reason=$level release: $base -> $version"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice title=Release::$level release $base -> $version (exporter-v$version)"
+
+  # ==========================================================================
+  # RELEASE — the ordered sequence. Refusals, bump, tests, commit, tag, proof,
+  # push. The only job with a writable token.
+  # ==========================================================================
+  release:
+    needs: decide
+    if: ${{ needs.decide.outputs.release == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      # The minimum that can push a commit and a tag, and nothing else.
+      contents: write
+    env:
+      # The integration branch, as a constant. Repointing the release line is
+      # this line plus the `push:` filter at the top of the file — and the first
+      # step refuses to run if those two disagree, so a half-edit cannot ship.
+      INTEGRATION_BRANCH: feat/servicetitan-hosted
+      # This repository, spelled out. A fork must not publish a tag that would
+      # resolve as `BBTT-01/ST-exporter@exporter-vX.Y.Z` for anybody.
+      RELEASE_REPOSITORY: BBTT-01/ST-exporter
+      VERSION: ${{ needs.decide.outputs.version }}
+      TAG: ${{ needs.decide.outputs.tag }}
+    steps:
+      # ------------------------------------------------------------------
+      # REFUSALS FIRST. Everything that can say no says it before anything is
+      # written, so a refused release leaves no half-bumped tree behind.
+      # ------------------------------------------------------------------
+      - name: Refuse to release from anywhere but this repository
+        run: |
+          if [ "$GITHUB_REPOSITORY" != "$RELEASE_REPOSITORY" ]; then
+            echo "::error::releases may only be cut from $RELEASE_REPOSITORY, not from" \
+                 "$GITHUB_REPOSITORY. A fork publishing an exporter-v* tag would be a tag" \
+                 "no connector can resolve — or worse, one that resolves to code this" \
+                 "repository never reviewed."
+            exit 1
+          fi
+          # A failed step is louder than a skipped job, which is why this is a
+          # step and not a job-level `if:`.
+          echo "repository $GITHUB_REPOSITORY"
+
+      - name: Refuse to release from anything but the integration branch
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "branch" ]; then
+            echo "::error::dispatched against a $GITHUB_REF_TYPE, not a branch. A release" \
+                 "has to advance the integration branch; there is nowhere to push from a tag."
+            exit 1
+          fi
+          if [ "$GITHUB_REF_NAME" != "$INTEGRATION_BRANCH" ]; then
+            echo "::error::triggered from '$GITHUB_REF_NAME', but releases are cut from" \
+                 "'$INTEGRATION_BRANCH' only. Every exporter-v* tag points into that branch," \
+                 "and a tag cut from anywhere else publishes an exporter that is not what" \
+                 "integration has. If the release line has moved, change INTEGRATION_BRANCH" \
+                 "AND the push: filter in .github/workflows/release.yml."
+            exit 1
+          fi
+          echo "branch $GITHUB_REF_NAME"
+
+      - uses: actions/checkout@v4
+        with:
+          # The BRANCH, not `github.sha`: if another merge landed while this run
+          # queued behind the concurrency group, the release must publish what
+          # integration actually has now. The triggering commit is asserted to be
+          # in it below, and the atomic push refuses anything non-fast-forward.
+          ref: ${{ env.INTEGRATION_BRANCH }}
+          # Full history and every tag: the refusal to overwrite is checked
+          # against the tags, and a shallow clone has none of them.
+          fetch-depth: 0
+          # The push at the end uses this checkout's credentials. GitHub starts no
+          # workflow run for a push made with GITHUB_TOKEN, which is loop guard (3).
+          persist-credentials: true
+
+      - name: Refuse if this file's own branch constants disagree
+        run: |
+          set -euo pipefail
+          # `on: push: branches:` cannot be an expression, so the branch name is
+          # written twice. This is the step that makes that safe.
+          filtered="$(sed -n 's/^    branches: \[\(.*\)\]$/\1/p' .github/workflows/release.yml | head -1)"
+          if [ "$filtered" != "$INTEGRATION_BRANCH" ]; then
+            echo "::error::release.yml triggers on '$filtered' but INTEGRATION_BRANCH is" \
+                 "'$INTEGRATION_BRANCH'. Repointing the release line means changing both."
+            exit 1
+          fi
+          echo "trigger branch and INTEGRATION_BRANCH agree: $filtered"
+
+      - name: Refuse unless the tree is clean and contains the triggering commit
+        env:
+          TRIGGERING_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # A fresh checkout is clean by construction; assert it anyway, because
+          # every later assertion ("the bump changed exactly these three files")
+          # is only meaningful against a clean starting point.
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the checked-out tree is dirty before anything was bumped:"
+            git status --porcelain
+            exit 1
+          fi
+          head="$(git rev-parse HEAD)"
+          # The branch may legitimately have moved ahead while this run queued —
+          # that release publishes more, which is correct. It must never have
+          # moved BACKWARDS or sideways: the commit that triggered this run has to
+          # be an ancestor of what is about to be tagged.
+          if ! git merge-base --is-ancestor "$TRIGGERING_SHA" "$head"; then
+            echo "::error::$TRIGGERING_SHA is not an ancestor of $INTEGRATION_BRANCH's tip" \
+                 "($head) — the branch was rewritten under this run. Nothing was changed."
+            exit 1
+          fi
+          echo "clean tree at $head (triggered by $TRIGGERING_SHA)"
+
+      - name: Refuse to overwrite an existing tag
+        run: |
+          set -euo pipefail
+          # Locally (the checkout fetched them all) AND on the remote, because the
+          # local clone is only as fresh as this job and two runs may be close
+          # together.
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::$TAG already exists at $(git rev-list -n1 "$TAG")." \
+                 "A published tag is what contractors pin; moving one would change the" \
+                 "code under a tenant without anything in their repository changing."
+            exit 1
+          fi
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
+            echo "::error::$TAG already exists on origin."
+            exit 1
+          fi
+          echo "$TAG is free"
+
+      # ------------------------------------------------------------------
+      # THE BUMP — delegated, not reimplemented.
+      # ------------------------------------------------------------------
+      - name: Bump all three version literals (scripts/release.sh)
+        run: ./scripts/release.sh "$VERSION"
+
+      - name: Assert all three literals moved and agree
+        run: |
+          set -euo pipefail
+          # `release.sh` already cross-checks these. It is asserted AGAIN here,
+          # independently, because the failure mode being guarded is a silent
+          # no-op: a sed that matches nothing exits 0, and a script whose checks
+          # read back the same file it failed to write is checking itself.
+          py="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)"
+          wf="$(sed -n 's/^ *EXPORTER_TAG: exporter-v\(.*\)/\1/p' .github/workflows/export.yml | head -1)"
+          caller="$(grep -o 'export\.yml@exporter-v[0-9.]*' docs/examples/connector-export.yml \
+                    | sed 's/.*@exporter-v//' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+          uses_count="$(grep -c 'export\.yml@exporter-v' docs/examples/connector-export.yml)"
+          echo "pyproject=$py export.yml=$wf caller=$caller (x$uses_count uses: lines)"
+          if [ "$py" != "$VERSION" ] || [ "$wf" != "$VERSION" ] || [ "$caller" != "$VERSION" ]; then
+            echo "::error::the three literals do not all read $VERSION" \
+                 "(pyproject='$py' export.yml='$wf' caller='$caller')."
+            exit 1
+          fi
+          # A no-op bump is the other half of the same failure: nothing changed,
+          # so the "release" would be a tag on unchanged code under a new number.
+          changed="$(git status --porcelain)"
+          if [ -z "$changed" ]; then
+            echo "::error::release.sh changed no files, yet the literals read $VERSION." \
+                 "The tree was already at this version and this release is a no-op."
+            exit 1
+          fi
+          echo "$changed"
+          # And it must have changed ONLY the three files it is allowed to touch.
+          unexpected="$(git status --porcelain | awk '{print $2}' \
+                        | grep -v -e '^pyproject\.toml$' \
+                                  -e '^\.github/workflows/export\.yml$' \
+                                  -e '^docs/examples/connector-export\.yml$' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "::error::release.sh touched files it should not have: $unexpected"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # GREEN BEFORE TAGGED. The suite runs against the BUMPED tree, because
+      # tests/st_exporter/test_workflow.py asserts the three literals agree —
+      # running it before the bump would be testing the previous release.
+      # ------------------------------------------------------------------
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Tests
+        run: pytest
+
+      - name: Contract fixtures are neither stale nor a silent rewrite
+        run: python scripts/gen_contract_fixtures.py --check
+
+      - name: Lint
+        run: |
+          ruff check src/st_exporter tests/st_exporter
+          ruff format --check src/st_exporter tests/st_exporter
+
+      # ------------------------------------------------------------------
+      # COMMIT, THEN TAG THE COMMIT JUST MADE. These two steps are the whole
+      # point of the file: there is no gap between them for a merge to land in.
+      # ------------------------------------------------------------------
+      - name: Commit the bump
+        id: commit
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml .github/workflows/export.yml docs/examples/connector-export.yml
+          # `[skip release]` is loop guard (1): this push must not cut another
+          # release. `[skip ci]` is deliberately NOT used — it would also skip
+          # CI's own checks on the branch.
+          git commit -m "chore: release $VERSION [skip release]" \
+                     -m "Bumped by .github/workflows/release.yml via scripts/release.sh."
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Tag that commit
+        env:
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Annotated, and pointed at the commit made one step ago BY SHA rather
+          # than by HEAD, so it cannot pick up anything that moved in between.
+          git tag -a "$TAG" "$SHA" -m "ST exporter $VERSION"
+
+      - name: Prove the tag names a commit that already names the tag
+        run: |
+          set -euo pipefail
+          # THE ORDERING CONSTRAINT, READ BACK OUT OF THE TAGGED OBJECT.
+          # Not out of the working tree — out of the committed tree the tag
+          # actually points at. This is the check a human was doing by eye, and it
+          # is the one that failed four times.
+          tagged_wf="$(git show "$TAG:.github/workflows/export.yml" \
+                       | sed -n 's/^ *EXPORTER_TAG: \(.*\)/\1/p' | head -1)"
+          tagged_py="$(git show "$TAG:pyproject.toml" \
+                       | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          tagged_caller="$(git show "$TAG:docs/examples/connector-export.yml" \
+                           | grep -o 'export\.yml@exporter-v[0-9.]*' | sed 's/.*@//' \
+                           | sort -u | tr '\n' ' ' | sed 's/ $//')"
+          echo "tag=$TAG  EXPORTER_TAG=$tagged_wf  pyproject=$tagged_py  caller=$tagged_caller"
+          if [ "$tagged_wf" != "$TAG" ]; then
+            echo "::error::$TAG points at a commit whose EXPORTER_TAG is '$tagged_wf'." \
+                 "Every contractor run at this tag would fail the runtime guard."
+            exit 1
+          fi
+          if [ "$tagged_py" != "$VERSION" ] || [ "$tagged_caller" != "$TAG" ]; then
+            echo "::error::the tagged commit disagrees with itself" \
+                 "(pyproject='$tagged_py' caller='$tagged_caller')."
+            exit 1
+          fi
+          echo "ordering constraint holds: the commit $TAG points at already names $TAG"
+
+      # ------------------------------------------------------------------
+      # PUBLISH. Atomically, so a half-push cannot leave a tag without its commit
+      # or a bump without its tag — and so a branch that moved under this run
+      # rejects the whole thing rather than half of it.
+      # ------------------------------------------------------------------
+      - name: Push the commit and the tag together
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          git push --atomic origin \
+            "HEAD:refs/heads/$INTEGRATION_BRANCH" \
+            "refs/tags/$TAG"
+
+      - name: Summary
+        if: always()
+        env:
+          PREVIOUS: ${{ needs.decide.outputs.previous }}
+          LEVEL: ${{ needs.decide.outputs.level }}
+          SHA: ${{ steps.commit.outputs.sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          {
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "### Release rehearsal (dry run) — nothing was pushed"
+            else
+              echo "### Released \`$TAG\`"
+            fi
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| previous | \`${PREVIOUS:-?}\` |"
+            echo "| level | \`${LEVEL:-?}\` |"
+            echo "| version | \`${VERSION:-?}\` |"
+            echo "| tag | \`${TAG:-?}\` |"
+            echo "| commit | \`${SHA:-not reached}\` |"
+            echo "| branch | \`$INTEGRATION_BRANCH\` |"
+            echo
+            echo "The tag points at that commit, and that commit's \`EXPORTER_TAG\` names the"
+            echo "tag — checked by reading them back out of the tagged tree."
+            echo
+            echo "**Contractors do not move until somebody repins them.**"
+            echo "\`docs/examples/connector-export.yml\` in this repository is already at"
+            echo "\`${TAG:-the new tag}\`; \`BBTT-01/st-connector-template\` and each contractor"
+            echo "repository hold their own copies, which this workflow cannot reach."
+          } >> "$GITHUB_STEP_SUMMARY"
