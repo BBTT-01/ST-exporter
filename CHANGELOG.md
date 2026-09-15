@@ -4,6 +4,56 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Customer phone and email were never exported
+
+### Fixed: `customer_phone` / `customer_email` blank on every row ever exported
+
+2,441 rows on one live tenant and 1,068 on the other, in both columns, for the
+life of the feature — the exact failure `KNOWN_UNVERIFIED.md` predicted for this
+field and the same shape as the `job_number` bug: a green run, a silent whole-blank
+column, and nothing that reads as an error.
+
+The exporter read contact details off the customer RECORD (`customer.phone`,
+`phoneSettings[]`, `contacts[]`). ServiceTitan keeps them on a sub-resource —
+`crm/v2/tenant/{id}/customers/{customerId}/contacts` — which TradeRated's own live
+Direct-path function has been reading in production all along. The jobs feed now
+fetches it for the customers behind the windowed rows and overlays the answer on
+the two columns.
+
+* **Same selection rule as the Direct path**, so a contractor cannot see a
+  different number depending on which path served the row: by `type`, never by
+  position, `MobilePhone` before `Phone`, `Email` for the email. **`Fax` is not a
+  phone and is never a fallback** — a wrong number on a technician's screen is
+  worse than a blank one.
+* **The old readers stay.** The contract widens, never narrows: a tenant that does
+  carry a flat `phone` still exports it, and the fallback is what fills the cells
+  when the contacts call is refused. Precedence only ever decides between two
+  POPULATED values — this can fill a blank cell and change a value, never empty one.
+* **A 403 costs two cells, not the feed.** Same degradation as job types and
+  business units: the `jobs` tab exports in full, the two cells fall back, and a
+  `Customer contacts degraded` annotation says so on the run.
+* **Neither column is exempted** from the blank-column detector. Silencing it
+  would hide the next occurrence of exactly this bug.
+* **No contract bump.** `jobs.v2`'s column list, grain and row key are untouched —
+  what changed is which ServiceTitan field fills two existing cells. The committed
+  fixtures regenerate byte-identically.
+
+### Added: `EXPORTER_CONTACTS_ROUTE` / `EXPORTER_CONTACTS_MAX_CUSTOMERS`
+
+The per-customer route is N+1, so it is deduped by `customerId` (many jobs share a
+customer) and capped at 3,000 distinct customers per run — of the order of
+1,000–1,500 requests for a tenant this size, inside the 600-per-10s budget.
+Hitting the cap is announced, not silently truncated.
+
+A bulk `crm/export/customers/contacts` change-feed would be strictly better and
+**could not be shown to exist** without a live tenant (the registry declares the
+crm export feeds as customers/locations/bookings; no documentation of a contacts
+feed was found). So the route is a setting, not a guess:
+`EXPORTER_CONTACTS_ROUTE=export` drains that feed cursor-tracked and cached like
+the other five, and a 404/400 from it is announced and falls back to the
+per-customer route for that run. Flipping it on once is how the question gets
+answered.
+
 ## [0.2.10] — 2026-09-15 · A feed that fails is a run that fails
 
 Three changes, all about the same thing: a feed that did not export must not end

@@ -14,13 +14,24 @@ from typing import Any, Callable, TypeVar
 
 from st_cli.client import ServiceTitanClient
 from st_cli.config import Settings
-from st_cli.exceptions import ConfigError, STCLIError
+from st_cli.exceptions import APIError, ConfigError, STCLIError
 from st_exporter import EXPORTER_VERSION
 from st_exporter.blank_columns import check_blank_columns
 from st_exporter.config import ExporterSettings
-from st_exporter.denormalize import build_job_rows
+from st_exporter.denormalize import apply_customer_contacts, build_job_rows, customer_ids
 from st_exporter.feeds.appointments import fetch_appointments_delta
 from st_exporter.feeds.assignments import fetch_assignments_delta
+from st_exporter.feeds.contacts import (
+    CURSOR_KEY as CONTACTS_CURSOR_KEY,
+)
+from st_exporter.feeds.contacts import (
+    DEFAULT_MAX_CONTACT_CUSTOMERS,
+    ROUTE_EXPORT,
+    ROUTE_PER_CUSTOMER,
+    fetch_contacts_export_delta,
+    fetch_contacts_per_customer,
+    group_contacts_by_customer,
+)
 from st_exporter.feeds.customers import fetch_customers_delta
 from st_exporter.feeds.financial import (
     DEFAULT_MAX_TIMESHEET_JOBS,
@@ -76,6 +87,10 @@ _RAW_LOCATIONS = "_raw_locations"
 _RAW_JOBS = "_raw_jobs"
 _RAW_APPOINTMENTS = "_raw_appointments"
 _RAW_ASSIGNMENTS = "_raw_assignments"
+#: Only written on the opt-in bulk contacts route — the per-customer route has no
+#: change feed to cache and re-reads each run, so a stale number can never be
+#: exported. See feeds/contacts.py.
+_RAW_CUSTOMER_CONTACTS = "_raw_customer_contacts"
 
 # `outbox` is not an export feed — it writes no tab and fetches nothing. It is
 # named here because naming it is what makes the outbox drain OPT-IN: the drain
@@ -245,6 +260,8 @@ def run_export(
             window_days=exporter_settings.window_days,
             financial_window_days=exporter_settings.financial_window_days,
             financial_max_jobs=exporter_settings.financial_max_jobs,
+            contacts_route=exporter_settings.contacts_route,
+            contacts_max_customers=exporter_settings.contacts_max_customers,
             pricebook_category_ids=exporter_settings.pricebook_category_ids,
             image_client=image_client,
             dry_run=dry_run,
@@ -285,6 +302,8 @@ def _run(
     window_days: int = DEFAULT_WINDOW_DAYS,
     financial_window_days: int = FINANCIAL_WINDOW_DAYS,
     financial_max_jobs: int = DEFAULT_MAX_TIMESHEET_JOBS,
+    contacts_route: str = ROUTE_PER_CUSTOMER,
+    contacts_max_customers: int = DEFAULT_MAX_CONTACT_CUSTOMERS,
     pricebook_category_ids: tuple[str, ...] = (),
     image_client: TrueQuoteImageClient | None = None,
     dry_run: bool,
@@ -342,6 +361,8 @@ def _run(
                 today=today,
                 run_at=run_at,
                 window_days=window_days,
+                contacts_route=contacts_route,
+                contacts_max_customers=contacts_max_customers,
                 dry_run=dry_run,
             ),
         )
@@ -650,6 +671,108 @@ def _optional_reference(
         return {}
 
 
+def _customer_contacts(
+    client: ServiceTitanClient,
+    rows: list[dict[str, Any]],
+    *,
+    route: str,
+    max_customers: int,
+    raw_cache_store: SheetsPort,
+    cursor: str | None,
+    dry_run: bool,
+) -> tuple[dict[str, list[dict[str, Any]]], str | None]:
+    """Customer phone/email for the rows about to be written; ``{}`` if refused.
+
+    The same degradation `_optional_reference` gives job types and business
+    units, for the same reason and by the same two mechanisms (a WARNING plus an
+    Actions annotation): `customer_phone` and `customer_email` are one cell each,
+    and losing the whole `jobs` feed over them would cost a contractor every
+    column on every row rather than two. A 403 here — the CRM permission this
+    sub-resource needs not being ticked — therefore leaves those two cells at
+    whatever the customer record itself resolved (usually blank) and the tab
+    otherwise intact.
+
+    **The failure is never silent.** It is announced, and the blank-column
+    detector reports the two columns independently if they end up empty tab-wide,
+    so "contacts were refused" and "contacts are blank" both reach the run
+    summary rather than only the log of a green run.
+
+    Returns the contacts and the contacts cursor to persist. On the default
+    per-customer route there is no cursor to advance, so the previous value is
+    handed straight back; on the bulk route a failure hands back the PREVIOUS
+    cursor too, so nothing is skipped — same trailing-edge rule as every other
+    feed here.
+    """
+    try:
+        if route == ROUTE_EXPORT:
+            try:
+                return _bulk_customer_contacts(
+                    client, raw_cache_store=raw_cache_store, cursor=cursor, dry_run=dry_run
+                )
+            except APIError as exc:
+                if exc.status_code not in (400, 404):
+                    raise
+                # ServiceTitan saying "there is no such feed" — which is the one
+                # thing nobody could establish without a tenant. Say so loudly
+                # (it is the answer to an open question, not just an error) and
+                # serve this run from the route that is known to work.
+                logger.warning(
+                    "DEGRADED: the bulk crm/export/customers/contacts feed answered %s. "
+                    "This tenant does not have it; falling back to the per-customer "
+                    "route for this run. Set EXPORTER_CONTACTS_ROUTE=per-customer to "
+                    "stop asking.",
+                    exc,
+                )
+                announce_to_actions(
+                    "Bulk contacts feed absent",
+                    f"crm/export/customers/contacts answered {exc}; this tenant does not "
+                    f"have that feed. The run fell back to the per-customer contacts "
+                    f"route. Set EXPORTER_CONTACTS_ROUTE=per-customer.",
+                )
+        return (
+            fetch_contacts_per_customer(client, customer_ids(rows), max_customers=max_customers),
+            cursor,
+        )
+    except STCLIError as exc:
+        logger.warning(
+            "DEGRADED: could not read customer contacts (%s). The jobs feed continues "
+            "without them; customer_phone / customer_email fall back to whatever the "
+            "customer record itself carries, which is usually blank. Check the CRM "
+            "customer-contacts permission on this tenant's ServiceTitan app.",
+            exc,
+        )
+        announce_to_actions(
+            "Customer contacts degraded",
+            f"could not read customer contacts ({exc}). The jobs tab still exported; "
+            f"customer_phone / customer_email may be blank on every row. Check the CRM "
+            f"customer-contacts permission on this tenant's ServiceTitan app.",
+        )
+        return {}, cursor
+
+
+def _bulk_customer_contacts(
+    client: ServiceTitanClient,
+    *,
+    raw_cache_store: SheetsPort,
+    cursor: str | None,
+    dry_run: bool,
+) -> tuple[dict[str, list[dict[str, Any]]], str | None]:
+    """The opt-in bulk route: a cursor-tracked change feed, cached like the rest.
+
+    Identical treatment to the five feeds above — delta from the stored cursor,
+    merged last-write-wins into a `_raw_customer_contacts` tab, grouped by
+    ``customerId`` — because if this feed exists it IS one of them. The cursor is
+    written by the caller alongside the other five, after the tab is on disk.
+    """
+    raw_contacts = RawCache.from_grid(raw_cache_store.read_grid(_RAW_CUSTOMER_CONTACTS))
+    delta, next_cursor = fetch_contacts_export_delta(client, cursor)
+    raw_contacts.merge(delta)
+    logger.info("fetched deltas: customer-contacts=%d (bulk route)", len(delta))
+    if not dry_run:
+        raw_cache_store.replace_grid(_RAW_CUSTOMER_CONTACTS, raw_contacts.to_grid())
+    return group_contacts_by_customer(raw_contacts.values()), next_cursor
+
+
 def _run_jobs_feed(
     client: ServiceTitanClient,
     export_store: SheetsPort,
@@ -660,6 +783,8 @@ def _run_jobs_feed(
     today: Any,
     run_at: str,
     window_days: int,
+    contacts_route: str = ROUTE_PER_CUSTOMER,
+    contacts_max_customers: int = DEFAULT_MAX_CONTACT_CUSTOMERS,
     dry_run: bool,
 ) -> tuple[list[dict[str, Any]], int]:
     """Fetch/denormalise/window the jobs feed; return (windowed_rows, skipped_no_job).
@@ -735,6 +860,21 @@ def _run_jobs_feed(
             skipped_bad_timestamp,
         )
 
+    # Contact details are fetched for the WINDOWED rows only — the customers whose
+    # jobs actually reach the tab — and applied on top of whatever the customer
+    # record's own fields resolved. Blank cells if it is refused; never a failed
+    # feed. See `_customer_contacts`.
+    contacts_by_customer, contacts_cursor = _customer_contacts(
+        client,
+        windowed_rows,
+        route=contacts_route,
+        max_customers=contacts_max_customers,
+        raw_cache_store=raw_cache_store,
+        cursor=cursor_bundle.get(CONTACTS_CURSOR_KEY),
+        dry_run=dry_run,
+    )
+    apply_customer_contacts(windowed_rows, contacts_by_customer)
+
     jobs_grid = build_job_grid(windowed_rows)
     check_blank_columns("jobs", jobs_grid)
 
@@ -745,6 +885,7 @@ def _run_jobs_feed(
             "jobs": jobs_cursor,
             "appointments": appointments_cursor,
             "assignments": assignments_cursor,
+            CONTACTS_CURSOR_KEY: contacts_cursor,
         }
     )
     if not dry_run:
