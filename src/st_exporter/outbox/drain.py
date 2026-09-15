@@ -31,7 +31,7 @@ paths, claim envelope, ServiceTitan write, result vocabulary — lives behind
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from st_cli.client import ServiceTitanClient
@@ -40,6 +40,7 @@ from st_exporter.outbox.actions import UnsupportedOutboxKindError
 from st_exporter.outbox.client import OutboxItem
 from st_exporter.outbox.lanes import OutboxLane
 from st_exporter.outbox.ledger import LedgerEntry, OutboxLedger
+from st_exporter.writeback import AssignmentWriteBack, write_back_for_item
 
 _DEFAULT_CLAIM_LIMIT = 10
 
@@ -53,6 +54,18 @@ class DrainSummary:
     succeeded: int
     failed: int
     replayed: int  # already in the ledger; re-reported without a new ST write
+
+    #: The `jobs`-tab effects of the items this lane PERFORMED this run — the
+    #: write-back half of ticket 17. Only items whose ServiceTitan write actually
+    #: happened here are in it: a replay's write happened on an earlier run, whose
+    #: own feed has long since exported it, so re-applying it now would be a Sheets
+    #: write that changes nothing.
+    #:
+    #: Collecting them is all the drain does. It never applies them, because
+    #: applying them is a Sheets write and a failed Sheets write must not be able
+    #: to turn a succeeded item into a failed one — by the time anything is
+    #: applied, every item here has already been reported succeeded to its app.
+    write_backs: list[AssignmentWriteBack] = field(default_factory=list)
 
     #: This lane did NOTHING because the shared ledger was already unwritable
     #: when its turn came. Without this flag a skipped lane is byte-identical to
@@ -142,6 +155,7 @@ def drain_outbox(
 
     items = lane.claim(limit)
     succeeded = failed = replayed = 0
+    write_backs: list[AssignmentWriteBack] = []
 
     for item in items:
         if not item.idempotency_key or not item.id:
@@ -230,6 +244,29 @@ def drain_outbox(
             )
         )
         succeeded += 1
+        # The ServiceTitan write is real from here on, so this item's effect on the
+        # jobs tab is a fact. Recorded before the flush deliberately: the flush can
+        # fail and end the lane (below) with the item still correctly reported
+        # succeeded, and a succeeded item's write-back must not be lost with it.
+        #
+        # Wrapped, and never re-raised: NOTHING about reading this payload may
+        # reach the item's own outcome. A write-back is a latency optimisation over
+        # a tab the next feed run rebuilds from scratch; an item is a real write
+        # into a contractor's ServiceTitan that must never be performed twice.
+        try:
+            effect = write_back_for_item(lane.product, item)
+        except Exception as exc:
+            effect = None
+            logger.warning(
+                "%s outbox item %s: the ServiceTitan write SUCCEEDED but its jobs-tab "
+                "write-back could not be derived: %s. The item stands as succeeded; the "
+                "next jobs feed exports the change.",
+                lane.product,
+                item.id,
+                exc,
+            )
+        if effect is not None:
+            write_backs.append(effect)
         try:
             ledger.flush()
         except Exception as exc:
@@ -291,6 +328,7 @@ def drain_outbox(
         failed=failed,
         replayed=replayed,
         ledger_unwritable=ledger.unwritable,
+        write_backs=write_backs,
     )
 
 

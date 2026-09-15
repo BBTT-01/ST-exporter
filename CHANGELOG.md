@@ -45,6 +45,51 @@ live for two contractors.
   is guarded, named in `feed_failures`, annotated, echoed as `feed_failed=jobs`,
   and — the whole point — the single `_meta` write is reached. It is still never
   filed as a scope answer; only a 403 is.
+### The exporter writes back what it just wrote
+
+When the outbox drain performs a technician assignment against ServiceTitan, the
+same run now updates the affected rows in the `jobs` tab instead of waiting for
+the next jobs run to rediscover its own write. That removes the middle leg of the
+Hosted round trip — worst case falls from roughly 25 minutes to roughly 12.
+
+It applies when `jobs` and `outbox` are named in the **same** invocation
+(`--feeds jobs,outbox`). A drain-only run (`--feeds outbox`) logs
+`write_back_deferred=<n>` and changes nothing: it makes no Export Store
+round-trip at all, which is the stated justification for its concurrency lock
+being separate from the export one, and writing an export tab from it would let a
+drain replace the `jobs` tab while an export run held the other lock. See
+`docs/examples/connector-export.yml` for the one-line opt-in and what it trades.
+
+Bounds, all of them deliberate:
+
+- The write-back goes through the same `build_job_grid` + full-tab `replace_grid`
+  path the feed uses, from the feed's own denormalised rows. There is no second
+  row-builder, so a written-back row is identical to the row the next feed run
+  will produce for it — pinned against the committed `jobs.v2` fixture.
+- **No cursor moves and `_meta` is untouched.** `_meta` is still written exactly
+  once per run, before every side lane. A write-back fetched nothing, so it may
+  not restate `last_cursor` or `last_run_at`; its `row_count` can be out by the
+  rows the write-back changed until the next jobs run.
+- **A failed write-back is not a failed item.** It runs after the drain, so every
+  item it knows about has already been performed, ledgered and reported
+  succeeded; a Sheets failure here is logged (`write_back_failed=1`), the run
+  stays green, and the next jobs run corrects the tab. Reporting the item failed
+  would make the app redeliver it and perform a second real ServiceTitan write.
+- **A scope-denied `jobs` tab is never written by the write-back.** If
+  ServiceTitan refuses this tenant the `jobs` feed (0.2.9's per-tab 403
+  classification), the run logs `write_back_scope_denied=<n>` and writes nothing.
+  A "never granted" tab stays absent — a quiet skip means *no tab*, and the
+  write-back must not resurrect one out of two ids — and a "revoked" tab stays
+  frozen at the last good run, which is the evidence the classification rests on.
+  The handle is built only on the one door out of the per-feed guard that means
+  "this run's rows are on disk" — a non-None outcome — so a denied or otherwise
+  failed `jobs` feed cannot produce one.
+- An appointment with no row in this run's output (outside the window, or its job
+  not in the raw cache yet) is left for the next feed run rather than invented.
+
+Not done, deliberately: on-demand workflow dispatch. It needs the GitHub Actions
+permission removed on 2026-09-10, and permissions are cumulative, so dispatch
+cannot be had without run-log read. One exporter cycle is the floor.
 
 ## [0.2.9] · Every feed declares a contract version, and the fixtures prove it
 

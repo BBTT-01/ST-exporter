@@ -253,6 +253,22 @@ jobs:
       # `outbox` and nothing else. Adding an export feed here would put this job
       # back on the shared export lock and back behind the hourly pricebook run,
       # and would make it write `_meta`.
+      #
+      # ONE DELIBERATE EXCEPTION, and it is a trade: `feeds: "jobs,outbox"`.
+      # That is the only shape in which the exporter can WRITE BACK what the
+      # drain just wrote — a technician assignment pushed from Profit Wizard
+      # lands in the `jobs` tab in the same run that performed it, instead of
+      # waiting for the next jobs run to rediscover it (up to twelve minutes).
+      # The write-back needs this run's own denormalised rows and a legitimate
+      # claim on the `jobs` tab, and a drain-only run has neither, by design:
+      # "makes no Export Store round-trip" is the whole justification for the
+      # separate `...-outbox` concurrency lock.
+      #
+      # What you give up by merging them: this job joins the shared export lock,
+      # so a drain can queue behind an hourly pricebook or six-hourly financial
+      # run. Both jobs are already on the same */5 schedule, so merging them
+      # costs one job, not one cadence. Delete `jobs-feed` above if you do it —
+      # two jobs both asking for `jobs` would roll each other's cursors back.
       feeds: "outbox"
     secrets:
       ST_CLIENT_ID: ${{ secrets.SERVICETITAN_CLIENT_ID }}

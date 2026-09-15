@@ -91,7 +91,13 @@ def run_once(
     elif not drain_requested:
         _warn_if_undrained()
 
-    typer.echo(_summary_line(summary, outcomes))
+    # AFTER the drain, and after every export write and the `_meta` write it
+    # follows: this is the write-back half of ticket 17 (see `writeback.py`). It
+    # cannot fail an outbox item — by the time it runs, every item it knows about
+    # has already been reported succeeded to its app.
+    write_back_note = _write_back(summary, outcomes)
+
+    typer.echo(_summary_line(summary, outcomes) + write_back_note)
 
     run_failed = False
 
@@ -125,6 +131,107 @@ def run_once(
 
     if run_failed:
         raise typer.Exit(code=1)
+
+
+def _write_back(summary: ExportSummary | None, outcomes: list[LaneOutcome]) -> str:
+    """Write this run's own outbox writes into the `jobs` tab; return a summary suffix.
+
+    Four outcomes, and none of them can touch an item's reported result:
+
+    - **Applied** — the jobs feed ran in this same invocation, so the tab and the
+      denormalised rows behind it belong to this run, and the affected rows are
+      replaced through the same grid-replace call the feed uses.
+    - **Deferred** — this was a drain-only run (`--feeds outbox`), which makes no
+      Export Store round-trip at all. It must not start making one: the outbox
+      concurrency lock is separate from the export lock precisely because a
+      drain-only run writes no export tab, so writing `jobs` from here would let a
+      drain replace that tab while an export run holds the other lock. The change
+      is already live in ServiceTitan; the next jobs feed exports it, exactly as
+      before this feature existed. Naming the fix in the log is the point: a
+      contractor whose drain job asks for `feeds: "jobs,outbox"` gets the
+      write-back, at the cost of sharing the export lock.
+    - **Scope-denied** — ServiceTitan refused the `jobs` feed this run. No tab
+      exists (never granted) or the tab is frozen as evidence (revoked); either
+      way the write-back must not be the thing that writes it.
+    - **Failed** — the Sheets write did not land. Logged, not fatal, not an item
+      failure and not a non-zero exit: the items are performed, reported and
+      durable; only the tab is one cycle stale, which is where it was before.
+    """
+    effects = [
+        effect
+        for outcome in outcomes
+        if outcome.summary is not None
+        for effect in outcome.summary.write_backs
+    ]
+    if not effects:
+        return ""
+
+    jobs_denied = summary is not None and (
+        "jobs" in summary.scope_not_granted or "jobs" in summary.scope_revoked
+    )
+    if jobs_denied:
+        # ServiceTitan refused this tenant the `jobs` feed this run, so there is
+        # no tab for the write-back to update and it must not make one. Never
+        # granted means the Sheet has no `jobs` tab at all and a quiet skip
+        # intends to keep it that way; revoked means the tab is frozen at the
+        # last good run as evidence. Either way the rows this run would write
+        # were never fetched. `run.py` already withholds the handle — this
+        # branch only exists so the log names the real reason instead of
+        # advising a `feeds:` change that would fix nothing.
+        logger.warning(
+            "%d outbox write(s) performed this run change the jobs tab, but ServiceTitan "
+            "refused this tenant the `jobs` feed, so there is no tab to update. The writes "
+            "are live in ServiceTitan and will export as soon as the permission is in place.",
+            len(effects),
+        )
+        return f" write_back_scope_denied={len(effects)}"
+
+    handle = summary.jobs_write_back if summary is not None else None
+    if handle is None:
+        logger.warning(
+            "%d outbox write(s) performed this run change the jobs tab, but this run did "
+            "not run the `jobs` feed, so the tab was not updated in it. The writes are live "
+            "in ServiceTitan and the next `jobs` run exports them. To get them in the same "
+            "run, the drain job's feeds must be `jobs,outbox` — which also moves that job "
+            "onto the shared export concurrency lock.",
+            len(effects),
+        )
+        return f" write_back_deferred={len(effects)}"
+
+    try:
+        result = handle.apply(effects)
+    except Exception as exc:
+        # `Exception`, and swallowed. The outbox items behind these effects are
+        # already performed against ServiceTitan, already in the ledger and
+        # already reported succeeded — this runs after the drain, so there is
+        # nothing left to mark failed even if we wanted to. Re-raising would only
+        # turn a green run with a one-cycle-stale tab into a red run with the
+        # same tab.
+        logger.error(
+            "write-back into the jobs tab failed after %d successful outbox write(s): %s. "
+            "The items are NOT failed and will NOT be redelivered — they are performed and "
+            "reported. The tab is one feed cycle stale and the next `jobs` run corrects it.",
+            len(effects),
+            exc,
+        )
+        return " write_back_failed=1"
+
+    if result.unmatched:
+        logger.info(
+            "write-back: %d change(s) had no matching row in this run's jobs output "
+            "(appointment outside the window, or its job not in the raw cache yet); the "
+            "next jobs feed picks them up",
+            len(result.unmatched),
+        )
+    logger.info(
+        "write-back: applied %d outbox change(s) to the jobs tab (%d row(s) changed)",
+        len(effects) - len(result.unmatched),
+        result.rows_changed,
+    )
+    return (
+        f" write_back_applied={len(effects) - len(result.unmatched)} "
+        f"write_back_rows_changed={result.rows_changed}"
+    )
 
 
 def _ledger_was_unwritable(outcomes: list[LaneOutcome]) -> bool:

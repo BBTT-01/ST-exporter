@@ -557,3 +557,86 @@ class TestAnUnwritableLedgerStopsEveryLaneNotJustTheOneThatHitIt:
         skipped = [r.getMessage() for r in caplog.records if "SKIPPED ENTIRELY" in r.getMessage()]
         assert len(skipped) == 2, skipped
         assert "truequote" in skipped[0] and "profitwizard" in skipped[1]
+
+
+class TestWriteBackCollection:
+    """The drain COLLECTS jobs-tab effects; it never applies them (ticket 17).
+
+    Applying is a Sheets write, and a Sheets write that fails must not be able to
+    turn a succeeded item into a failed one. Keeping the two apart here is what
+    makes that structural rather than a matter of catching the right exception.
+    """
+
+    @staticmethod
+    def _assignment(item_id: str = "1", key: str = "key-1") -> OutboxItem:
+        return OutboxItem(
+            id=item_id,
+            idempotency_key=key,
+            kind="assign_technician",
+            payload={"jobAppointmentId": 100, "job_id": 1, "technician_ids_to_add": [901]},
+        )
+
+    def test_a_performed_assignment_yields_its_jobs_tab_effect(self) -> None:
+        item = self._assignment()
+        lane = _lane([item], product="profitwizard")
+        summary = drain_outbox(MagicMock(), lane, OutboxLedger(InMemorySheetsStore()))
+
+        assert summary.succeeded == 1
+        assert [(e.appointment_id, e.assigned) for e in summary.write_backs] == [("100", ("901",))]
+
+    def test_a_failed_item_yields_nothing(self) -> None:
+        def _raise(client, item):
+            raise RuntimeError("servicetitan 500")
+
+        lane = _lane([self._assignment()], product="profitwizard", perform=_raise)
+        summary = drain_outbox(MagicMock(), lane, OutboxLedger(InMemorySheetsStore()))
+
+        assert summary.failed == 1
+        assert summary.write_backs == []
+
+    def test_a_replay_yields_nothing(self) -> None:
+        """A replay's ServiceTitan write happened on an earlier run, whose own feed
+        has long since exported it. Re-applying it would be a Sheets write that
+        changes nothing."""
+        item = self._assignment()
+        ledger = OutboxLedger(InMemorySheetsStore())
+        lane = _lane([item, item], product="profitwizard")
+        summary = drain_outbox(MagicMock(), lane, ledger)
+
+        assert (summary.succeeded, summary.replayed) == (1, 1)
+        assert len(summary.write_backs) == 1
+
+    def test_an_item_whose_effect_cannot_be_read_still_succeeds(self) -> None:
+        item = OutboxItem(
+            id="1", idempotency_key="key-1", kind="assign_technician", payload={"junk": True}
+        )
+        lane = _lane([item], product="profitwizard")
+        summary = drain_outbox(MagicMock(), lane, OutboxLedger(InMemorySheetsStore()))
+
+        assert summary.succeeded == 1
+        assert summary.write_backs == []
+        lane.report_success.assert_called_once_with(item, "st-1")
+        lane.report_failure.assert_not_called()
+
+    def test_a_ledger_flush_failure_keeps_the_effect_of_the_item_it_reported(self) -> None:
+        """That item IS reported succeeded (see the flush-failure branch), so its
+        ServiceTitan write is real and its tab row must still be corrected."""
+        store = InMemorySheetsStore()
+
+        def boom(tab_name: str, grid: list[list[str]]) -> None:
+            raise RuntimeError("sheets 429")
+
+        store.replace_grid = boom  # type: ignore[method-assign]
+        item = self._assignment()
+        lane = _lane([item], product="profitwizard")
+        summary = drain_outbox(MagicMock(), lane, OutboxLedger(store))
+
+        assert summary.succeeded == 1
+        lane.report_success.assert_called_once_with(item, "st-1")
+        assert [e.appointment_id for e in summary.write_backs] == ["100"]
+
+    def test_nothing_in_the_drain_ever_writes_a_tab_other_than_the_ledger(self) -> None:
+        store = _RecordingStore()
+        lane = _lane([self._assignment()], product="profitwizard")
+        drain_outbox(MagicMock(), lane, OutboxLedger(store))
+        assert set(store.tabs) == {"_outbox_ledger"}
