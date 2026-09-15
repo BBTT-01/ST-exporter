@@ -511,3 +511,23 @@ Columns that are legitimately blank for a whole tenant are listed in `ALL_BLANK_
 with the reason, per tab. **Add to that list only for a column that is optional by
 contract** — never to quiet a column from this document, which is precisely what
 the detector exists to find.
+
+## The contract guard is advisory until CI is a required status check
+
+`.github/workflows/ci.yml`, `docs/export-contract.md` ("What CI cannot do for itself")
+
+Nothing in this repository can make its own CI run. GitHub honours `[skip ci]`,
+`[ci skip]` and `[no ci]` in a head commit message and does not start the workflow
+at all — and a workflow that never ran is not a failed one, so a pull request
+carrying that text is mergeable by default. `if:` conditions cannot help: they are
+evaluated only once a run exists.
+
+**Human action, outside this repo:** Settings → Branches → branch protection rule
+for `main` → "Require status checks to pass before merging" → add `test`. A
+required check that never reported blocks the merge, which is what turns the
+contract fixtures, the published register and the append-only anchor from a
+courtesy into a gate. Until that is set, every one of them is advisory — including
+the anchor, whose whole purpose is to be the one check the branch cannot subvert.
+
+There is no in-repo tripwire for this, deliberately: any test that tried to assert
+it would itself be running inside the run that was skipped.

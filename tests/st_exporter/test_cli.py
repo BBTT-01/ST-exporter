@@ -429,3 +429,115 @@ class TestTheSummaryLineNamesTheImagePass:
         line = self._summary(ImageUploadSummary(too_large=2, unsupported=5))
         assert "images_too_large=2" in line
         assert "images_unsupported=5" in line
+
+
+class TestAnUnwritableLedgerIsNotASilentlyGreenRun:
+    """The failure the cross-lane fix introduced one file over.
+
+    Skipping a lane when the shared ledger is unwritable is correct — it is what
+    stops each remaining lane performing one more unledgered ServiceTitan write.
+    But a skipped lane claimed, performed and reported nothing and returned
+    `DrainSummary(0, 0, 0, 0)` with `error=None`: byte-identical, in the summary
+    line, to a lane whose queue was empty. No annotation, and `cli.py` exited
+    non-zero only for a config error.
+
+    So a protected, deleted or quota-hit `_outbox_ledger` tab meant two products'
+    bookings and leads queued INDEFINITELY while every Actions run stayed green —
+    the same "invisible warning in a green run" the blank-column annotation exists
+    to prevent.
+    """
+
+    def _outcomes(self) -> list[LaneOutcome]:
+        return [
+            LaneOutcome(
+                product="traderated",
+                summary=DrainSummary(1, 1, 0, 0, ledger_unwritable=True),
+            ),
+            LaneOutcome(
+                product="truequote",
+                summary=DrainSummary(
+                    0, 0, 0, 0, skipped_ledger_unwritable=True, ledger_unwritable=True
+                ),
+            ),
+            LaneOutcome(
+                product="profitwizard",
+                summary=DrainSummary(
+                    0, 0, 0, 0, skipped_ledger_unwritable=True, ledger_unwritable=True
+                ),
+            ),
+        ]
+
+    def _run(self, monkeypatch, outcomes):  # type: ignore[no-untyped-def]
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "jobs,outbox"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            patch("st_exporter.cli._drain_outboxes", return_value=outcomes),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        return exc_info.value.code
+
+    def test_the_run_exits_non_zero(self, monkeypatch, capsys) -> None:
+        """The drain is the last thing the run does and every export write is
+        already committed to the Sheet, so failing here costs nothing — and it is
+        the only channel a queue going nowhere has."""
+        assert self._run(monkeypatch, self._outcomes()) != 0
+
+    def test_the_summary_line_distinguishes_a_skipped_lane_from_an_idle_one(
+        self, monkeypatch, capsys
+    ) -> None:
+        self._run(monkeypatch, self._outcomes())
+        out = capsys.readouterr().out
+        assert "ledger_unwritable=1" in out
+        assert "truequote_skipped=1" in out
+        assert "profitwizard_skipped=1" in out
+        # The lane that DID work is not marked skipped.
+        assert "traderated_skipped=1" not in out
+
+    def test_an_idle_lane_produces_neither_marker(self, monkeypatch, capsys) -> None:
+        """The counters are identical to the starved case, so the markers are the
+        only thing carrying the difference — and they must not cry wolf."""
+        idle = [
+            LaneOutcome(product="truequote", summary=DrainSummary(0, 0, 0, 0)),
+            LaneOutcome(product="profitwizard", summary=DrainSummary(0, 0, 0, 0)),
+        ]
+        assert self._run(monkeypatch, idle) == 0
+        out = capsys.readouterr().out
+        assert "truequote_claimed=0 truequote_succeeded=0" in out
+        assert "_skipped=1" not in out
+        assert "ledger_unwritable" not in out
+
+    def test_a_single_lane_run_reports_it_too(self, monkeypatch, capsys) -> None:
+        """There is no later lane to be skipped and carry the news, so the lane
+        that DISCOVERS the unwritable ledger has to."""
+        outcomes = [
+            LaneOutcome(
+                product="traderated",
+                summary=DrainSummary(2, 1, 0, 0, ledger_unwritable=True),
+            )
+        ]
+        assert self._run(monkeypatch, outcomes) != 0
+        assert "ledger_unwritable=1" in capsys.readouterr().out
+
+    def test_it_is_announced_to_actions_as_an_error_not_a_warning(
+        self, monkeypatch, capsys
+    ) -> None:
+        """A red annotation, because nothing here is a suspicion: work is not
+        getting done and will not get done on the next run either."""
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+        self._run(monkeypatch, self._outcomes())
+        out = capsys.readouterr().out
+        annotations = [line for line in out.splitlines() if line.startswith("::")]
+        assert annotations, "a starved queue in a run nobody opens is the whole failure"
+        assert annotations[0].startswith("::error title=Outbox ledger unwritable::")
+        assert "truequote" in annotations[0] and "profitwizard" in annotations[0]
+
+    def test_it_is_logged_at_error_naming_the_starved_products(self, monkeypatch, caplog) -> None:
+        with caplog.at_level(logging.ERROR):
+            self._run(monkeypatch, self._outcomes())
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("LEDGER UNWRITABLE" in message for message in errors)
+        assert any("truequote, profitwizard" in message for message in errors)

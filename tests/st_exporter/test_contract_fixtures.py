@@ -350,6 +350,46 @@ def test_the_version_the_code_writes_has_a_published_directory() -> None:
     )
 
 
+@pytest.mark.parametrize("contract", contracts.FEEDS, ids=lambda c: c.feed)
+def test_a_live_versions_registered_files_are_exactly_the_tabs_the_code_declares(
+    contract: contracts.FeedContract,
+) -> None:
+    """A tab REMOVED from a released version is as breaking as one renamed.
+
+    The byte-identity test above only looks at files that are both registered and
+    on disk, and the generator only consulted the register for files it still
+    produced — so deleting a `TabContract` from a released feed left the fixture
+    and its register entry sitting there, unchanged and therefore unremarked,
+    while the exporter stopped writing the tab. A consumer's tests keep passing
+    against a file that now describes nothing. This asserts the set both ways:
+    every registered file is still produced, and every produced file is
+    registered.
+
+    Only for versions the code still WRITES. A retired version's directory stays
+    forever by design and legitimately has no code behind it any more.
+    """
+    published = _published()
+    registered = set(published.get(contract.version, {}))
+    declared = {f"{tab.name}.json" for tab in contract.tabs}
+    assert registered == declared, (
+        f"THE '{contract.feed}' FEED NO LONGER WRITES THE TABS {contract.version} WAS "
+        f"RELEASED WITH.\n"
+        f"  registered as released: {sorted(registered)}\n"
+        f"  declared in the code:   {sorted(declared)}\n"
+        f"  no longer produced:     {sorted(registered - declared)}\n"
+        f"  not registered:         {sorted(declared - registered)}\n"
+        f"Removing a tab is a BREAKING change and nothing about it is loud: the "
+        f"manifest simply stops mentioning it, the committed fixture stays on disk "
+        f"unchanged, and every consumer pinned to {contract.version} keeps reading a "
+        f"tab the exporter no longer writes — ZERO ROWS, and `_meta` still saying "
+        f"{contract.version}.\n"
+        f"{contracts.published_bump_hint(contract.version)}, then "
+        f"{contracts.REGENERATE_COMMAND}: {contract.version} keeps its directory for "
+        f"consumers still pinned to it, and the new version describes the tabs that "
+        f"actually exist."
+    )
+
+
 # --- the generator's half of the same guard -----------------------------------
 #
 # The tests above catch a released fixture that has already been changed. These
@@ -381,6 +421,52 @@ def _tamper_with_the_released_jobs_sha(root: Path) -> None:
     document = json.loads(path.read_text(encoding="utf-8"))
     document["versions"]["jobs.v2"]["jobs.json"] = "0" * 64
     path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+
+def _rename_a_column_in_the_generated_grid(module: Any) -> None:
+    """Stand in for the source-code edit itself: what `build_files()` produces for
+    `jobs.v2` now spells `job_number` as `job_no`.
+
+    Patching the generator's own output rather than `format.py` keeps the repro
+    exact — this is byte-for-byte what a rename produces — while leaving the
+    installed package untouched for every other test in the session.
+    """
+    real = module.build_files
+
+    def patched() -> dict[str, str]:
+        files = real()
+        key = f"{contracts.FIXTURE_ROOT}/jobs.v2/jobs.json"
+        files[key] = files[key].replace('"job_number"', '"job_no"')
+        return files
+
+    module.build_files = patched
+
+
+def _retype_a_cell_in_the_generated_grid(module: Any) -> None:
+    """A genuine typo fix: one cell's TEXT differs, and nothing structural does."""
+    real = module.build_files
+
+    def patched() -> dict[str, str]:
+        files = real()
+        key = f"{contracts.FIXTURE_ROOT}/jobs.v2/jobs.json"
+        assert "Fixture Customer Ltd" in files[key]
+        files[key] = files[key].replace("Fixture Customer Ltd", "Fixture Customer Limited")
+        return files
+
+    module.build_files = patched
+
+
+def _drop_a_produced_tab(module: Any, relative: str) -> None:
+    """Stand in for deleting a `TabContract` from `contracts.py`: the code stops
+    producing that tab, and says nothing about the fixture already on disk."""
+    real = module.build_files
+
+    def patched() -> dict[str, str]:
+        files = real()
+        del files[f"{contracts.FIXTURE_ROOT}/{relative}"]
+        return files
+
+    module.build_files = patched
 
 
 class TestTheGeneratorRefusesToRewriteAPublishedVersion:
@@ -432,6 +518,77 @@ class TestTheGeneratorRefusesToRewriteAPublishedVersion:
         released = (root / contracts.FIXTURE_ROOT / "jobs.v2" / "jobs.json").read_bytes()
         assert register["versions"]["jobs.v2"]["jobs.json"] == hashlib.sha256(released).hexdigest()
 
+    def test_republish_will_not_land_a_column_rename_however_the_changelog_reads(
+        self, sandbox: tuple[Any, Path], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The CHANGELOG line never constrained anything, and now it does not have to.
+
+        The reviewer's repro: rename `job_number` to `job_no`, append
+        `- republish jobs.v2: fixed a typo` — wording the refusal message itself
+        hands you — and `--republish jobs.v2` exited 0 with `job_no` in a fixture
+        still stamped `jobs.v2`. The generator cannot tell a typo from a contract
+        change by reading prose, so it no longer tries: it compares the released
+        file with the new payload and refuses anything structural.
+        """
+        module, root = sandbox
+        _rename_a_column_in_the_generated_grid(module)
+        (root / "CHANGELOG.md").write_text(
+            "# Changelog\n\n- republish jobs.v2: fixed a typo\n", encoding="utf-8"
+        )
+
+        assert _run(module, "--republish", "jobs.v2") == 2
+
+        printed = capsys.readouterr().out
+        assert "THIS IS NOT A TYPO FIX" in printed
+        assert "'columns' would change" in printed
+        committed = (root / contracts.FIXTURE_ROOT / "jobs.v2" / "jobs.json").read_text("utf-8")
+        assert '"job_no"' not in committed
+
+    def test_republish_will_not_drop_a_tab_from_a_released_version(
+        self, sandbox: tuple[Any, Path], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        module, root = sandbox
+        _drop_a_produced_tab(module, "pricebook.v1/pricebook.equipment.json")
+        (root / "CHANGELOG.md").write_text(
+            "# Changelog\n\n- republish pricebook.v1: tidy-up\n", encoding="utf-8"
+        )
+
+        assert _run(module, "--republish", "pricebook.v1") == 2
+        assert "may not add or remove a tab" in capsys.readouterr().out
+
+    def test_republish_still_lands_a_genuine_typo_in_a_cell(
+        self, sandbox: tuple[Any, Path]
+    ) -> None:
+        """The escape hatch has to keep working, or the next person routes around it.
+
+        Cell TEXT only: same columns, same row_key, same grain, same row count.
+        """
+        module, root = sandbox
+        _retype_a_cell_in_the_generated_grid(module)
+        (root / "CHANGELOG.md").write_text(
+            "# Changelog\n\n- republish jobs.v2: expanded an abbreviated fixture name\n",
+            encoding="utf-8",
+        )
+
+        assert _run(module, "--republish", "jobs.v2") == 0
+
+        committed = (root / contracts.FIXTURE_ROOT / "jobs.v2" / "jobs.json").read_text("utf-8")
+        assert "Fixture Customer Limited" in committed
+        register = json.loads((root / contracts.PUBLISHED_PATH).read_text(encoding="utf-8"))
+        assert (
+            register["versions"]["jobs.v2"]["jobs.json"]
+            == hashlib.sha256(committed.encode("utf-8")).hexdigest()
+        )
+
+    def test_a_cell_typo_is_still_refused_without_the_republish_flag(
+        self, sandbox: tuple[Any, Path]
+    ) -> None:
+        """Structurally-typo-only is a NARROWING of `--republish`, not a new way in:
+        a changed cell is still a changed released byte and still needs the flag."""
+        module, _root = sandbox
+        _retype_a_cell_in_the_generated_grid(module)
+        assert _run(module) == 2
+
     def test_deleting_the_register_does_not_rebuild_it_from_todays_code(
         self, sandbox: tuple[Any, Path], capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -443,6 +600,79 @@ class TestTheGeneratorRefusesToRewriteAPublishedVersion:
         assert _run(module) == 2
         assert "IS MISSING" in capsys.readouterr().out
         assert not (root / contracts.PUBLISHED_PATH).exists()
+
+    def test_removing_a_tab_from_a_released_version_is_refused(
+        self, sandbox: tuple[Any, Path], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The asymmetry that made this an oversight rather than a decision.
+
+        ADDING a tab to a released version was already refused (the register has
+        no sha for it). REMOVING one was not: the register was consulted only for
+        files the code still PRODUCES, so a registered file the code had stopped
+        producing was never a violation, the generator never deleted it, and the
+        byte-identity test still found it unchanged on disk. Deleting the
+        `pricebook.equipment` contract regenerated cleanly at `pricebook.v1` —
+        the manifest quietly dropped the tab while TrueQuote's tests against
+        `pricebook.v1` kept passing for a tab the exporter no longer wrote. Zero
+        rows, no error, `_meta` still saying `pricebook.v1`.
+        """
+        module, root = sandbox
+        _drop_a_produced_tab(module, "pricebook.v1/pricebook.equipment.json")
+
+        assert _run(module) == 2
+
+        printed = capsys.readouterr().out
+        assert "pricebook.v1 is published — bump to pricebook.v2" in printed
+        assert "the code no longer produces it" in printed
+        # And the fixture it would have orphaned is still exactly where it was.
+        assert (
+            root / contracts.FIXTURE_ROOT / "pricebook.v1" / "pricebook.equipment.json"
+        ).exists()
+
+    def test_removing_a_tab_is_refused_in_check_mode_too(self, sandbox: tuple[Any, Path]) -> None:
+        """CI runs `--check`; it must not be the lenient path for this either."""
+        module, _root = sandbox
+        _drop_a_produced_tab(module, "pricebook.v1/pricebook.equipment.json")
+        assert _run(module, "--check") == 2
+
+    def test_deleting_one_versions_key_from_the_register_is_refused(
+        self, sandbox: tuple[Any, Path], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The "delete the register" bypass, one level down and two lines long.
+
+        A missing FILE entry was already a violation; a missing VERSION entry was
+        read as "brand new, nothing published under it yet" — even with that
+        version's directory sitting on disk. So deleting `"jobs.v2"` from the
+        register and regenerating re-baselined jobs.v2 to whatever the code
+        produced that day, renamed column included, and left the manifest still
+        saying `jobs.v2`. A directory that already exists is not brand new.
+        """
+        module, root = sandbox
+        path = root / contracts.PUBLISHED_PATH
+        document = json.loads(path.read_text(encoding="utf-8"))
+        del document["versions"]["jobs.v2"]
+        path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+        assert _run(module) == 2
+        assert "not listed in" in capsys.readouterr().out
+
+    def test_a_deleted_version_key_is_refused_even_with_a_column_rename_riding_along(
+        self, sandbox: tuple[Any, Path]
+    ) -> None:
+        """The reviewer's repro end to end: rename a column, delete only that
+        version's key, regenerate. It used to exit 0 with `job_no` in a fixture
+        still stamped `jobs.v2`."""
+        module, root = sandbox
+        _rename_a_column_in_the_generated_grid(module)
+        path = root / contracts.PUBLISHED_PATH
+        document = json.loads(path.read_text(encoding="utf-8"))
+        del document["versions"]["jobs.v2"]
+        path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+        assert _run(module) == 2
+        committed = (root / contracts.FIXTURE_ROOT / "jobs.v2" / "jobs.json").read_text("utf-8")
+        assert '"job_no"' not in committed
+        assert '"job_number"' in committed
 
     def test_an_untouched_suite_regenerates_cleanly(self, sandbox: tuple[Any, Path]) -> None:
         """The guard must be invisible when nothing changed — a check that cries
@@ -646,9 +876,12 @@ _SOURCE_TEXT = "\n".join(
 #: A word worth checking: two or more letters. Single letters (the ``T`` of an ISO
 #: timestamp, a state code's halves) carry no customer identity.
 _WORD = re.compile(r"[A-Za-z]{2,}")
-#: A number worth checking: three or more digits. Shorter runs are the minutes and
-#: months of a formatted date, and every two-digit number appears in any file.
-_NUMBER = re.compile(r"\d{3,}")
+#: A number worth checking: two or more digits. It was three, which quietly
+#: exempted every price under $1000 with cents — ``89.95`` tokenises to ``89`` and
+#: ``95``, neither of which is three digits long, so the cell carried no tokens at
+#: all (see ``_traces_to_the_source_records``). Two-digit runs are noisier, but a
+#: noisy guard that asks a human to look is the failure mode we want.
+_NUMBER = re.compile(r"\d{2,}")
 
 
 def _traces_to_the_source_records(cell: str) -> bool:
@@ -658,12 +891,38 @@ def _traces_to_the_source_records(cell: str) -> bool:
     address from its parts, joins category ids with commas, formats a timestamp
     from a date constant — and a composed value is legitimate even though the whole
     string appears nowhere.
+
+    **The last chance requires at least one token.** ``all([])`` is ``True``, so
+    while this ended in a bare ``all(...)`` a cell that produced no tokens passed
+    unconditionally: ``89.95``, ``0.99``, ``42``, ``X9`` and ``q`` were all waved
+    through — i.e. every price the pricebook is most likely to carry was exempt
+    from the one guard that claims to cover prices. A cell with nothing checkable
+    in it has not been checked, so it falls through to the offender list and a
+    human decides.
+
+    Two honest limits, because a guard nobody knows the edges of gets trusted
+    past them (``test_the_provenance_guards_documented_limits_are_real`` pins
+    both):
+
+    - **short numbers.** Tokens are matched one at a time, because the exporter
+      FORMATS numbers — ``1234.0`` in a source record is ``1234.00`` in a cell —
+      so requiring the whole string would flag every legitimate price. The cost
+      is that a short value whose digit runs all appear somewhere in the source
+      text (``12.50`` → ``12``, ``50``) traces without anyone having transcribed
+      it.
+    - **common-word prose.** The haystack is the TEXT of
+      ``tests/st_exporter/fixtures/*.py``, comments and all, so common English
+      words are in it and a memo built only from them can pass.
+
+    Neither weakens what this is FOR: a pasted response carries names, streets,
+    emails and ids, and none of those are common words or two-digit runs.
     """
     if cell in _SOURCE_TEXT:
         return True
     if all(part.strip() in _SOURCE_TEXT for part in cell.split(",") if part.strip()):
         return True
-    return all(token in _SOURCE_TEXT for token in (*_WORD.findall(cell), *_NUMBER.findall(cell)))
+    tokens = [*_WORD.findall(cell), *_NUMBER.findall(cell)]
+    return bool(tokens) and all(token in _SOURCE_TEXT for token in tokens)
 
 
 def test_every_fixture_cell_traces_back_to_a_synthetic_source_record() -> None:
@@ -706,3 +965,70 @@ def test_the_manifests_no_real_customer_data_claim_is_the_one_the_tests_back() -
     """The flag is a claim to a consumer; the test above is what makes it true."""
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     assert manifest["contains_real_customer_data"] is False
+
+
+@pytest.mark.parametrize(
+    "cell",
+    ["89.95", "874.19", "87.31", "0.77", "Z7", "X9"],
+    ids=lambda v: str(v),
+)
+def test_a_cell_with_nothing_checkable_in_it_does_not_pass_the_provenance_guard(
+    cell: str,
+) -> None:
+    """`all([])` is `True`, and that is how prices got exempted from the price guard.
+
+    The third fallback is `all(...)` over a cell's word and number tokens. With
+    numbers matched at three digits or more, a cell like `89.95` or `X9` yielded
+    an EMPTY token list — and an empty `all()` is vacuously true, so it passed
+    unconditionally. That is exactly the class of value the guard's own docstring
+    claims to be the only cover for: a price has no recognisable shape, so no
+    regex can ever guard it and provenance is all there is.
+
+    Now a cell has to produce at least one token, and every token has to be in the
+    synthetic source records. None of these strings is.
+    """
+    assert cell not in _SOURCE_TEXT, f"{cell!r} is in the fixtures; pick another literal"
+    assert not _traces_to_the_source_records(cell)
+
+
+@pytest.mark.parametrize(
+    "cell",
+    ["Fixture Customer Ltd", "1 Main St, Springfield, IL, 62701", "2026-09-03T09:00:00-05:00"],
+    ids=lambda v: str(v),
+)
+def test_the_tightened_guard_still_passes_legitimate_composed_cells(cell: str) -> None:
+    """A guard that cries wolf on every run is a guard somebody deletes.
+
+    These are the three composition shapes the fallbacks exist for: a literal, an
+    address joined from its parts, and a timestamp formatted from a date constant.
+    """
+    assert _traces_to_the_source_records(cell)
+
+
+def test_the_provenance_guards_documented_limits_are_real() -> None:
+    """Two limits, stated rather than implied, so nobody mistakes this for a filter.
+
+    1. **Short numbers.** Tokens are matched individually, because the exporter
+       FORMATS numbers (`1234.0` in a source record becomes `1234.00` in a cell),
+       so a whole-string match would flag every legitimate price. The cost is that
+       a short value whose two- and three-digit runs all happen to appear
+       somewhere in the source text passes without having been transcribed.
+    2. **Common-word prose.** The haystack is the TEXT of
+       `tests/st_exporter/fixtures/*.py`, comments included, so common English
+       words are in it and a free-text memo built only from them can trace.
+
+    Neither weakens what the guard is FOR: a pasted response carries names,
+    streets, emails and ids, and none of those are common words or short numbers.
+    """
+    assert _traces_to_the_source_records("12.50"), "limit 1: short numeric cells can trace"
+    common = (
+        "the and for with that this from have been will not but out one all any can has had "
+        "job item name date time code type list new old set get run line unit part call "
+        "back door work crew team"
+    ).split()
+    assert [word for word in common if word in _SOURCE_TEXT], (
+        "No common English word appears in the fixture source text at all. That would "
+        "make this guard stronger than documented — update the note in "
+        "`_traces_to_the_source_records` and docs/export-contract.md rather than "
+        "deleting this test."
+    )

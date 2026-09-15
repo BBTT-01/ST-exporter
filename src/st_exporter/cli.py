@@ -10,7 +10,7 @@ from st_cli.config import Settings, load_settings
 from st_cli.exceptions import STCLIError
 from st_exporter.config import ExporterSettings
 from st_exporter.images.client import TrueQuoteImageClient
-from st_exporter.logging_setup import logger
+from st_exporter.logging_setup import announce_to_actions, logger
 from st_exporter.outbox.drain import LaneOutcome, drain_lanes
 from st_exporter.outbox.lanes import build_lanes, close_lanes
 from st_exporter.outbox.ledger import OutboxLedger
@@ -92,6 +92,59 @@ def run_once(
         _warn_if_undrained()
 
     typer.echo(_summary_line(summary, outcomes))
+
+    if _ledger_was_unwritable(outcomes):
+        _announce_unwritable_ledger(outcomes)
+        # The drain is the LAST thing this run does and every export write is
+        # already committed to the Sheet, so failing here costs nothing and is
+        # the only channel a queue that is silently going nowhere has. A skipped
+        # lane claims, performs and reports nothing and returns all-zero counts —
+        # byte-identical to a lane with an empty queue — so without this a
+        # protected, deleted or quota-hit `_outbox_ledger` tab leaves two
+        # products' bookings and leads queued INDEFINITELY behind green runs.
+        raise typer.Exit(code=1)
+
+
+def _ledger_was_unwritable(outcomes: list[LaneOutcome]) -> bool:
+    return any(
+        outcome.summary is not None and outcome.summary.ledger_unwritable for outcome in outcomes
+    )
+
+
+def _announce_unwritable_ledger(outcomes: list[LaneOutcome]) -> None:
+    """Red-annotate a run whose ledger stopped accepting rows.
+
+    At `::error`, not `::warning`: nothing here is a suspicion. The shared
+    `_outbox_ledger` tab could not be written, so every lane after the one that
+    discovered it performed nothing at all, and will perform nothing on the next
+    run either, and the next — a permanently unwritable ledger (tab deleted, tab
+    protected, the service account's write quota gone) starves those queues
+    forever. The log line alone is invisible: a WARNING in a green run is the
+    exact failure the blank-column annotation exists for.
+    """
+    skipped = [
+        outcome.product
+        for outcome in outcomes
+        if outcome.summary is not None and outcome.summary.skipped_ledger_unwritable
+    ]
+    logger.error(
+        "OUTBOX LEDGER UNWRITABLE — the shared `_outbox_ledger` tab would not accept "
+        "rows this run%s. Nothing further was performed, and nothing will be performed "
+        "on any later run until the tab is writable again: items stay queued in each "
+        "app indefinitely. Check that the tab exists, is not protected, and that the "
+        "service account still has write access to the raw-cache spreadsheet.",
+        f", so {', '.join(skipped)} performed nothing at all" if skipped else "",
+    )
+    announce_to_actions(
+        "Outbox ledger unwritable",
+        (
+            "The shared _outbox_ledger tab would not accept rows"
+            + (f"; {', '.join(skipped)} drained NOTHING this run" if skipped else "")
+            + ". Queued bookings and leads are not being delivered and will keep "
+            "queueing until the tab is writable again."
+        ),
+        level="error",
+    )
 
 
 def _warn_if_undrained() -> None:
@@ -175,8 +228,19 @@ def _summary_line(summary: ExportSummary | None, outcomes: list[LaneOutcome]) ->
                 f"{outcome.product}_failed={counts.failed} "
                 f"{outcome.product}_replayed={counts.replayed}"
             )
+            if counts.skipped_ledger_unwritable:
+                # WITHOUT this the line above reads exactly like an idle lane —
+                # all four counters zero — and "this product delivered nothing
+                # because the ledger is broken" is indistinguishable from "this
+                # product had nothing queued". Same rule as pricebook_failed and
+                # images_stopped: the thing that changes what the zeros MEAN goes
+                # in the run's own output, not only in the log.
+                message += f" {outcome.product}_skipped=1"
         else:
             message += f" {outcome.product}_lane_error=1"
+
+    if any(o.summary is not None and o.summary.ledger_unwritable for o in outcomes):
+        message += " ledger_unwritable=1"
 
     return message.strip() or "nothing to do"
 

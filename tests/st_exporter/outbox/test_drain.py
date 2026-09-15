@@ -315,7 +315,9 @@ class TestLedgerFlushFailureAfterARealWrite:
         summary = drain_outbox(MagicMock(), lane, OutboxLedger(_FlushFailingStore()))
 
         # The write happened, so it counts as succeeded...
-        assert summary == DrainSummary(claimed=1, succeeded=1, failed=0, replayed=0)
+        assert summary == DrainSummary(
+            claimed=1, succeeded=1, failed=0, replayed=0, ledger_unwritable=True
+        )
         # ...and, crucially, the app was told, so it will not redeliver.
         lane.report_success.assert_called_once_with(item, "st-1")
 
@@ -333,7 +335,12 @@ class TestLedgerFlushFailureAfterARealWrite:
         outcomes = drain_lanes(MagicMock(), [lane], OutboxLedger(store))
         # A lane that performed and reported is a lane that ran, not a lane error.
         assert outcomes[0].error is None
-        assert outcomes[0].summary == DrainSummary(claimed=1, succeeded=1, failed=0, replayed=0)
+        # `ledger_unwritable` is set on the lane that DISCOVERS it, not only on the
+        # lanes skipped afterwards: a single-lane run has no later lane to carry
+        # the news, and the caller must still exit non-zero and annotate.
+        assert outcomes[0].summary == DrainSummary(
+            claimed=1, succeeded=1, failed=0, replayed=0, ledger_unwritable=True
+        )
         assert lane.report_success.called
 
         # Second run: the app has settled the item, so it is not reclaimed. Even
@@ -358,7 +365,9 @@ class TestLedgerFlushFailureAfterARealWrite:
         summary = drain_outbox(MagicMock(), lane, OutboxLedger(_FlushFailingStore(failures=99)))
 
         assert performs == ["i1"], "the second item must not be performed unledgerable"
-        assert summary == DrainSummary(claimed=2, succeeded=1, failed=0, replayed=0)
+        assert summary == DrainSummary(
+            claimed=2, succeeded=1, failed=0, replayed=0, ledger_unwritable=True
+        )
         lane.report_success.assert_called_once_with(items[0], "st-i1")
 
     def test_the_flush_failure_is_logged_at_error_with_the_idempotency_key(self, caplog) -> None:  # type: ignore[no-untyped-def]
@@ -473,11 +482,50 @@ class TestAnUnwritableLedgerStopsEveryLaneNotJustTheOneThatHitIt:
         )
         assert ledger.unwritable
         # Lane 1 performed, recorded nothing, and reported — so it is not redelivered.
-        assert outcomes[0].summary == DrainSummary(claimed=1, succeeded=1, failed=0, replayed=0)
-        # Lanes 2 and 3 did nothing at all, and said so rather than erroring.
+        assert outcomes[0].summary == DrainSummary(
+            claimed=1, succeeded=1, failed=0, replayed=0, ledger_unwritable=True
+        )
+        # Lanes 2 and 3 did nothing at all, and SAY SO. Before this flag a skipped
+        # lane returned DrainSummary(0, 0, 0, 0) with no error — byte-identical to
+        # a lane whose queue was simply empty — so a permanently unwritable ledger
+        # starved two products' queues indefinitely behind green runs. The counts
+        # alone cannot carry that; the flag is what the caller turns into
+        # `<product>_skipped=1`, a red annotation and a non-zero exit.
         for outcome in outcomes[1:]:
             assert outcome.error is None
-            assert outcome.summary == DrainSummary(claimed=0, succeeded=0, failed=0, replayed=0)
+            assert outcome.summary == DrainSummary(
+                claimed=0,
+                succeeded=0,
+                failed=0,
+                replayed=0,
+                skipped_ledger_unwritable=True,
+                ledger_unwritable=True,
+            )
+
+    def test_a_skipped_lane_is_distinguishable_from_an_idle_one(self) -> None:
+        """The whole finding in one assertion.
+
+        An idle lane and a starved lane both report claimed=succeeded=failed=
+        replayed=0 and error=None. If those two objects are equal, nothing
+        downstream — summary line, annotation, exit code — can tell a product
+        whose queue is empty from a product whose queue is going nowhere.
+        """
+        idle = _lane([], product="truequote")
+        idle_summary = drain_outbox(MagicMock(), idle, OutboxLedger(InMemorySheetsStore()))
+
+        starved_ledger = OutboxLedger(InMemorySheetsStore())
+        starved_ledger.mark_unwritable()
+        starved = _lane(
+            [OutboxItem(id="i1", idempotency_key="k1", kind="booking", payload={})],
+            product="truequote",
+        )
+        starved_summary = drain_outbox(MagicMock(), starved, starved_ledger)
+
+        assert idle_summary != starved_summary
+        assert not idle_summary.skipped_ledger_unwritable
+        assert not idle_summary.ledger_unwritable
+        assert starved_summary.skipped_ledger_unwritable
+        assert starved_summary.ledger_unwritable
 
     def test_the_skipped_lanes_neither_claim_nor_report(self) -> None:
         """Unclaimed and unreported is the correct outcome: the app's lease never

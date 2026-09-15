@@ -91,7 +91,37 @@ only file in the suite not derived from the current code:
   names the version to bump. `--republish <version>` exists for a genuine typo in
   a released fixture and needs a CHANGELOG line naming it;
 - deleting the register does not rebuild it from today's code: that was the
-  one-`rm` bypass, and it is refused too.
+  one-`rm` bypass, and it is refused too;
+- deleting ONE version's key is refused the same way — a version directory that
+  already exists on disk is not a brand-new version, and treating it as one
+  re-baselined exactly that version on the next run;
+- REMOVING a tab from a released version is refused, not just adding one. The
+  register is now checked in both directions: a file registered under a version
+  the code still writes, that the code no longer produces, is a violation.
+  Removing a tab used to regenerate cleanly at the same version — the manifest
+  dropped it, the fixture and its register entry stayed on disk, and a consumer
+  kept testing itself against a tab the exporter had stopped writing;
+- `--republish <version>` is now **structurally** typo-only. The released file
+  and the new payload are parsed and compared: if `columns`, `row_key`, `grain`,
+  the set of tabs or the number of rows would move, it is refused however the
+  CHANGELOG is worded. Only cell text may change. The CHANGELOG line remains as
+  the audit trail a consumer can find; it was never a gate, because free text
+  copied out of the refusal message cannot tell a transposed digit from a
+  renamed column;
+- CI adds the trust anchor the branch cannot provide for itself:
+  `scripts/check_register_append_only.py` diffs `published.json` against the base
+  branch and fails if any already-published `(version, file)` sha changed or
+  disappeared. Every other guard is judged by a file living in the branch under
+  review; this one is judged by `main`.
+
+**`contracts/fixtures/jobs.v2/jobs.json` changed bytes in this release**, before
+any tag carried it: the fixture's customer phone numbers were moved into the
+reserved `555-01xx` block during the scrub. No consumer can have fetched it — the
+suite post-dates `exporter-v0.2.8` and no `exporter-v0.2.9` tag exists — so this
+is not a republish and needs no version bump. It is recorded here anyway, because
+the rule this mechanism enforces is that a change to a released file leaves a
+trace a consumer can find, and a mechanism that exempts itself from its own rule
+is not one anybody should trust.
 
 Failure messages now lead with **bump the version**, and present regeneration as
 what you do afterwards. Leading with "regenerate" was pointing at the bypass.

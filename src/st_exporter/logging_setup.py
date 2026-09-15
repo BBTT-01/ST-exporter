@@ -38,13 +38,18 @@ def _escape(value: str) -> str:
     return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
-def announce_to_actions(title: str, message: str) -> None:
+def announce_to_actions(title: str, message: str, *, level: str = "warning") -> None:
     """Also surface ``message`` in the GitHub Actions UI, if that is where we are.
 
-    Two channels, because they answer different questions: the ``::warning``
-    annotation puts a yellow line on the run itself (visible without opening the
-    log of a green run — which is the whole problem), and the step summary is what
-    somebody reading the run afterwards sees first.
+    Two channels, because they answer different questions: the annotation puts a
+    coloured line on the run itself (visible without opening the log of a green
+    run — which is the whole problem), and the step summary is what somebody
+    reading the run afterwards sees first.
+
+    ``level`` is the Actions workflow-command name: ``warning`` for "this looks
+    wrong, check it", ``error`` for "work is not getting done" — a red annotation,
+    which is what a queue that is draining nothing needs. It changes the colour
+    only; neither one fails the step, so the caller still owns the exit code.
 
     A no-op outside Actions, and it NEVER raises: every caller is a detector, and a
     detector must not be able to fail the run it is watching.
@@ -52,7 +57,7 @@ def announce_to_actions(title: str, message: str) -> None:
     if not os.environ.get("GITHUB_ACTIONS"):
         return
     try:
-        print(f"::warning title={_escape(title)}::{_escape(message)}", flush=True)
+        print(f"::{level} title={_escape(title)}::{_escape(message)}", flush=True)
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
             with open(summary, "a", encoding="utf-8") as handle:

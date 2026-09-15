@@ -149,8 +149,45 @@ no fixture (see "Why `jobs` is v2 and not v1").
 than aspirational: it holds the sha256 of every file **as released**, the test
 suite asserts each released file still hashes to it, and
 `scripts/gen_contract_fixtures.py` REFUSES to rewrite a version listed there.
-Changing a released tab means a new version directory, always. (A genuine typo in
-a released fixture: `--republish <version>`, plus a CHANGELOG line.)
+Changing a released tab means a new version directory, always.
+
+Four things are refused, because each one was a way through:
+
+| Move | What used to happen |
+|---|---|
+| A released file's bytes change | refused already |
+| A tab is **added** to a released version | refused already |
+| A tab is **removed** from a released version | regenerated cleanly at the same version — the manifest dropped the tab while its fixture and register entry stayed on disk, so consumers kept testing against a tab the exporter no longer wrote |
+| One version's key is deleted from `published.json` | that version was treated as brand new and silently re-baselined on the next run |
+
+A genuine typo in a released fixture is still fixable: `--republish <version>`,
+plus a CHANGELOG line naming it. But the CHANGELOG line is an **audit trail, not
+the gate** — it is free text, and the refusal message hands you the wording to
+paste. The gate is structural: the released file and the new payload are parsed
+and compared, and if `columns`, `row_key`, `grain`, the set of tabs or the number
+of rows would move, the republish is refused however it is described. **Only cell
+text may change.**
+
+### What CI cannot do for itself
+
+Two limits, both outside this repository, both owned by whoever administers it:
+
+1. **`.github/workflows/ci.yml` must be a required status check.** GitHub honours
+   `[skip ci]`, `[ci skip]` and `[no ci]` in a head commit message and does not
+   start the run at all — and a workflow that never ran is not a failed one, so a
+   PR carrying that in its commit message is mergeable by default. No `if:`
+   condition can prevent this, because conditions are evaluated only once a run
+   exists. Fix: **Settings → Branches → branch protection for `main` → Require
+   status checks to pass before merging → add `test`.** Until that is set, every
+   guard described on this page is advisory.
+2. **The register is a file in the branch under review.** The generator's
+   refusals and the test suite's assertions are all judged against this branch's
+   copy of `published.json`, so none of them can tell a correct register from one
+   that was edited to say what the branch needed. The `published register is
+   append-only vs the base branch` CI step closes that: it reads the copy on the
+   **base branch** — already merged and released — and fails if any published
+   `(version, file)` sha changed or disappeared. It is the only check here whose
+   authority comes from outside the branch, and it too depends on (1).
 
 Each file:
 
@@ -293,7 +330,18 @@ branch**, not before the PR:
 These are backstops for steps 3-6, not a substitute for them. The third one is
 structural rather than pattern-matching, but it still cannot tell you that
 `Acme Overhead Doors` is somebody's actual customer — only that the value was
-typed into this repository deliberately.
+typed into this repository deliberately. Its two known edges, both pinned by a
+test so they cannot quietly widen:
+
+- **short numbers.** Cells are checked token by token, because the exporter
+  formats numbers (`1234.0` becomes `1234.00`), so a short value whose two- and
+  three-digit runs all happen to appear somewhere in the source text passes.
+- **common-word prose.** The haystack is the source files' text, comments
+  included, so a free-text memo written only in common English words can trace.
+
+Neither touches what the guard is for — a pasted response carries names, streets,
+emails and ids — but neither should be mistaken for coverage of prose or prices
+in general.
 
 ## Changing the contract (producer side)
 
@@ -311,4 +359,5 @@ typed into this repository deliberately.
    which is the intended order of events, not a problem.
 
 Fixtures are generated, never edited by hand. A hand edit is caught by the
-manifest checksums.
+manifest checksums, and a hand edit to `published.json` itself is caught by the
+append-only check against the base branch (see "What CI cannot do for itself").

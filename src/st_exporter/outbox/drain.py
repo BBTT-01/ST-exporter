@@ -54,6 +54,23 @@ class DrainSummary:
     failed: int
     replayed: int  # already in the ledger; re-reported without a new ST write
 
+    #: This lane did NOTHING because the shared ledger was already unwritable
+    #: when its turn came. Without this flag a skipped lane is byte-identical to
+    #: an idle one — ``DrainSummary(0, 0, 0, 0)`` either way — and a protected or
+    #: deleted ``_outbox_ledger`` tab starves two of three products' queues
+    #: indefinitely while every Actions run stays green. That is the same
+    #: "invisible warning in a green run" failure the blank-column annotation
+    #: exists for; the caller turns this into a ``<product>_skipped=1`` counter,
+    #: an annotation and a non-zero exit.
+    skipped_ledger_unwritable: bool = False
+
+    #: The ledger was not accepting rows by the time this lane finished — either
+    #: it was already unwritable (``skipped_ledger_unwritable``) or this lane is
+    #: the one whose flush failed. Set on the lane that discovers it too, so that
+    #: a single-lane run still reports the condition: there is no later lane to
+    #: be skipped and carry the news.
+    ledger_unwritable: bool = False
+
 
 @dataclass
 class LaneOutcome:
@@ -114,7 +131,14 @@ def drain_outbox(
             "will be redelivered once the ledger is writable again.",
             lane.product,
         )
-        return DrainSummary(claimed=0, succeeded=0, failed=0, replayed=0)
+        return DrainSummary(
+            claimed=0,
+            succeeded=0,
+            failed=0,
+            replayed=0,
+            skipped_ledger_unwritable=True,
+            ledger_unwritable=True,
+        )
 
     items = lane.claim(limit)
     succeeded = failed = replayed = 0
@@ -261,7 +285,13 @@ def drain_outbox(
         failed,
         replayed,
     )
-    return DrainSummary(claimed=len(items), succeeded=succeeded, failed=failed, replayed=replayed)
+    return DrainSummary(
+        claimed=len(items),
+        succeeded=succeeded,
+        failed=failed,
+        replayed=replayed,
+        ledger_unwritable=ledger.unwritable,
+    )
 
 
 def drain_lanes(

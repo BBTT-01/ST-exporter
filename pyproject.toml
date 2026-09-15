@@ -25,6 +25,15 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
     "time-machine>=2.13",
+    # Imported directly by the test suite, not by src/. Both arrive transitively
+    # today (pyyaml via fastmcp, cryptography via google-auth), so a fresh venv
+    # passes without them — until a dependency bump drops one and the guards that
+    # depend on them stop being red or green and start being a COLLECTION ERROR:
+    # tests/st_exporter/test_workflow.py parses .github/workflows/*.yml with
+    # `yaml`, and test_sheets.py builds a service-account key with `cryptography`.
+    # A guard that disappears is worse than one that fails.
+    "pyyaml>=6.0",
+    "cryptography>=42.0",
 ]
 
 [project.scripts]
