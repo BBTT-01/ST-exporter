@@ -103,6 +103,18 @@ These are part of the contract, not implementation detail:
 - Ids are text, never coerced to integers.
 - A row with a blank key column is dropped by the exporter, not written — so
   `_meta.row_count` means what a reconciler thinks it means.
+- **An absent TAB means absent, not empty.** The same rule one level up. Every
+  feed job runs on every connector's schedule, and a feed the tenant's
+  ServiceTitan app was never granted is refused with a 403 and writes no tab at
+  all: a contractor who did not buy TrueQuote has no `pricebook.*` tabs and no
+  `pricebook` rows in `_meta`. Do not read that as "a catalogue with nothing in
+  it" — a tab that exists always carries at least its header.
+- **A tab that stops being refreshed still says when it was last current.** If a
+  permission is revoked, the tab keeps its last good contents and its `_meta` row
+  is carried forward untouched, so `last_run_at` names the last genuinely fresh
+  run rather than the run that could not refresh it. A consumer that cares about
+  freshness must read `last_run_at`, not the mere presence of rows. (The exporter
+  turns that run red and annotates it; see `src/st_exporter/scopes.py`.)
 
 ## What a consumer MUST do
 

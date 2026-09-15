@@ -93,6 +93,8 @@ def run_once(
 
     typer.echo(_summary_line(summary, outcomes))
 
+    run_failed = False
+
     if _ledger_was_unwritable(outcomes):
         _announce_unwritable_ledger(outcomes)
         # The drain is the LAST thing this run does and every export write is
@@ -102,6 +104,25 @@ def run_once(
         # byte-identical to a lane with an empty queue — so without this a
         # protected, deleted or quota-hit `_outbox_ledger` tab leaves two
         # products' bookings and leads queued INDEFINITELY behind green runs.
+        run_failed = True
+
+    if summary is not None and summary.scope_revoked:
+        # A permission this tenant HAD and no longer has. `scopes.py` has already
+        # put a red `::error` annotation on the run naming the feed and the
+        # permission; this is what turns the run itself red. That matters more
+        # than it looks: a red run is the one thing a contractor sees without
+        # opening anything, and it is the entire reason the feed jobs no longer
+        # carry a hand-maintained repository variable each. A feed silently not
+        # running is the failure mode being eliminated, so the feed that WAS
+        # running and stopped must never end green.
+        #
+        # Not `scope_not_granted`: a product that was never bought is not a
+        # failure, it is the ordinary state of every feed job a contractor's
+        # ServiceTitan app does not cover. It is named in the summary line above
+        # and nowhere else.
+        run_failed = True
+
+    if run_failed:
         raise typer.Exit(code=1)
 
 
@@ -195,6 +216,18 @@ def _summary_line(summary: ExportSummary | None, outcomes: list[LaneOutcome]) ->
                 f" {_tab_key(tab)}={count}"
                 for tab, count in sorted(summary.financial_row_counts.items())
             )
+        if summary.scope_not_granted:
+            # An absent tab is the contract's way of saying "not bought", and an
+            # absence is not something a reader can notice. So the run says it
+            # out loud, every time, in its own output: this feed was refused,
+            # this tenant never had the permission, nothing is wrong.
+            message += " not_granted=" + ",".join(sorted(summary.scope_not_granted))
+        if summary.scope_revoked:
+            # Different fact, different word: this one WORKED before. It also
+            # carries a red annotation and a non-zero exit (see `run_once`); the
+            # summary line names it too so a support engineer reading one line of
+            # output learns which feed went stale and when to expect it back.
+            message += " scope_revoked=" + ",".join(sorted(summary.scope_revoked))
         if summary.financial_failures:
             # Named in the run's output rather than only in the log: a missing
             # `reporting.jobCosts` tab is the difference between Profit Wizard

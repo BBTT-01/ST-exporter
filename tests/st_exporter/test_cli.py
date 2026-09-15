@@ -541,3 +541,82 @@ class TestAnUnwritableLedgerIsNotASilentlyGreenRun:
         errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
         assert any("LEDGER UNWRITABLE" in message for message in errors)
         assert any("truequote, profitwizard" in message for message in errors)
+
+
+class TestScopeOutcomesInTheRunsOwnOutput:
+    """The caller workflow runs every feed job for every contractor now, so the
+    run's own output is where "this feed did not export, and why" has to appear.
+
+    Two different facts, deliberately worded differently and treated differently:
+    a feed the tenant never had is named and nothing else; a feed they HAD and
+    lost turns the run red.
+    """
+
+    def _run(self, monkeypatch, summary):  # type: ignore[no-untyped-def]
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "jobs"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch(
+                "st_exporter.cli.TradeRatedSettings",
+                return_value=MagicMock(configured=False, images_configured=False),
+            ),
+            patch("st_exporter.cli.run_export", return_value=summary),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        return exc_info.value.code
+
+    def test_a_never_granted_feed_is_named_and_the_run_stays_green(
+        self, monkeypatch, capsys
+    ) -> None:
+        """An absent tab is how the contract says "not bought", and an absence is
+        not something a reader notices. So it is stated — but it is not a
+        failure: it is the ordinary state of a feed job belonging to a product
+        this contractor's ServiceTitan app does not cover."""
+        code = self._run(
+            monkeypatch, _summary(scope_not_granted={"pricebook": "Pricebook -> Services"})
+        )
+        assert code == 0
+        assert "not_granted=pricebook" in capsys.readouterr().out
+
+    def test_a_revoked_feed_turns_the_run_red(self, monkeypatch, capsys) -> None:
+        """This one worked before. A feed that stops exporting must never end
+        green — that silence is the whole failure mode the per-feed repository
+        variables were deleted for."""
+        code = self._run(monkeypatch, _summary(scope_revoked={"jobs": "HTTP 403: nope"}))
+        assert code != 0
+        assert "scope_revoked=jobs" in capsys.readouterr().out
+
+    def test_the_two_are_never_confused_in_the_line(self, monkeypatch, capsys) -> None:
+        code = self._run(
+            monkeypatch,
+            _summary(scope_not_granted={"financial": "Accounting"}, scope_revoked={"jobs": "403"}),
+        )
+        assert code != 0
+        out = capsys.readouterr().out
+        assert "not_granted=financial" in out
+        assert "scope_revoked=jobs" in out
+
+    def test_an_ordinary_run_says_neither(self, monkeypatch, capsys) -> None:
+        """The markers must not cry wolf: a run where every requested feed
+        exported carries no scope words at all."""
+        assert self._run(monkeypatch, _summary()) == 0
+        out = capsys.readouterr().out
+        assert "not_granted" not in out and "scope_revoked" not in out
+
+    def test_a_drain_only_run_has_no_export_summary_to_read(self, monkeypatch) -> None:
+        """`--feeds outbox` never calls `run_export`, so there is no summary and
+        nothing for the scope check to dereference. The drain is not a feed and
+        is not scope-gated — see `run.EXPORT_FEEDS`."""
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "outbox"])
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch("st_exporter.cli.run_export") as mock_run,
+            patch("st_exporter.cli._drain_outboxes", return_value=[]),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 0
+        mock_run.assert_not_called()

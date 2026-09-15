@@ -356,6 +356,36 @@ filter. `_find` deliberately lists all campaigns and matches locally instead, be
 a filter ServiceTitan silently ignored would return page one of every campaign and
 could match the wrong row.
 
+## Which feeds a tenant is allowed to read — decided by a 403, and unverified
+
+The caller workflow no longer carries a repository variable per feed. Every feed
+job runs for every contractor and ServiceTitan's scopes decide what exports: a
+feed the tenant's app was never granted answers **403** and is skipped quietly
+(no tab written, run stays green), while a feed that HAS run successfully before
+— proved by its `_meta` row — is treated as a **revoked** permission and turns
+the run red. `src/st_exporter/scopes.py`.
+
+Unverified, and worth knowing before trusting the quiet half:
+
+- **Whether every ungranted read endpoint really answers 403.** One is confirmed:
+  `marketing/categories` returned `403 Scope validation failed` on an app without
+  that scope (see above). The rest is inference from the same platform behaving
+  the same way. An endpoint that answered 401 or 404 for a missing scope would be
+  a loud failure rather than a quiet skip — noisy, not silent, which is the safe
+  direction to be wrong in.
+- **Whether a 403 is ever transient.** Nothing suggests it is, but if
+  ServiceTitan ever returned one under load, a feed that had run before would be
+  announced as revoked for that cycle. It would recover by itself on the next
+  run, and its tabs and `_meta` row are untouched meanwhile.
+- **Whether a partially-granted module is possible** — e.g. Pricebook Services
+  readable and Pricebook Equipment not. The exporter decides at FEED level, so
+  the first 403 rules out the whole feed's remaining tabs for that run. If a
+  tenant can really hold half a module, a granted tab would stop being refreshed
+  with the others. No tenant has shown this.
+- **A 400 is deliberately NOT treated as "not bought"** — `active=Any` below is
+  exactly that case, and a sibling branch handles it. Only 403 is an
+  authorization answer here.
+
 ## Pricebook list endpoints: `active=Any`, and the `assets` shape
 
 `src/st_exporter/feeds/pricebook.py`, `src/st_exporter/pricebook.py`

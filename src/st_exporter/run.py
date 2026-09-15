@@ -8,13 +8,13 @@ regardless of whether its underlying record changed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from st_cli.client import ServiceTitanClient
 from st_cli.config import Settings
-from st_cli.exceptions import ConfigError, STCLIError
+from st_cli.exceptions import APIError, ConfigError, STCLIError
 from st_exporter import EXPORTER_VERSION
 from st_exporter.blank_columns import check_blank_columns
 from st_exporter.config import ExporterSettings
@@ -60,6 +60,7 @@ from st_exporter.images.upload import ImageUploadSummary, upload_pricebook_image
 from st_exporter.logging_setup import configure_logging, logger
 from st_exporter.meta import CursorBundle, MetaRow, build_meta_grid, parse_meta_grid
 from st_exporter.pricebook import CONTRACT_VERSION, build_category_grid, build_item_grid
+from st_exporter.scopes import ScopeLedger
 from st_exporter.sheets import SheetsClient, SheetsPort, get_gspread_client
 from st_exporter.window import DEFAULT_WINDOW_DAYS, FINANCIAL_WINDOW_DAYS, in_window
 
@@ -131,8 +132,10 @@ class ExportSummary:
     skipped_no_job: int
     dry_run: bool
     # Row count per `pricebook.*` tab, or None when the pricebook feed wasn't
-    # selected this run. None and {} are different: {} would mean "ran, wrote
-    # nothing", which never happens (a tab always gets at least its header).
+    # selected this run. None and {} are different: {} means the feed ran and
+    # wrote no tab at all — every tab failed, or the whole feed was refused for
+    # want of the Pricebook permission (`scope_not_granted`/`scope_revoked`). A
+    # tab that IS written always has at least its header, so it is never 0-vs-{}.
     pricebook_row_counts: dict[str, int] | None = None
     # Tab name -> why it was skipped, for the pricebook tabs that failed. Same
     # contract as `financial_failures`: a failed tab is absent from
@@ -150,6 +153,16 @@ class ExportSummary:
     # Tab name -> why it was skipped, for the financial tabs that failed. Its
     # previous contents and its `_meta` row are left untouched in the Sheet.
     financial_failures: dict[str, str] | None = None
+    # Feed -> the ServiceTitan permission it needs, for a feed this tenant has
+    # NEVER been granted (403, and no `_meta` row has ever named a successful run
+    # of it). A quiet, expected skip: no tab is written, nothing failed, and an
+    # absent tab means the contractor did not buy that product. See `scopes.py`.
+    scope_not_granted: dict[str, str] = field(default_factory=dict)
+    # Feed -> ServiceTitan's 403 detail, for a feed that HAS run successfully on
+    # this Sheet before. The permission was taken away: the run is annotated at
+    # `::error` and exits non-zero (`cli.py`). Its tabs and `_meta` rows are left
+    # exactly as the last good run left them.
+    scope_revoked: dict[str, str] = field(default_factory=dict)
 
 
 def run_export(
@@ -251,37 +264,58 @@ def _run(
 
     meta_rows = parse_meta_grid(export_store.read_grid("_meta"))
     new_meta_rows: list[MetaRow] = []
+    # Which feeds the tenant's ServiceTitan app is allowed to read is decided by
+    # ServiceTitan, not by the caller workflow: every feed job runs on its
+    # schedule, and a 403 is the answer for a product this contractor did not
+    # buy. `scopes.py` is what tells that apart from a permission that was
+    # revoked, using the `_meta` rows read above — so it is built from the state
+    # BEFORE this run touches it.
+    scopes = ScopeLedger(meta_rows=meta_rows, new_meta_rows=new_meta_rows)
 
     windowed_rows: list[dict[str, Any]] = []
     skipped_no_job = 0
     jobs_row_count = meta_rows["jobs"].row_count if "jobs" in meta_rows else 0
 
     if "jobs" in feeds:
-        windowed_rows, skipped_no_job = _run_jobs_feed(
-            client,
-            export_store,
-            raw_cache_store,
-            meta_rows=meta_rows,
-            new_meta_rows=new_meta_rows,
-            today=today,
-            run_at=run_at,
-            window_days=window_days,
-            dry_run=dry_run,
-        )
-        jobs_row_count = len(windowed_rows)
+        try:
+            windowed_rows, skipped_no_job = _run_jobs_feed(
+                client,
+                export_store,
+                raw_cache_store,
+                meta_rows=meta_rows,
+                new_meta_rows=new_meta_rows,
+                today=today,
+                run_at=run_at,
+                window_days=window_days,
+                dry_run=dry_run,
+            )
+        except APIError as exc:
+            # A 403 and nothing else. `deny` returns None for every other status,
+            # and the raise below is what keeps a 400, a 404 or a 429 behaving
+            # exactly as it did before this feed could be scope-skipped at all.
+            if scopes.deny("jobs", ("jobs",), exc) is None:
+                raise
+            # No tab is written and `jobs_row_count` keeps the carried-forward
+            # `_meta` count, which is what the untouched tab still holds.
+        else:
+            jobs_row_count = len(windowed_rows)
     elif "jobs" in meta_rows:
         new_meta_rows.append(meta_rows["jobs"])
 
     technicians_row_count = meta_rows["technicians"].row_count if "technicians" in meta_rows else 0
 
     if "technicians" in feeds:
-        technicians_row_count = _run_technicians_feed(
-            client,
-            export_store,
-            new_meta_rows=new_meta_rows,
-            run_at=run_at,
-            dry_run=dry_run,
-        )
+        try:
+            technicians_row_count = _run_technicians_feed(
+                client,
+                export_store,
+                new_meta_rows=new_meta_rows,
+                run_at=run_at,
+                dry_run=dry_run,
+            )
+        except APIError as exc:
+            if scopes.deny("technicians", ("technicians",), exc) is None:
+                raise
     elif "technicians" in meta_rows:
         new_meta_rows.append(meta_rows["technicians"])
 
@@ -297,6 +331,7 @@ def _run(
             new_meta_rows=new_meta_rows,
             run_at=run_at,
             category_ids=pricebook_category_ids,
+            scopes=scopes,
             dry_run=dry_run,
         )
     else:
@@ -316,6 +351,7 @@ def _run(
             today=today,
             window_days=financial_window_days,
             max_jobs=financial_max_jobs,
+            scopes=scopes,
             dry_run=dry_run,
         )
     else:
@@ -343,7 +379,12 @@ def _run(
     # and the `_meta` row that describes it. Handling those failures is not
     # enough; ordering makes the whole class of "fresh tabs, stale `_meta`"
     # impossible. Never move it back above the `_meta` write.
-    if pricebook_item_records is not None:
+    if pricebook_item_records is not None and not scopes.denied("pricebook"):
+        # A scope-denied pricebook feed fetched no items at all, so `item_records`
+        # is empty for a reason that has nothing to do with the catalogue. Running
+        # the image pass on it would hand `ImageLedger.keep` an empty `seen_keys`
+        # and prune every image the tenant has ever had uploaded — "not looked at"
+        # read as "gone", the exact mistake `catalogue_complete` exists to prevent.
         image_summary = _upload_pricebook_images(
             client,
             raw_cache_store,
@@ -366,6 +407,8 @@ def _run(
         images=image_summary,
         financial_row_counts=financial_row_counts,
         financial_failures=financial_failures,
+        scope_not_granted=dict(scopes.not_granted),
+        scope_revoked=dict(scopes.revoked),
     )
 
 
@@ -547,6 +590,12 @@ class _TabGuard:
     ``row_count`` is derived from the GRID, never from the fetched record list:
     the builders drop keyless records, so counting the records would report rows
     that were never written.
+
+    A **403** is not a tab failure and is handed to the ``ScopeLedger`` instead —
+    it is a fact about the whole FEED (ServiceTitan grants Pricebook, not
+    `pricebook.equipment`), and it means either "this product was never bought"
+    or "this permission was revoked". See ``scopes.py``. Every other
+    ``STCLIError`` keeps the per-tab behaviour above, unchanged.
     """
 
     def __init__(
@@ -557,21 +606,41 @@ class _TabGuard:
         meta_rows: dict[str, MetaRow],
         new_meta_rows: list[MetaRow],
         run_at: str,
+        scopes: ScopeLedger | None = None,
+        feed_tabs: tuple[str, ...] = (),
     ) -> None:
+        # Doubles as the FEED name (`pricebook`, `financial`) — which is what
+        # the ScopeLedger keys on, because a ServiceTitan permission is granted
+        # over a feed and not over one of its tabs.
         self._label = label
         self._contract_version = contract_version
         self._meta_rows = meta_rows
         self._new_meta_rows = new_meta_rows
         self._run_at = run_at
+        self._scopes = scopes
+        # Every tab of the feed this guard is guarding — the unit a ServiceTitan
+        # permission is granted over, and therefore the unit "has this ever
+        # worked?" has to be asked over.
+        self._feed_tabs = feed_tabs or ()
         self.grids: dict[str, list[list[str]]] = {}
         self.row_counts: dict[str, int] = {}
         self.failures: dict[str, str] = {}
 
     def attempt(self, tab_name: str, build: Any) -> Any:
         """Build one tab's grid behind the guard. Returns whatever ``build`` did."""
+        if self._scopes is not None and self._scopes.denied(self._label):
+            # The permission covers the whole feed, so the remaining tabs would
+            # each buy the same 403. Don't spend the requests; their `_meta` rows
+            # were already carried forward when the first one was classified.
+            return None
         try:
             grid, carried = build()
         except STCLIError as exc:
+            if self._scopes is not None and self._scopes.deny(self._label, self._feed_tabs, exc):
+                # A 403: not this tab's failure but the feed's permission. The
+                # ledger has already carried every one of the feed's `_meta` rows
+                # forward and decided whether it is loud or quiet.
+                return None
             self.failures[tab_name] = str(exc)
             logger.warning(
                 "%s: %s was NOT written this run (%s). Its previous contents "
@@ -616,6 +685,7 @@ def _run_pricebook_feed(
     new_meta_rows: list[MetaRow],
     run_at: str,
     category_ids: tuple[str, ...] = (),
+    scopes: ScopeLedger | None = None,
     dry_run: bool,
 ) -> tuple[dict[str, int], dict[str, str], list[dict[str, Any]]]:
     """Write the four `pricebook.*` tabs; append one MetaRow per tab that succeeded.
@@ -646,6 +716,8 @@ def _run_pricebook_feed(
         meta_rows=meta_rows,
         new_meta_rows=new_meta_rows,
         run_at=run_at,
+        scopes=scopes,
+        feed_tabs=PRICEBOOK_FEED_NAMES,
     )
 
     item_records: list[dict[str, Any]] = []
@@ -685,6 +757,7 @@ def _run_financial_feed(
     today: Any,
     window_days: int,
     max_jobs: int,
+    scopes: ScopeLedger | None = None,
     dry_run: bool,
 ) -> tuple[dict[str, int], dict[str, str]]:
     """Write the four `financial` tabs; append one MetaRow per tab that succeeded.
@@ -710,6 +783,8 @@ def _run_financial_feed(
         meta_rows=meta_rows,
         new_meta_rows=new_meta_rows,
         run_at=run_at,
+        scopes=scopes,
+        feed_tabs=FINANCIAL_FEED_NAMES,
     )
 
     guard.attempt(

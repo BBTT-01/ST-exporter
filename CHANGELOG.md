@@ -219,13 +219,10 @@ jobs a contractor runs per product bought, the cadences, and that exactly one
 job drains. It used to be reviewed by eye, once per connector repository, which
 is how the one-drain comment came to be deleted from a live one.
 
-Every feed job is off until a repository **variable** turns it on
-(`JOBS_FEED`, `TECHNICIANS_FEED`, `PRICEBOOK_FEED`, `FINANCIAL_FEED`), so a
-reviews-only contractor exports no price book, no invoices and no timesheets.
-Variables rather than secrets because GitHub does not expose the `secrets`
-context to a job-level `if:`. The drain has no variable: every product writes
-through its outbox, and a drain that can be switched off by forgetting a
-variable is a drain that stops silently.
+**Every feed job runs on its schedule, for every contractor**, and nothing in
+the YAML says which feeds a connector exports. There are no per-feed repository
+variables — see "ServiceTitan's scopes decide which feeds run" below. The drain
+is not a feed and is not scope-gated: it runs iff `feeds` names `outbox`.
 
 The reusable workflow's concurrency group is now **two** groups per connector
 repository rather than one, split by what a run WRITES rather than by which job
@@ -236,6 +233,43 @@ all. That is what takes the 5-minute drain off the back of the hourly pricebook
 run. It is not a per-FEED key: per-feed locks would let two feeds rewrite
 `_meta` over each other, and the prerequisite for them is a merge-on-write
 `_meta` in Python, not a change to the YAML.
+
+### ServiceTitan's scopes decide which feeds run — no per-feed variables
+
+The four repository variables that gated the feed jobs (`JOBS_FEED`,
+`TECHNICIANS_FEED`, `PRICEBOOK_FEED`, `FINANCIAL_FEED`) are **deleted**. They
+duplicated the ServiceTitan scopes: the boxes a contractor ticks when they create
+the app already state what they bought, and a hand-maintained second copy of one
+fact in a different place drifts —
+
+* variable **on**, scope **missing** → a red run every hour, forever;
+* variable **off**, scope **granted** → a feed they paid for silently not
+  running, on green runs. That is the same silent-stop failure the one-drain rule
+  exists to prevent, and it also made applying a caller patch order-dependent: set
+  the variables first or a live contractor's export stops with no symptom.
+
+The defence of the variables was that a 403 cannot tell "never bought" from
+"permission revoked". **`_meta` answers that**, because it already records the
+last successful run of every tab (`src/st_exporter/scopes.py`):
+
+| What the exporter sees | What it means | What it does |
+|---|---|---|
+| 403, and no `_meta` row has ever named a run of this feed | the scope was never granted | skip **quietly**: no tab is written, `not_granted=<feed>` in the run's summary line, run stays green |
+| 403, and a `_meta` row names a past run | the permission was **revoked** | `::error` annotation naming the feed and the permission, tabs keep their last good contents, `scope_revoked=<feed>` in the summary, **run exits non-zero** |
+
+Either way the feed's previous `_meta` rows are carried forward unchanged, exactly
+as `_TabGuard` does for a failed tab — that evidence is what makes the *next*
+403 decidable, so it is never deleted.
+
+**Only HTTP 403 takes this path.** A 400 (`KNOWN_UNVERIFIED.md` records one on
+`active=Any`), a 401, a 404, a 429 or a transport error behaves exactly as before:
+the per-tab guard fails that tab loudly, or the exception ends the run. Treating
+any of them as "not bought" would turn an outage into a silent skip.
+
+On a **first-ever run** no feed has a `_meta` row, so nothing is declared revoked
+and a 403 is "never granted" — which is what it is. `PRICEBOOK_CATEGORY_IDS`
+stays: it narrows *what* the pricebook feed exports and never decides *whether* it
+runs.
 
 ### Three apps, three path shapes, three scope vocabularies — none of it shared
 
