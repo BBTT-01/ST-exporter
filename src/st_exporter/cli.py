@@ -200,6 +200,12 @@ def _summary_line(summary: ExportSummary | None, outcomes: list[LaneOutcome]) ->
             f"jobs={summary.jobs_row_count} technicians={summary.technicians_row_count} "
             f"skipped_no_job={summary.skipped_no_job} dry_run={summary.dry_run}"
         )
+        if summary.feed_failures:
+            # Named in the run's own output, not only in the log. A failed `jobs`
+            # feed means its cursor did not advance, so the next run re-drains —
+            # the symptom that ticket 21 describes as "presents as a slow
+            # exporter". It must not be something you have to go digging for.
+            message += " feed_failed=" + ",".join(sorted(summary.feed_failures))
         if summary.pricebook_row_counts is not None:
             message += "".join(
                 f" {tab.replace('.', '_')}={count}"

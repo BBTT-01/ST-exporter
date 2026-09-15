@@ -194,3 +194,52 @@ class TestOneRowPerTab:
         ]
         with pytest.raises(ValueError, match="pricebook.services"):
             build_meta_grid(rows)
+
+
+class TestRollingBackAHalfWrittenFeed:
+    """``_guarded_feed``/``_TabGuard`` roll back a feed that threw part-way.
+
+    A row recorded before the tab it describes reached the Sheet is the cursor
+    leading the data — the one direction ticket 21 refuses to trade itself for —
+    and, because ``carry`` is a ``setdefault``, leaving it in place would also
+    silently BEAT the previous row the guard is about to carry forward.
+    """
+
+    def test_restore_discards_rows_recorded_since_the_snapshot(self) -> None:
+        rows = MetaRowSet()
+        rows.add(MetaRow(feed="jobs", last_run_at="today"))
+        committed = rows.snapshot()
+
+        rows.add(MetaRow(feed="technicians", last_run_at="today"))
+        rows.restore(committed)
+
+        assert [row.feed for row in rows] == ["jobs"]
+
+    def test_the_committed_rows_survive_the_rollback_unchanged(self) -> None:
+        jobs = MetaRow(feed="jobs", last_run_at="today", last_cursor="{}")
+        rows = MetaRowSet()
+        rows.add(jobs)
+        committed = rows.snapshot()
+        rows.add(MetaRow(feed="technicians", last_run_at="today"))
+
+        rows.restore(committed)
+
+        assert list(rows) == [jobs]
+
+    def test_a_rolled_back_row_no_longer_blocks_the_carried_one(self) -> None:
+        previous = MetaRow(feed="technicians", last_run_at="yesterday", row_count=5)
+        rows = MetaRowSet()
+        committed = rows.snapshot()
+        # The feed recorded its row and then threw before writing its tab.
+        rows.add(MetaRow(feed="technicians", last_run_at="today", row_count=0))
+
+        rows.restore(committed)
+        rows.carry(previous)
+
+        assert list(rows) == [previous]
+
+    def test_the_snapshot_is_not_a_live_view(self) -> None:
+        rows = MetaRowSet()
+        committed = rows.snapshot()
+        rows.add(MetaRow(feed="jobs", last_run_at="today"))
+        assert committed == {}

@@ -12,9 +12,19 @@ from __future__ import annotations
 from typing import Any
 
 from st_cli.client import ServiceTitanClient
+from st_cli.exceptions import APIError
 from st_cli.pagination import fetch_all
+from st_exporter.logging_setup import announce_to_actions, logger
 
 _PAGE_SIZE = 200
+
+#: Requests deactivated technicians alongside active ones. Still unverified against
+#: a real tenant (KNOWN_UNVERIFIED.md), which is exactly why it is not removed on a
+#: guess either: dropping it would silently make the tab active-only, and a
+#: deactivated technician vanishing from the tab is indistinguishable, downstream,
+#: from one who never existed. The parameter stays; the FAILURE mode is what got
+#: fixed — see ``fetch_technicians``.
+_ACTIVE_ANY = {"active": "Any"}
 
 
 def fetch_technicians(client: ServiceTitanClient) -> list[dict[str, Any]]:
@@ -25,10 +35,44 @@ def fetch_technicians(client: ServiceTitanClient) -> list[dict[str, Any]]:
     disappear from the tab instead of showing up with ``active=false``. The exact
     parameter name/values aren't confirmed against a real tenant — see
     KNOWN_UNVERIFIED.md.
+
+    **On a 400, and only a 400, the list is re-fetched without the parameter.**
+    A 400 is ServiceTitan saying it does not accept this filter, which is the one
+    reading under which sending it is pointless; every other status (403 on a
+    missing Settings → Technicians permission, 429, 5xx, a transport failure) is
+    about the request's fate, not the parameter, and is re-raised for the caller's
+    guard to handle. This is not a guess about the right spelling — it cannot be
+    made without a tenant — it makes the wrong guess SURVIVABLE: a rejected filter
+    now costs an active-only tab plus a loud annotation naming what is missing,
+    instead of failing the whole feed. Remove the fallback once a tenant confirms
+    the parameter.
     """
-    return list(
-        fetch_all(client, "settings", "technicians", params={"active": "Any"}, page_size=_PAGE_SIZE)
-    )
+    try:
+        return list(
+            fetch_all(
+                client, "settings", "technicians", params=dict(_ACTIVE_ANY), page_size=_PAGE_SIZE
+            )
+        )
+    except APIError as exc:
+        if exc.status_code != 400:
+            raise
+        logger.warning(
+            "DEGRADED: ServiceTitan rejected active=Any on the technicians list (%s). "
+            "Re-fetching WITHOUT it — the technicians tab may therefore be "
+            "active-only, so a deactivated technician can be missing from it "
+            "entirely rather than present with active=false. See "
+            "KNOWN_UNVERIFIED.md, 'Technician `active` filter parameter'.",
+            exc,
+        )
+        announce_to_actions(
+            "Technicians: active=Any rejected",
+            f"ServiceTitan returned {exc} for the technicians list with active=Any. "
+            f"The tab was rebuilt WITHOUT that filter and may be active-only: a "
+            f"deactivated technician can be absent rather than active=false. The "
+            f"correct parameter needs confirming on a real tenant "
+            f"(KNOWN_UNVERIFIED.md).",
+        )
+        return list(fetch_all(client, "settings", "technicians", page_size=_PAGE_SIZE))
 
 
 def fetch_job_types(client: ServiceTitanClient) -> dict[str, dict[str, Any]]:
