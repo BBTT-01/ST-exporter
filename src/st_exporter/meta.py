@@ -35,14 +35,20 @@ META_COLUMNS: tuple[str, ...] = (
     "contract_version",
 )
 
-# The five high-volume, cursor-tracked feeds that the `jobs` output feed is
+# The high-volume, cursor-tracked feeds that the `jobs` output feed is
 # denormalised from. Order is stable so the encoded cursor is deterministic.
+#
+# `customer-contacts` is only ever advanced on the opt-in bulk contacts route
+# (EXPORTER_CONTACTS_ROUTE=export, see feeds/contacts.py); on the default
+# per-customer route it stays null, which is also exactly what a tenant switching
+# TO the bulk route needs — a null token means "drain from the beginning".
 JOBS_CURSOR_FEEDS: tuple[str, ...] = (
     "customers",
     "locations",
     "jobs",
     "appointments",
     "assignments",
+    "customer-contacts",
 )
 
 

@@ -45,6 +45,23 @@ on:
           Wizard reads, so this costs one request per job.
         type: number
         default: 500
+      contacts_route:
+        description: >-
+          Where the jobs feed reads customer phone/email from: `per-customer`
+          (default) calls `crm/customers/{id}/contacts` once per distinct customer
+          — the route TradeRated's live Direct-path function uses — or `export` to
+          try the bulk `crm/export/customers/contacts` change-feed, which could not
+          be shown to exist without a live tenant. `export` is safe to try: a
+          404/400 from it is announced and falls back to per-customer for that run.
+        type: string
+        default: "per-customer"
+      contacts_max_customers:
+        description: >-
+          Cap on how many DISTINCT customers one run asks for contacts on the
+          per-customer route. Hitting it leaves those rows' customer_phone /
+          customer_email blank and is announced on the run.
+        type: number
+        default: 3000
       pricebook_category_ids:
         description: >-
           Optional comma-separated ServiceTitan pricebook category ids to restrict
@@ -294,6 +311,8 @@ jobs:
           EXPORTER_PRICEBOOK_CATEGORY_IDS: ${{ inputs.pricebook_category_ids }}
           EXPORTER_FINANCIAL_WINDOW_DAYS: ${{ inputs.financial_window }}
           EXPORTER_FINANCIAL_MAX_JOBS: ${{ inputs.financial_max_jobs }}
+          EXPORTER_CONTACTS_ROUTE: ${{ inputs.contacts_route }}
+          EXPORTER_CONTACTS_MAX_CUSTOMERS: ${{ inputs.contacts_max_customers }}
           FEEDS: ${{ inputs.feeds }}
         run: |
           # Per-segment check rather than an enumeration of every combination —

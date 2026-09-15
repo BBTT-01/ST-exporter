@@ -36,6 +36,23 @@ JOB_2 = {
 CUSTOMER_10 = {"id": 10, "name": "Jane Doe", "phone": "555-0111", "email": "jane@example.com"}
 CUSTOMER_11 = {"id": 11, "name": "Bob Smith", "phone": "555-0133", "email": "bob@example.com"}
 
+#: What `crm/v2/tenant/{id}/customers/{customerId}/contacts` really answers — the
+#: endpoint the phone number and the email actually live on. Deliberately NOT the
+#: same values as the flat scalars above: the tab must show the contact, so a
+#: fixture where the two agree would prove nothing about which one was read.
+#: The fax is here for the same reason — to be ignored.
+CONTACTS_10 = [
+    {"id": 1, "customerId": 10, "type": "Fax", "value": "555-0000"},
+    {"id": 2, "customerId": 10, "type": "Phone", "value": "555-0112"},
+    {"id": 3, "customerId": 10, "type": "MobilePhone", "value": "555-0113"},
+    {"id": 4, "customerId": 10, "type": "Email", "value": "jane.mobile@example.com"},
+]
+CONTACTS_11 = [
+    {"id": 5, "customerId": 11, "type": "MobilePhone", "value": "555-0134"},
+    {"id": 6, "customerId": 11, "type": "Email", "value": "bob.mobile@example.com"},
+]
+CONTACTS_BY_CUSTOMER = {10: CONTACTS_10, 11: CONTACTS_11}
+
 LOCATION_20 = {
     "id": 20,
     "address": {"street": "1 Main St", "city": "Springfield", "state": "IL", "zip": "62701"},
@@ -74,6 +91,19 @@ def appointment_2_outside_window(far_past_iso: str) -> dict:
     }
 
 
+def register_customer_contacts(api_base: str, contacts_by_customer: dict | None = None) -> None:
+    """Register the per-customer contacts sub-resource for each fixture customer.
+
+    Both run fixtures call this, because the contacts pull happens on EVERY run —
+    it has no cursor of its own (see ``feeds/contacts.py``), so a second run asks
+    again for the customers whose rows are in the window.
+    """
+    for customer_id, contacts in (contacts_by_customer or CONTACTS_BY_CUSTOMER).items():
+        respx.get(f"{api_base}/crm/v2/tenant/{TENANT_ID}/customers/{customer_id}/contacts").mock(
+            return_value=httpx.Response(200, json={"data": contacts, "hasMore": False})
+        )
+
+
 def _envelope(data: list[dict], cursor: str) -> httpx.Response:
     return httpx.Response(200, json={"data": data, "hasMore": False, "continueFrom": cursor})
 
@@ -107,3 +137,4 @@ def register(api_base: str, *, today_iso: str, far_past_iso: str) -> None:
     respx.get(f"{api_base}/settings/v2/tenant/{TENANT_ID}/business-units").mock(
         return_value=httpx.Response(200, json={"data": [], "hasMore": False})
     )
+    register_customer_contacts(api_base)

@@ -8,9 +8,14 @@ added later) that reads one.
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from st_exporter.feeds.contacts import (
+    DEFAULT_MAX_CONTACT_CUSTOMERS,
+    ROUTE_PER_CUSTOMER,
+    ROUTES,
+)
 from st_exporter.feeds.financial import DEFAULT_MAX_TIMESHEET_JOBS
 from st_exporter.window import FINANCIAL_WINDOW_DAYS
 
@@ -56,6 +61,42 @@ class ExporterSettings(BaseSettings):
     financial_max_jobs: int = Field(
         default=DEFAULT_MAX_TIMESHEET_JOBS, ge=1, validation_alias="EXPORTER_FINANCIAL_MAX_JOBS"
     )
+
+    # Which route the jobs feed reads customer phone/email from. `per-customer`
+    # (the default) is the one route with live evidence behind it — TradeRated's
+    # Direct-path function has been reading `customers/{id}/contacts` in
+    # production for both tenants. `export` opts into the bulk
+    # `crm/export/customers/contacts` change-feed, which could not be shown to
+    # exist without a live tenant to ask; if it answers 404/400 the run says so
+    # and falls back to per-customer rather than blanking two columns. See
+    # feeds/contacts.py. Not GOOGLE_-prefixed; see window_days.
+    contacts_route: str = Field(
+        default=ROUTE_PER_CUSTOMER, validation_alias="EXPORTER_CONTACTS_ROUTE"
+    )
+
+    # Cap on how many DISTINCT customers one run asks for contacts on the
+    # per-customer route — the financial feed's EXPORTER_FINANCIAL_MAX_JOBS knob
+    # for the same N+1 shape. ge=1 because zero would blank both contact columns
+    # on every row, which is the bug this cap's feed exists to fix.
+    contacts_max_customers: int = Field(
+        default=DEFAULT_MAX_CONTACT_CUSTOMERS,
+        ge=1,
+        validation_alias="EXPORTER_CONTACTS_MAX_CUSTOMERS",
+    )
+
+    @field_validator("contacts_route")
+    @classmethod
+    def _known_contacts_route(cls, value: str) -> str:
+        """Reject an unknown route rather than silently exporting blank columns.
+
+        A typo'd `EXPORTER_CONTACTS_ROUTE` must not fall through to "fetch
+        nothing": that is indistinguishable, on the tab, from the very bug this
+        setting exists to fix.
+        """
+        route = value.strip().lower()
+        if route not in ROUTES:
+            raise ValueError(f"EXPORTER_CONTACTS_ROUTE must be one of {', '.join(ROUTES)}")
+        return route
 
     # Optional comma-separated ServiceTitan pricebook category ids to restrict the
     # pricebook feed to. Blank (the default) exports the whole catalogue, which is

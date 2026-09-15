@@ -18,8 +18,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping
 
+from st_exporter.feeds.contacts import (
+    EMAIL_TYPES_IN_PREFERENCE_ORDER,
+    PHONE_TYPES_IN_PREFERENCE_ORDER,
+    select_contact_value,
+)
 from st_exporter.feeds.raw_cache import RawCache
 from st_exporter.format import build_service_address
 
@@ -79,10 +84,13 @@ def _first_present(*sources: dict[str, Any] | None, keys: tuple[str, ...]) -> An
 
 #: ServiceTitan's documented customer object carries contact details as
 #: ``contacts: [{id, type, value, memo}]`` with ``type`` one of
-#: ``Phone | MobilePhone | Email | Fax``. Matched case-folded. Fax is
-#: deliberately NOT a phone: the tab's `customer_phone` is what somebody rings.
-_PHONE_CONTACT_TYPES = ("phone", "mobilephone")
-_EMAIL_CONTACT_TYPES = ("email",)
+#: ``Phone | MobilePhone | Email | Fax``. Matched case-folded, mobile preferred
+#: over landline. Fax is deliberately NOT a phone: the tab's `customer_phone` is
+#: what somebody rings. The same tuples and the same selector as the contacts
+#: ENDPOINT (``feeds/contacts.py``), so this fallback layer and the real source
+#: can never disagree about which entry is the customer's phone number.
+_PHONE_CONTACT_TYPES = PHONE_TYPES_IN_PREFERENCE_ORDER
+_EMAIL_CONTACT_TYPES = EMAIL_TYPES_IN_PREFERENCE_ORDER
 
 
 def _contact_detail(
@@ -167,18 +175,17 @@ def _typed_contact(customer: dict[str, Any], contact_types: tuple[str, ...]) -> 
 
     Untyped entries are skipped for the same reason. An empty ``contact_types``
     means the caller is not asking about contacts at all.
+
+    **This is the fallback, not the source.** The details really live on
+    ``customers/{id}/contacts`` (``feeds/contacts.py``), which
+    ``apply_customer_contacts`` overlays on top of whatever this resolved. This
+    layer is kept because the contract only ever widens: a tenant that does carry
+    a flat ``phone`` or a ``contacts[]`` array still exports it, and it is what
+    fills the cell when the contacts endpoint is refused.
     """
     if not contact_types:
         return None
-    for contact in customer.get("contacts") or []:
-        if not isinstance(contact, dict):
-            continue
-        if str(contact.get("type") or "").strip().lower() not in contact_types:
-            continue
-        value = contact.get("value")
-        if value is not None and str(value).strip():
-            return value
-    return None
+    return select_contact_value(customer.get("contacts") or [], contact_types)
 
 
 def _coordinate(location: dict[str, Any] | None) -> tuple[Any, Any]:
@@ -377,6 +384,13 @@ def build_job_rows(
                     # Not a contract column; used by run.py to sort deterministically
                     # without re-deriving ints from formatted text.
                     "_sort_key": _sort_key(job.get("id"), appointment_id),
+                    # Also not a contract column (``build_job_grid`` renders
+                    # ``JOB_COLUMNS`` and nothing else, so an extra key cannot reach
+                    # a cell). It carries the join key the CONTACTS endpoint needs,
+                    # so run.py can fetch contacts for exactly the customers whose
+                    # rows survived the window filter rather than for every customer
+                    # ever cached. ``apply_customer_contacts`` removes it.
+                    "_customer_id": job.get("customerId"),
                 }
             )
 
@@ -384,6 +398,47 @@ def build_job_rows(
     for row in rows:
         del row["_sort_key"]
     return DenormalizeResult(rows=rows, skipped_no_job=skipped_no_job)
+
+
+def customer_ids(rows: list[dict[str, Any]]) -> list[Any]:
+    """The customer id behind each row, in row order, blanks dropped.
+
+    Duplicated ids are kept as-is — deduping belongs to the fetcher, which is the
+    thing that has to count requests (``feeds.contacts.fetch_contacts_per_customer``).
+    """
+    return [row["_customer_id"] for row in rows if row.get("_customer_id") not in (None, "")]
+
+
+def apply_customer_contacts(
+    rows: list[dict[str, Any]],
+    contacts_by_customer: Mapping[str, list[dict[str, Any]]],
+) -> None:
+    """Overlay the contacts endpoint's answer onto ``customer_phone``/``customer_email``.
+
+    In place, and **it takes precedence**: the details really live on
+    ``crm/v2/tenant/{id}/customers/{id}/contacts``, and the readers in
+    ``_contact_detail`` are the widened fallback for a tenant that happens to
+    carry them on the customer record too. Precedence only decides between two
+    POPULATED values — a customer with no contact of that type, or a run where
+    the contacts call was refused, keeps whatever the fallback resolved rather
+    than having it blanked. That is the invariant worth stating: this can fill a
+    blank cell, and it can change a value, but it can never empty one.
+
+    Always removes the private ``_customer_id`` key, so calling it with an empty
+    mapping (the degraded path) still leaves rows in exactly the shape the grid
+    builder expects.
+    """
+    for row in rows:
+        customer_id = row.pop("_customer_id", None)
+        contacts = contacts_by_customer.get(str(customer_id)) if customer_id is not None else None
+        if not contacts:
+            continue
+        phone = select_contact_value(contacts, _PHONE_CONTACT_TYPES)
+        if phone is not None:
+            row["customer_phone"] = phone
+        email = select_contact_value(contacts, _EMAIL_CONTACT_TYPES)
+        if email is not None:
+            row["customer_email"] = email
 
 
 def _sort_key(job_id: Any, appointment_id: Any) -> tuple[int, int]:
