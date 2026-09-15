@@ -680,8 +680,15 @@ class TestCustomerContactsArray:
         assert row["customer_phone"] == "555-2468"
 
     def test_contacts_sit_above_the_flat_scalar_and_below_the_settings_array(self) -> None:
-        """Widen-only: the new layer is INSERTED, so no shape that resolved a
-        value before resolves a different one now."""
+        """The new layer is INSERTED between the two that existed.
+
+        NOT "no shape resolves a different value now" — that was wrong, and the
+        second case below is the counter-example: contacts[] + a populated flat
+        scalar used to give the scalar and now gives the contact. Deliberate
+        (contacts[] is the documented shape; the scalar is a guess), but a changed
+        value, not a filled blank. The property that does hold: nothing that
+        resolved a value before is blank now.
+        """
         row = _rows_for_customer(
             {
                 "id": 10,

@@ -218,9 +218,48 @@ FIXTURE_ROOT = "contracts/fixtures"
 #: Repo-relative path of the manifest a consumer reads first.
 MANIFEST_PATH = f"{FIXTURE_ROOT}/manifest.json"
 
+#: Repo-relative path of the PUBLISHED register: every contract version that has
+#: ever been released, and the sha256 of each of its files **as released**.
+#:
+#: This is the one file in the suite that is not derived from the current code,
+#: and that is its entire point. Every other check compares the committed
+#: fixtures against what the code produces *today*, so a column rename plus a
+#: regeneration leaves every check green and every consumer reading a name that
+#: no longer exists — zero rows, four codebases, no error anywhere. The register
+#: is the only record of what was actually shipped under `jobs.v2`, so a changed
+#: fixture under an already-published version is a fact, not an opinion, and the
+#: only way out of it is a NEW version.
+PUBLISHED_PATH = f"{FIXTURE_ROOT}/published.json"
+
 #: The command that regenerates the suite. Named in every drift failure message,
 #: because the person reading that message did not write this code.
 REGENERATE_COMMAND = "python scripts/gen_contract_fixtures.py"
+
+#: How a genuine typo in an already-published fixture is fixed: deliberately, by
+#: name, and with a CHANGELOG line, because it rewrites bytes a consumer may
+#: already have pinned. It is not a way to land a contract change.
+REPUBLISH_FLAG = "--republish"
+
+
+def bump_version(version: str) -> str:
+    """``'jobs.v2'`` -> ``'jobs.v3'``; the version a breaking change must move to."""
+    feed, _, number = version.rpartition(".v")
+    if not feed or not number.isdigit():
+        raise ValueError(f"not a contract version of the form '<feed>.v<N>': {version!r}")
+    return f"{feed}.v{int(number) + 1}"
+
+
+def published_bump_hint(version: str) -> str:
+    """The one sentence every "you changed a released fixture" message leads with."""
+    return f"{version} is published — bump to {bump_version(version)}"
+
+
+def version_of_fixture(repo_relative_path: str) -> str | None:
+    """The contract version directory a suite file sits in, or ``None`` for the
+    manifest and the register themselves, which are not versioned."""
+    remainder = repo_relative_path.removeprefix(f"{FIXTURE_ROOT}/")
+    directory, separator, _ = remainder.partition("/")
+    return directory if separator else None
 
 
 def fixture_relative_path(contract: FeedContract, tab: TabContract) -> str:

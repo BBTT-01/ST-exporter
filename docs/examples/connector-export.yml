@@ -21,7 +21,7 @@
 #   jobs-feed           */5         TradeRated, Profit Wizard
 #   technicians-feed    */30        TradeRated, Profit Wizard
 #   pricebook-feed      hourly      TrueQuote
-#   financial-feed      daily       Profit Wizard
+#   financial-feed      */6 hours   Profit Wizard
 #   outbox-drain        */5         everyone — see below, it is not a feed
 #
 # Every feed job is OFF until a repository VARIABLE turns it on, so a
@@ -135,7 +135,7 @@ jobs:
     if: >-
       vars.JOBS_FEED == 'true' &&
       (github.event.schedule == '*/5 * * * *' || github.event.inputs.feed == 'jobs')
-    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.3.0
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.9
     with:
       feeds: "jobs"
     secrets:
@@ -151,7 +151,7 @@ jobs:
     if: >-
       vars.TECHNICIANS_FEED == 'true' &&
       (github.event.schedule == '*/30 * * * *' || github.event.inputs.feed == 'technicians')
-    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.3.0
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.9
     with:
       feeds: "technicians"
     secrets:
@@ -167,7 +167,7 @@ jobs:
     if: >-
       vars.PRICEBOOK_FEED == 'true' &&
       (github.event.schedule == '7 * * * *' || github.event.inputs.feed == 'pricebook')
-    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.3.0
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.9
     with:
       feeds: "pricebook"
       # Blank exports the whole catalogue, which is what almost every tenant
@@ -196,7 +196,7 @@ jobs:
     if: >-
       vars.FINANCIAL_FEED == 'true' &&
       (github.event.schedule == '37 */6 * * *' || github.event.inputs.feed == 'financial')
-    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.3.0
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.9
     with:
       feeds: "financial"
     secrets:
@@ -217,7 +217,7 @@ jobs:
   outbox-drain:
     if: >-
       github.event.schedule == '*/5 * * * *' || github.event.inputs.feed == 'outbox'
-    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.3.0
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.9
     with:
       # `outbox` and nothing else. Adding an export feed here would put this job
       # back on the shared export lock and back behind the hourly pricebook run,

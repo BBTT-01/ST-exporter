@@ -15,15 +15,50 @@ Two separate concerns, both handled explicitly rather than by relying on root:
    root or weakening (1)'s security rationale.
 
 ``configure_logging`` is called unconditionally at the top of every run.
+
+``announce_to_actions`` is the third concern: a WARNING in the log of a run that
+SUCCEEDS is invisible. GitHub only surfaces a message if it is an annotation or a
+step summary, so anything a human must actually see has to be emitted as both.
+`export.yml` already does this by hand for the drain notice; this is the same
+thing for warnings raised from Python.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 
 _QUIET_LOGGERS = ("httpx", "httpcore")
 
 logger = logging.getLogger("st_exporter")
+
+
+def _escape(value: str) -> str:
+    """GitHub's workflow-command escaping: a raw newline would end the command."""
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def announce_to_actions(title: str, message: str) -> None:
+    """Also surface ``message`` in the GitHub Actions UI, if that is where we are.
+
+    Two channels, because they answer different questions: the ``::warning``
+    annotation puts a yellow line on the run itself (visible without opening the
+    log of a green run — which is the whole problem), and the step summary is what
+    somebody reading the run afterwards sees first.
+
+    A no-op outside Actions, and it NEVER raises: every caller is a detector, and a
+    detector must not be able to fail the run it is watching.
+    """
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+    try:
+        print(f"::warning title={_escape(title)}::{_escape(message)}", flush=True)
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a", encoding="utf-8") as handle:
+                handle.write(f"- **{title}** — {message}\n")
+    except Exception:  # a notice must never break the run it is reporting on
+        logger.debug("could not emit a GitHub Actions annotation", exc_info=True)
 
 
 def configure_logging() -> None:

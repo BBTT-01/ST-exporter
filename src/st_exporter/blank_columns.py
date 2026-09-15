@@ -14,11 +14,17 @@ say so loudly.
 This is a DETECTOR, not a guard. It never raises, never changes a grid and never
 fails a tab — a genuinely empty column on a real tenant must still export. The only
 output is a WARNING naming the tab, the column and the row count.
+
+**And a warning nobody reads is not an output.** The run that carried the 2431
+blank rows was GREEN, and a green Actions run is a run whose log nobody opens. So
+under Actions the same warning is also emitted as a `::warning` annotation and
+appended to the step summary (`logging_setup.announce_to_actions`), which is how
+`export.yml` already surfaces the drain notice.
 """
 
 from __future__ import annotations
 
-from st_exporter.logging_setup import logger
+from st_exporter.logging_setup import announce_to_actions, logger
 
 #: A tab must have at least this many data rows before an all-blank column is
 #: reported. The number is a coincidence threshold, not a size preference: if a
@@ -114,6 +120,15 @@ def _scan(tab_name: str, grid: list[list[str]], min_rows: int) -> list[str]:
             tab_name,
             column,
             len(rows),
+        )
+        # A warning in the log of a SUCCESSFUL Actions run is invisible: the run is
+        # green, nobody opens it, and the 2431-row bug lasted the whole life of the
+        # feature for exactly that reason. An annotation shows on the run itself.
+        announce_to_actions(
+            "Blank column",
+            f"{tab_name}.{column} is empty on all {len(rows)} exported rows — almost "
+            f"certainly a wrong ServiceTitan field name, not a tenant with no data. "
+            f"See st_exporter/blank_columns.py.",
         )
     return blank
 

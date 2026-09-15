@@ -25,6 +25,14 @@ documented at ``_resolve``'s own docstring:
   order only ever decides between two populated values.
 - *``contacts[]``.* Only ``_contact_detail`` selects ``contacts[]`` by ``type``;
   no path DSL can express "the entry whose type is Phone".
+- *A blank array entry with no flat key beside it.* ``{"phoneSettings": [{"phone":
+  ""}]}`` is ``''`` to the DSL (the literal path holds a blank, and "present but
+  blank" is a fact a debugging table should show) and ``None`` to the exporter
+  (it asks "does this customer have a phone number anywhere", and the answer is
+  no). Both write a blank cell, so nothing downstream can tell them apart — but
+  it is a fourth difference, and it was missing from this list.
+
+There are FOUR of them, not three. Any other disagreement is drift.
 
 If you change either implementation and this file goes red, the question is
 which of the two is now wrong — not which assertion to relax.
@@ -155,3 +163,22 @@ class TestTheDeliberateDifferences:
         # ...the exporter's `fields` tuple puts `phone` first. Both are
         # widen-only; neither can blank a column that used to resolve.
         assert _contact_detail(customer, settings_key="phoneSettings", fields=_FIELDS) == "555-2222"
+
+    def test_a_blank_only_array_is_present_but_blank_to_one_and_absent_to_the_other(
+        self,
+    ) -> None:
+        """The fourth difference — the one this file used to say did not exist.
+
+        Only visible when there is no flat scalar beside the blank array entry: with
+        one (``{"phoneSettings": [{"phone": ""}], "phone": ""}``, in the agreeing
+        matrix above) both return ``''``.
+        """
+        customer = {"phoneSettings": [{"phone": ""}]}
+        # The column key names that exact path, and it holds a blank string.
+        assert _resolve(customer, _DSL_KEY) == ""
+        # The exporter scanned every entry, found nothing non-empty, and has no
+        # flat `phone` key to fall back to: there is no phone number here.
+        assert _contact_detail(customer, settings_key="phoneSettings", fields=_FIELDS) is None
+        # Harmless downstream — both render as an empty cell — but pinned, because
+        # an unexplained disagreement between these two is how the round-two bug
+        # looked right up until it was one.

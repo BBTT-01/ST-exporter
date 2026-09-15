@@ -68,12 +68,32 @@ class OutboxLedger:
     One ledger instance is shared by every lane in a run: they all read and
     write the same tab, and a single read-modify-write cycle over the whole tab
     is what keeps lane B from clobbering lane A's rows on flush.
+
+    **Because it is shared, "this ledger is not accepting rows" is shared too.**
+    A failed flush is a fact about the Sheet, not about the lane that happened to
+    hit it, so it is recorded HERE (:meth:`mark_unwritable`) rather than in a
+    local variable inside one drain. When it lived in a local, each later lane
+    performed exactly one unledgered ServiceTitan write before hitting the same
+    failing flush — three lanes, three real writes at risk of duplicating.
     """
 
     def __init__(self, store: SheetsPort) -> None:
         self._store = store
         self._entries: dict[tuple[str, str], LedgerEntry] = {}
         self._loaded = False
+        self._unwritable = False
+
+    @property
+    def unwritable(self) -> bool:
+        """True once a flush has failed: no further ServiceTitan write is safe.
+
+        Not reset within a run. The next run re-reads the tab and starts clean.
+        """
+        return self._unwritable
+
+    def mark_unwritable(self) -> None:
+        """Record that this ledger could not be flushed, for EVERY lane sharing it."""
+        self._unwritable = True
 
     def _ensure_loaded(self) -> None:
         if self._loaded:

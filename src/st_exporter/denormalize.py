@@ -149,10 +149,19 @@ def _typed_contact(customer: dict[str, Any], contact_types: tuple[str, ...]) -> 
     this is the reading most likely to be the real one.
 
     It is added BENEATH the settings-array and ABOVE the flat scalar rather than
-    replacing either, because the contract only ever widens: no tenant shape
-    that resolved a number before resolves a different one now, and a tenant
-    that only ever had `contacts[]` stops exporting a blank column. Selection is
-    by ``type``, never by position — index 0 of a customer's contacts can just
+    replacing either. **This is not purely widening, and the precedent matters.**
+    A tenant carrying BOTH a typed ``contacts[]`` entry and a populated flat
+    ``phone`` used to export the scalar and now exports the contact:
+
+        {"contacts": [{"type": "Phone", "value": "A"}], "phone": "B"}
+
+    gave ``B`` before and gives ``A`` now. That is deliberate — ``contacts[]`` is
+    the shape ServiceTitan's schema actually documents, and the flat scalar is a
+    guess kept as a fallback — but it IS a changed value for that shape, not a
+    newly-filled blank. What the layering does guarantee is the weaker and more
+    important property: no column that resolved a value before is blank now, and
+    a tenant that only ever had ``contacts[]`` stops exporting a blank column.
+    Selection is by ``type``, never by position — index 0 of a customer's contacts can just
     as easily be their fax number, and an email in the phone column is a wrong
     answer, which is worse than a blank one.
 

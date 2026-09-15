@@ -427,3 +427,85 @@ class TestAnItemWithNoIdentityIsNeverPerformed:
         summary = drain_outbox(MagicMock(), lane, OutboxLedger(InMemorySheetsStore()))
         assert summary == DrainSummary(claimed=2, succeeded=1, failed=1, replayed=0)
         lane.report_success.assert_called_once_with(items[1], "st-i2")
+
+
+class TestAnUnwritableLedgerStopsEveryLaneNotJustTheOneThatHitIt:
+    """`drain_lanes` hands the SAME ledger to each lane in turn.
+
+    The "stop performing" flag used to be a local inside `drain_outbox`, so it
+    died with that call: lane 2 performed one real ServiceTitan write before
+    hitting the identical failing flush, and so did lane 3. Three lanes, two
+    extra unledgered writes — each one a booking or a lead that duplicates when
+    the app redelivers it.
+    """
+
+    def _lanes(self, performs: list[str]):
+        def perform(client, item):  # type: ignore[no-untyped-def]
+            performs.append(f"{item.id}")
+            return f"st-{item.id}"
+
+        return [
+            _lane(
+                [
+                    OutboxItem(
+                        id=product,
+                        idempotency_key=f"k-{product}",
+                        kind="booking",
+                        payload={},
+                    )
+                ],
+                product=product,
+                perform=perform,
+            )
+            for product in ("traderated", "truequote", "profitwizard")
+        ]
+
+    def test_only_the_first_lane_performs_a_write(self) -> None:
+        performs: list[str] = []
+        lanes = self._lanes(performs)
+        # Every ledger flush fails, for every lane.
+        ledger = OutboxLedger(_FlushFailingStore(failures=99))
+
+        outcomes = drain_lanes(MagicMock(), lanes, ledger)
+
+        assert performs == ["traderated"], (
+            f"lanes 2 and 3 performed an unledgered ServiceTitan write each: {performs}"
+        )
+        assert ledger.unwritable
+        # Lane 1 performed, recorded nothing, and reported — so it is not redelivered.
+        assert outcomes[0].summary == DrainSummary(claimed=1, succeeded=1, failed=0, replayed=0)
+        # Lanes 2 and 3 did nothing at all, and said so rather than erroring.
+        for outcome in outcomes[1:]:
+            assert outcome.error is None
+            assert outcome.summary == DrainSummary(claimed=0, succeeded=0, failed=0, replayed=0)
+
+    def test_the_skipped_lanes_neither_claim_nor_report(self) -> None:
+        """Unclaimed and unreported is the correct outcome: the app's lease never
+        starts, so it simply redelivers next run — no duplicate write, none lost."""
+        performs: list[str] = []
+        lanes = self._lanes(performs)
+
+        drain_lanes(MagicMock(), lanes, OutboxLedger(_FlushFailingStore(failures=99)))
+
+        for lane in lanes[1:]:
+            lane.claim.assert_not_called()
+            lane.report_success.assert_not_called()
+            lane.report_failure.assert_not_called()
+
+    def test_a_healthy_ledger_still_drains_every_lane(self) -> None:
+        performs: list[str] = []
+        lanes = self._lanes(performs)
+        drain_lanes(MagicMock(), lanes, OutboxLedger(InMemorySheetsStore()))
+        assert performs == ["traderated", "truequote", "profitwizard"]
+
+    def test_the_skip_is_logged_at_error_naming_the_product(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        import logging
+
+        performs: list[str] = []
+        lanes = self._lanes(performs)
+        with caplog.at_level(logging.ERROR):
+            drain_lanes(MagicMock(), lanes, OutboxLedger(_FlushFailingStore(failures=99)))
+
+        skipped = [r.getMessage() for r in caplog.records if "SKIPPED ENTIRELY" in r.getMessage()]
+        assert len(skipped) == 2, skipped
+        assert "truequote" in skipped[0] and "profitwizard" in skipped[1]

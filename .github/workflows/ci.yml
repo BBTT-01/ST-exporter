@@ -1,0 +1,57 @@
+# The repo's own checks, on pull requests. There was no CI here at all until
+# this file: `.github/workflows/` held only `export.yml`, which is a REUSABLE
+# workflow contractors call and never runs on a push to this repository. So
+# every guard in the test suite — the contract fixtures, the published register,
+# the caller-workflow assertions — ran only when somebody remembered to type
+# `pytest`, and a producer-side guard nobody runs is a theoretical guard.
+#
+# IT CANNOT INTERFERE WITH `export.yml`. It is a separate file that:
+#   - declares no `workflow_call`, so no connector repository can call it;
+#   - takes no `secrets`, so it cannot touch a tenant's ServiceTitan or Sheet;
+#   - never runs `st-export`, so it writes no tab and drains no outbox;
+#   - takes its own concurrency group, so it cannot queue behind, or hold up,
+#     any customer's export run.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  # Per branch/PR, and superseding an in-flight run of ITSELF only. Nothing here
+  # writes anything, so cancelling a stale run is free.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Tests
+        run: pytest
+
+      # The producer half of the contract guard, run the way a reviewer cannot
+      # forget to. `--check` writes nothing: it fails if the committed fixtures
+      # are not what the exporter produces, and it REFUSES (exit 2) if producing
+      # them would rewrite a version that has already been released.
+      - name: Contract fixtures are neither stale nor a silent rewrite
+        run: python scripts/gen_contract_fixtures.py --check
+
+      - name: Lint
+        run: |
+          ruff check src/st_exporter tests/st_exporter
+          ruff format --check src/st_exporter tests/st_exporter

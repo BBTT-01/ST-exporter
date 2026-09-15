@@ -33,8 +33,8 @@ JOB_2 = {
     "modifiedOn": "2026-01-01T00:00:00Z",
 }
 
-CUSTOMER_10 = {"id": 10, "name": "Jane Doe", "phone": "555-1111", "email": "jane@example.com"}
-CUSTOMER_11 = {"id": 11, "name": "Bob Smith", "phone": "555-3333", "email": "bob@example.com"}
+CUSTOMER_10 = {"id": 10, "name": "Jane Doe", "phone": "555-0111", "email": "jane@example.com"}
+CUSTOMER_11 = {"id": 11, "name": "Bob Smith", "phone": "555-0133", "email": "bob@example.com"}
 
 LOCATION_20 = {
     "id": 20,

@@ -63,10 +63,84 @@ READS them. Rename a column without bumping the version and `pytest` goes red wi
 a message naming the tab, the column, and the only two ways out — written for
 someone who did not write this code.
 
-**No real customer data.** This repo is public; every fixture is synthetic, and
-the suite mechanically rejects an email outside the reserved domains or a phone
-outside the `555` block. The full scrubbing rule for any future recording from a
+**No real customer data.** This repo is public; every fixture is synthetic. The
+suite rejects any email whose DOMAIN (anchored at the `@`) is not one of the four
+reserved ones, any run of 7+ digits that is not `555-01xx`, and — the part no
+regex can do — any cell that does not trace back to a literal in
+`tests/st_exporter/fixtures/`. Names, addresses and prices have no recognisable
+shape, so what is checked for them is provenance: a recorded response cannot
+reach the committed suite without being hand-transcribed into the synthetic
+source records first. The full scrubbing rule for any future recording from a
 live tenant is in the contract doc.
+
+### A published version is frozen — `contracts/fixtures/published.json`
+
+Every check above compares the fixtures to what the code produces **today**,
+which is a check that regenerating always satisfies. Rename a column, run
+`scripts/gen_contract_fixtures.py`, and the suite went green again with `jobs.v2`
+still stamped on a tab no consumer's reader can find a column in — every
+consumer's version check passing, every consumer reading the old name, zero rows,
+four codebases, no error anywhere.
+
+`published.json` records the sha256 of every fixture **as released**. It is the
+only file in the suite not derived from the current code:
+
+- the test suite asserts every file under a released version still hashes to it,
+  and fails with `jobs.v2 is published — bump to jobs.v3`;
+- the generator REFUSES to write a change to a released version (exit 2) and
+  names the version to bump. `--republish <version>` exists for a genuine typo in
+  a released fixture and needs a CHANGELOG line naming it;
+- deleting the register does not rebuild it from today's code: that was the
+  one-`rm` bypass, and it is refused too.
+
+Failure messages now lead with **bump the version**, and present regeneration as
+what you do afterwards. Leading with "regenerate" was pointing at the bypass.
+
+`row_key` is also asserted against the rows themselves — every tab's committed
+rows must be unique under it, and the `jobs` fixture must contain at least one
+appointment carrying two technicians. Comparing the fixture's `row_key` string to
+`contracts.py` only proved the fixture was generated from `contracts.py`. This is
+what would have caught 0.2.7, which renamed nothing and changed only uniqueness.
+
+### CI, at last
+
+`.github/workflows/ci.yml` runs `pytest`, `gen_contract_fixtures.py --check` and
+ruff on every pull request. Until now `.github/workflows/` held only `export.yml`
+— a reusable workflow contractors call, which never runs on a push here — so every
+guard in this repo ran only when somebody remembered to type `pytest`. CI is
+`pull_request`/`push` only, declares no `workflow_call`, takes no secrets and
+never runs `st-export`, so it cannot interfere with a customer's export.
+
+### Fixed — the example caller pinned a tag that does not exist
+
+`docs/examples/connector-export.yml` — the file whose own header calls it the
+SOURCE OF TRUTH, and which every connector repository copies — had all five
+`uses:` lines on `@exporter-v0.3.0`. Tags stop at `exporter-v0.2.8` and this
+release is 0.2.9, so a contractor copying it got a workflow GitHub cannot
+resolve: every feed and the drain stop, and the only symptom is runs that do not
+happen. Now pinned to `exporter-v0.2.9`, asserted equal to `export.yml`'s
+`EXPORTER_TAG` by a test (the old one only checked the five agreed with each
+other), and rewritten by `scripts/release.sh`, whose comment claimed "exactly
+two" version literals while this was a third it never touched. The header table's
+`financial-feed daily` is also corrected to six-hourly, and a test now pins that
+table to the crons.
+
+### Documentation
+
+- `jobs.v1` has **no fixture** and cannot have one — the code that produced that
+  grain was replaced in 0.2.7, before this suite existed. The contract doc said
+  old version directories stay "so a consumer still pinned keeps a fixture" and
+  named `jobs.v1`; it now says plainly that a consumer on a Sheet last written by
+  0.2.6 or older has prose and nothing else.
+- `denormalize._contact_detail` claimed inserting the `contacts[]` layer meant "no
+  shape that resolved a value before resolves a different one now". False:
+  `{"contacts": [{"type": "Phone", "value": "A"}], "phone": "B"}` gave `B` and now
+  gives `A`. Deliberate — `contacts[]` is the documented shape — but a changed
+  value, not a filled blank. Both that docstring and the test that repeated the
+  claim are corrected.
+- `_resolve` and the parity test enumerated "three deliberate differences" from
+  `_contact_detail`. There are four: `{"phoneSettings": [{"phone": ""}]}` is `''`
+  to one and `None` to the other. Pinned by a test.
 
 ### For the three consuming apps
 
@@ -175,6 +249,27 @@ The payload is mapped rather than forwarded — string ids to integers, and the
 1-5 star rating doubled to ServiceTitan's 0-10 scale. Forwarding it unmapped
 would have posted every five-star review as 5/10: a wrong number that looks
 right.
+
+### Fixed — one unwritable ledger used to cost one unledgered write PER LANE
+
+`drain_lanes` hands the SAME `OutboxLedger` to each lane in turn, but "the ledger
+stopped accepting rows" was a local variable inside `drain_outbox`. So it died
+with that call: lane 2 performed one real ServiceTitan write before hitting the
+identical failing flush, and so did lane 3 — three lanes, two extra unledgered
+writes, each one a booking or a lead that duplicates when the app redelivers it.
+The state now lives on the ledger (`OutboxLedger.unwritable`), so the first
+failed flush stops every remaining lane. Those lanes claim nothing, perform
+nothing and report nothing: the app's lease expires and it redelivers, which
+neither duplicates a write nor loses one.
+
+### Blank-column warnings are visible in a green Actions run
+
+The detector logged a warning, and a warning in the log of a **successful** run is
+invisible — which is exactly how the 2431-row `job_number` bug lasted the life of
+the feature. Under Actions the same message is now also a `::warning` annotation
+on the run and a line in the step summary, the way `export.yml` already surfaces
+the drain notice. A test also asserts every `ALL_BLANK_OK` key names a real column
+of a real tab: a typo'd entry exempts nothing, silently.
 
 ### Idempotency is now keyed by `(product, idempotency_key)`
 

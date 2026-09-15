@@ -11,6 +11,11 @@ can go wrong, so this loop flushes per item, immediately after recording and
 before reporting — not once at the end, which would lose every already-performed
 item in the batch to a crash or to one item's report failing.
 
+**A failed flush stops every lane, not just the one that hit it.** The ledger is
+one shared object across all lanes in a run (``drain_lanes`` hands the same
+instance to each in turn), so it carries that state itself: see
+``OutboxLedger.unwritable``.
+
 **Never leave a performed item unreported.** The ledger is a best-effort
 optimisation for recognising a redelivery; the app's own queue is the other half
 of the same guarantee. So if the flush itself fails after a real ServiceTitan
@@ -96,9 +101,23 @@ def drain_outbox(
     *,
     limit: int = _DEFAULT_CLAIM_LIMIT,
 ) -> DrainSummary:
+    if ledger.unwritable:
+        # The ledger is SHARED by every lane in this run. An earlier lane already
+        # found it would not flush, so nothing can be recorded here either — and a
+        # ServiceTitan write we cannot record is a write that duplicates on the next
+        # redelivery. Do not even claim: an unclaimed item's lease never starts, so
+        # the app simply redelivers it next run, which is the correct outcome.
+        logger.error(
+            "%s outbox: SKIPPED ENTIRELY — the shared ledger stopped accepting rows "
+            "earlier in this run, so no write here could be recorded. Nothing was "
+            "claimed, performed or reported; every item stays queued in the app and "
+            "will be redelivered once the ledger is writable again.",
+            lane.product,
+        )
+        return DrainSummary(claimed=0, succeeded=0, failed=0, replayed=0)
+
     items = lane.claim(limit)
     succeeded = failed = replayed = 0
-    ledger_unwritable = False
 
     for item in items:
         if not item.idempotency_key or not item.id:
@@ -137,6 +156,21 @@ def drain_outbox(
             )
             _report(lane, item, succeeded=True, value=existing.st_id)
             continue
+
+        if ledger.unwritable:
+            # Belt to the `break` below's braces, and the invariant stated where it
+            # matters: NOTHING is performed while the ledger cannot record it. The
+            # remaining items are left unperformed AND unreported on purpose — the
+            # app's lease expires and it redelivers them, which is the one outcome
+            # that neither duplicates a write nor loses one.
+            logger.error(
+                "%s outbox: stopping before item %s — the ledger is not accepting rows, "
+                "so this write could not be recorded. It is left unperformed and "
+                "unreported; the app's lease will expire and redeliver it.",
+                lane.product,
+                item.id,
+            )
+            break
 
         try:
             st_id = lane.perform(client, item)
@@ -196,9 +230,11 @@ def drain_outbox(
                 exc,
             )
             _report(lane, item, succeeded=True, value=st_id)
-            # Stop performing: the ledger is not accepting rows, so every further
-            # write in this lane would carry the same duplicate risk.
-            ledger_unwritable = True
+            # Stop performing — in EVERY lane, not just this one. The ledger is
+            # shared, so a flush that failed here will fail there: marking it on the
+            # ledger is what stops each remaining lane from performing one more
+            # unledgered ServiceTitan write apiece before discovering the same thing.
+            ledger.mark_unwritable()
             break
         _report(lane, item, succeeded=True, value=st_id)
 
@@ -207,7 +243,7 @@ def drain_outbox(
     # the same reason as the per-item flush: by here every performed item has
     # already been reported, and raising would turn a completed lane into a
     # `LaneOutcome(error=...)` that hides its counts.
-    if not ledger_unwritable:
+    if not ledger.unwritable:
         try:
             ledger.flush()
         except Exception as exc:

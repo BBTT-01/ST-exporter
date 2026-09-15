@@ -315,3 +315,137 @@ def test_every_caller_job_pins_the_same_exporter_tag(caller: dict[Any, Any]) -> 
     tag = tags.pop()
     assert tag.startswith("exporter-v"), tag
     assert tag != "main" and "branch" not in tag
+
+
+def test_the_caller_pins_the_tag_this_repo_publishes(caller: dict[Any, Any]) -> None:
+    """The five `uses:` lines agreeing with each other is not enough.
+
+    They agreed perfectly at `exporter-v0.3.0` — a tag that does not exist. Tags
+    stop at 0.2.8 and `EXPORTER_TAG`/`pyproject.toml` say 0.2.9, so a contractor
+    copying the file whose own header calls it "the SOURCE OF TRUTH" got a
+    workflow GitHub cannot resolve: every feed and the drain stop, with the only
+    symptom being runs that do not happen.
+
+    So the caller is checked against the ONE literal in `export.yml`, which is
+    what `scripts/release.sh` moves and what the runtime guard verifies against
+    the installed package.
+    """
+    published = re.search(r"^ +EXPORTER_TAG: (exporter-v\S+)$", WORKFLOW.read_text(), re.M)
+    assert published, "export.yml no longer declares a single EXPORTER_TAG literal"
+    expected = published.group(1)
+    pinned = {job["uses"].split("@", 1)[1] for job in caller["jobs"].values()}
+    assert pinned == {expected}, (
+        f"CALLER PINS A DIFFERENT TAG — docs/examples/connector-export.yml uses "
+        f"{sorted(pinned)} but this repository publishes {expected} "
+        f"(.github/workflows/export.yml, EXPORTER_TAG).\n"
+        f"A contractor copies that file verbatim. A tag that does not exist is not a "
+        f"warning: GitHub cannot resolve the workflow, so every feed and the drain "
+        f"simply stop running.\n"
+        f"Bump all three literals together with: ./scripts/release.sh <X.Y.Z>"
+    )
+
+
+def test_the_pinned_tag_is_the_version_in_pyproject(caller: dict[Any, Any]) -> None:
+    """...and the tag names the version this source tree actually is."""
+    pyproject = (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text()
+    version = re.search(r'^version = "(.+)"$', pyproject, re.M)
+    assert version
+    tag = {job["uses"].split("@", 1)[1] for job in caller["jobs"].values()}.pop()
+    assert tag == f"exporter-v{version.group(1)}", (
+        f"{tag} does not name pyproject.toml's version {version.group(1)}. "
+        f"Use ./scripts/release.sh <X.Y.Z>, which moves all three together."
+    )
+
+
+def test_release_sh_rewrites_the_caller_too() -> None:
+    """Its comment used to say "there are exactly two" version literals while the
+    caller's five `uses:` lines sat there untouched — which is how they drifted to
+    a non-existent tag in the first place."""
+    release = (Path(__file__).resolve().parents[2] / "scripts" / "release.sh").read_text()
+    assert "docs/examples/connector-export.yml" in release, (
+        "scripts/release.sh does not touch the caller workflow, so a release leaves it "
+        "pinned to the previous tag and nothing bumps it."
+    )
+    assert "exactly two" not in release
+
+
+def test_the_caller_header_table_states_the_cadence_each_job_actually_runs_on(
+    caller: dict[Any, Any],
+) -> None:
+    """The header table is the only part of that file a contractor reads before
+    copying it, and it said `financial-feed daily` for a run that moved to
+    six-hourly. A wrong table is how a contractor concludes a feed is broken."""
+    header = CALLER.read_text().split("jobs:", 1)[0]
+    stated = dict(re.findall(r"^#   ([a-z-]+-(?:feed|drain)) +(\S+(?: \S+)?) ", header, re.M))
+    assert set(stated) == set(FEED_JOBS) | {DRAIN_JOB}, stated
+    expected_minutes = {
+        "jobs-feed": "*/5",
+        "technicians-feed": "*/30",
+        "pricebook-feed": "hourly",
+        "financial-feed": "*/6 hours",
+        DRAIN_JOB: "*/5",
+    }
+    assert stated == expected_minutes, (
+        f"THE HEADER TABLE IS STALE — it says {stated}, the crons say {expected_minutes}."
+    )
+    # And the claim about `financial-feed` is grounded in the cron, not in this table.
+    assert _evaluate(
+        caller["jobs"]["financial-feed"]["if"], variables=_ALL_ON, schedule="37 */6 * * *"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CI — `.github/workflows/ci.yml`.
+#
+# Until it existed, `.github/workflows/` held only the reusable `export.yml`,
+# which never runs on a push to this repository. Every guard in this suite was
+# therefore enforced only by someone remembering to type `pytest`.
+# ---------------------------------------------------------------------------
+
+CI = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+
+
+@pytest.fixture(scope="module")
+def ci() -> dict[Any, Any]:
+    parsed: Any = yaml.safe_load(CI.read_text())
+    return dict(parsed)
+
+
+def test_ci_runs_the_suite_and_the_contract_check_on_pull_requests(ci: dict[Any, Any]) -> None:
+    triggers = _triggers(ci)
+    assert "pull_request" in triggers, (
+        "CI must run on pull requests: a producer-side contract guard that only runs "
+        "when someone remembers to type `pytest` is a theoretical guard."
+    )
+    steps = [step.get("run", "") for job in ci["jobs"].values() for step in job["steps"]]
+    assert any(re.search(r"\bpytest\b", run) for run in steps), steps
+    assert any("gen_contract_fixtures.py --check" in run for run in steps), steps
+
+
+def test_ci_cannot_interfere_with_the_customer_export_workflow(ci: dict[Any, Any]) -> None:
+    """`export.yml` is a REUSABLE workflow contractors call against live tenants.
+
+    CI must stay incapable of touching it: not callable, not scheduled, handed no
+    secrets, and never running the exporter itself.
+    """
+    triggers = _triggers(ci)
+    assert "workflow_call" not in triggers, "a connector repo must not be able to call CI"
+    assert "schedule" not in triggers, "CI must not run on a customer's cadence"
+    text = CI.read_text()
+    assert "secrets." not in text, "CI is handed no tenant credentials"
+    assert "st-export-${{ github.repository }}" not in text, (
+        "CI must not take either of the export workflow's concurrency locks"
+    )
+    steps = [step.get("run", "") for job in ci["jobs"].values() for step in job["steps"]]
+    assert not any("st-export" in run for run in steps), (
+        "CI must never run the exporter itself — it would write to a tab or drain a queue"
+    )
+    used = [str(step.get("uses", "")) for job in ci["jobs"].values() for step in job["steps"]]
+    assert not any("export.yml" in entry for entry in used), used
+
+
+def test_the_export_workflow_is_still_reusable_only(workflow_text: str) -> None:
+    """The other direction of the same separation: adding CI must not have given
+    `export.yml` a trigger of its own, which would run it here against no secrets."""
+    triggers = _triggers(dict(yaml.safe_load(workflow_text)))
+    assert set(triggers) == {"workflow_call"}, triggers

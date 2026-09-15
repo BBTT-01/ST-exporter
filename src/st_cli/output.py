@@ -59,6 +59,16 @@ def _resolve(record: dict[str, Any], key: str) -> Any:
       ``type``; no path DSL can express "the entry whose type is Phone", so this
       resolver has no equivalent and the CLI's phone/email columns can still be
       blank where the exporter's are not.
+    - **A blank array entry with nothing beside it.** ``{"phoneSettings":
+      [{"phone": ""}]}`` resolves to ``''`` here (the named path holds a blank,
+      and "present but blank" is worth seeing) and to ``None`` in
+      ``_contact_detail`` (which found no non-empty entry and has no flat key to
+      fall back to). Both render as an empty cell, so nothing downstream can tell
+      them apart — but it is a real difference and it is pinned, because an
+      unexplained disagreement between these two is exactly what the round-two
+      bug looked like before anyone noticed.
+
+    FOUR differences, not three. Anything else is drift.
     """
     first_seen: Any = None
     seen = False

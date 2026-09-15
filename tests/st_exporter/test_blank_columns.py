@@ -209,3 +209,63 @@ def test_jobs_feed_runs_the_detector_over_the_grid_it_writes(
     assert "technicians" in checked_tabs
     jobs_call = next(c for c in checked.call_args_list if c.args[0] == "jobs")
     assert jobs_call.args[1] == export_store.tabs["jobs"]
+
+
+class TestItIsVisibleInAGreenActionsRun:
+    """A `logger.warning` in a SUCCESSFUL run's log is invisible, and that is how
+    the 2431-row bug survived: the run was green, so nobody opened it."""
+
+    def test_a_blank_column_emits_an_actions_annotation_and_a_step_summary_line(
+        self, monkeypatch, capsys, tmp_path
+    ) -> None:
+        summary = tmp_path / "summary.md"
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+
+        assert check_blank_columns("jobs", _grid(ABOVE)) == ["suspect"]
+
+        printed = capsys.readouterr().out
+        assert "::warning title=Blank column::" in printed
+        assert "jobs.suspect" in printed and str(ABOVE) in printed
+        annotation = printed.split("::warning", 1)[1].rstrip("\n")
+        assert "\n" not in annotation, "a raw newline would terminate the command early"
+        written = summary.read_text()
+        assert "Blank column" in written and "jobs.suspect" in written
+
+    def test_nothing_is_printed_outside_actions(self, monkeypatch, capsys) -> None:
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        check_blank_columns("jobs", _grid(ABOVE))
+        assert "::warning" not in capsys.readouterr().out
+
+    def test_an_unwritable_step_summary_cannot_fail_the_export(self, monkeypatch, tmp_path) -> None:
+        """The detector must never be able to fail the run it is watching."""
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "no" / "such" / "dir" / "s.md"))
+        assert check_blank_columns("jobs", _grid(ABOVE)) == ["suspect"]
+
+
+def test_every_all_blank_ok_entry_names_a_real_tab_and_a_real_column() -> None:
+    """An exemption that matches nothing exempts nothing — silently.
+
+    Every key here is a real column of a real tab today, but nothing asserted it,
+    so a typo (or a column renamed later and not renamed here) would leave a
+    dead entry behind: the column it was meant to cover goes back to being
+    reported, or — worse on a rename — the NEW column name is never exempt and
+    the entry sits there looking like it is doing something.
+    """
+    from st_exporter import contracts
+
+    tabs = contracts.tabs()
+    for tab_name, columns in ALL_BLANK_OK.items():
+        assert tab_name in tabs, (
+            f"ALL_BLANK_OK exempts columns on '{tab_name}', which is not a tab the "
+            f"exporter writes ({sorted(tabs)}). The exemption covers nothing."
+        )
+        declared = tabs[tab_name][1].columns
+        for column, reason in columns.items():
+            assert column in declared, (
+                f"ALL_BLANK_OK['{tab_name}']['{column}'] is not a column of that tab "
+                f"({list(declared)}). It exempts nothing, and the column it was meant "
+                f"to cover is being reported as blank on every run."
+            )
+            assert reason.strip(), f"{tab_name}.{column} is exempted with no reason given"
