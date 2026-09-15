@@ -251,6 +251,11 @@ jobs:
       # So: exactly one notice per cycle is correct. Two notices in the same
       # five minutes is a second drain, visible in the run list without reading
       # anyone's YAML.
+      #
+      # `contains()` here, but an exact `== 'outbox'` on the concurrency group
+      # above, and the asymmetry is deliberate in both directions: ANY run that
+      # drains must announce it (so `jobs,outbox` is caught), while only a run
+      # that provably writes no `_meta` may leave the shared export lock.
       - name: Announce the drain
         if: ${{ contains(inputs.feeds, 'outbox') }}
         env:

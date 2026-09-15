@@ -21,15 +21,44 @@ queues that trap was about to get three times worse.
 
 The capability is now keyed on an explicit request rather than on the incidental
 presence of a secret, so handing the secrets to a second job is **inert**. The
-existing repo-wide concurrency group is the second guarantee: every caller job
-calls this same reusable workflow, so two drains could never run at once even if
-someone did add `feeds: outbox` to a second job.
+concurrency group is the second guarantee: every drain names the same feeds
+string, so every drain takes the same lock and two of them could never run at
+once even if someone did add `feeds: outbox` to a second job. And the caller
+workflow no longer hands any feed job a product **machine token**, so a second
+job that asked for `outbox` would build no lane and drain nothing — three
+independent things now have to be true at once, where there used to be a comment.
 
 **This is a required migration for existing connectors.** A caller that bumps to
 this version without adding `outbox` to exactly one job stops draining. That
 cannot be silent, so every run carrying a product's secrets without the `outbox`
 feed logs a WARNING naming that product. `--feeds outbox` on its own skips the
 export half entirely, so a dedicated drain job costs no Sheets round-trip.
+
+### One drain job, four feed jobs, and the lock split in two
+
+The caller workflow every connector runs is now kept here, at
+`docs/examples/connector-export.yml`, and the suite asserts its shape: which
+jobs a contractor runs per product bought, the cadences, and that exactly one
+job drains. It used to be reviewed by eye, once per connector repository, which
+is how the one-drain comment came to be deleted from a live one.
+
+Every feed job is off until a repository **variable** turns it on
+(`JOBS_FEED`, `TECHNICIANS_FEED`, `PRICEBOOK_FEED`, `FINANCIAL_FEED`), so a
+reviews-only contractor exports no price book, no invoices and no timesheets.
+Variables rather than secrets because GitHub does not expose the `secrets`
+context to a job-level `if:`. The drain has no variable: every product writes
+through its outbox, and a drain that can be switched off by forgetting a
+variable is a drain that stops silently.
+
+The reusable workflow's concurrency group is now **two** groups per connector
+repository rather than one, split by what a run WRITES rather than by which job
+asked for it. Every run with an export feed keeps the shared `…-export` lock,
+because they all read and rewrite the whole `_meta` grid; a run asking for
+`outbox` and nothing else takes `…-outbox`, because it never touches `_meta` at
+all. That is what takes the 5-minute drain off the back of the hourly pricebook
+run. It is not a per-FEED key: per-feed locks would let two feeds rewrite
+`_meta` over each other, and the prerequisite for them is a merge-on-write
+`_meta` in Python, not a change to the YAML.
 
 ### Three apps, three path shapes, three scope vocabularies — none of it shared
 
