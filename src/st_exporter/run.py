@@ -69,6 +69,7 @@ from st_exporter.pricebook import CONTRACT_VERSION, build_category_grid, build_i
 from st_exporter.scopes import ScopeLedger
 from st_exporter.sheets import SheetsClient, SheetsPort, get_gspread_client
 from st_exporter.window import DEFAULT_WINDOW_DAYS, FINANCIAL_WINDOW_DAYS, in_window
+from st_exporter.writeback import JobsWriteBack
 
 _RAW_CUSTOMERS = "_raw_customers"
 _RAW_LOCATIONS = "_raw_locations"
@@ -183,6 +184,16 @@ class ExportSummary:
     # `::error` and exits non-zero (`cli.py`). That tab and its `_meta` row are
     # left exactly as the last good run left them; its siblings still refresh.
     scope_revoked: dict[str, str] = field(default_factory=dict)
+    # The `jobs` tab of this run, held open so the outbox drain that follows can
+    # write its own assignments straight into it (ticket 17) instead of waiting a
+    # whole cycle to rediscover them. None whenever that is not possible or not
+    # wanted: no `jobs` feed this run (a drain-only run must make no Export Store
+    # round-trip — see `JobsWriteBack`), or a dry run, which writes nothing at all.
+    #
+    # It is a live handle rather than data because applying it must happen AFTER
+    # the drain, and the drain happens after `run_export` has returned. `cli.py`
+    # is what joins the two.
+    jobs_write_back: JobsWriteBack | None = None
 
 
 def run_export(
@@ -310,6 +321,7 @@ def _run(
     feed_failures: dict[str, str] = {}
 
     windowed_rows: list[dict[str, Any]] = []
+    jobs_write_back: JobsWriteBack | None = None
     skipped_no_job = 0
     jobs_row_count = meta_rows["jobs"].row_count if "jobs" in meta_rows else 0
 
@@ -336,6 +348,25 @@ def _run(
         if jobs_outcome is not None:
             windowed_rows, skipped_no_job = jobs_outcome
             jobs_row_count = len(windowed_rows)
+            if not dry_run:
+                # The one door out of `_guarded_feed` that means "the tab on disk
+                # is THIS run's rows": a non-None outcome. The guard returns None
+                # for every other exit — a 403 (never granted, or revoked) and any
+                # other `STCLIError` alike — so a write-back handle cannot exist
+                # for a feed that wrote nothing. That is the whole precondition,
+                # and it is why the construction sits here rather than beside the
+                # call: a scope-denied `jobs` is a tab that does not exist on this
+                # Sheet (never granted) or one frozen at its last good run
+                # (revoked), and a write-back that replaced it would create a tab
+                # ServiceTitan just refused us the data for, out of rows this run
+                # never fetched — resurrecting a tab a quiet skip means to leave
+                # absent, and overwriting a revoked tab's preserved contents.
+                #
+                # Same rows, same builder, same tab — see `writeback.JobsWriteBack`.
+                # Created here and applied by `cli.py` after the drain, so no
+                # write-back can come between a written tab and the `_meta` row
+                # that describes it.
+                jobs_write_back = JobsWriteBack(export_store, windowed_rows)
         # Otherwise no tab was written — because the feed failed, or because a 403
         # ruled the tab out — and `jobs_row_count` keeps the carried-forward
         # `_meta` count, which is what the untouched tab still holds.
@@ -474,6 +505,7 @@ def _run(
         financial_failures=financial_failures,
         scope_not_granted=dict(scopes.not_granted),
         scope_revoked=dict(scopes.revoked),
+        jobs_write_back=jobs_write_back,
     )
 
 
