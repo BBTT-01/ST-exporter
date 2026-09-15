@@ -1,0 +1,88 @@
+# The repo's own checks, on pull requests. There was no CI here at all until
+# this file: `.github/workflows/` held only `export.yml`, which is a REUSABLE
+# workflow contractors call and never runs on a push to this repository. So
+# every guard in the test suite — the contract fixtures, the published register,
+# the caller-workflow assertions — ran only when somebody remembered to type
+# `pytest`, and a producer-side guard nobody runs is a theoretical guard.
+#
+# IT CANNOT INTERFERE WITH `export.yml`. It is a separate file that:
+#   - declares no `workflow_call`, so no connector repository can call it;
+#   - takes no `secrets`, so it cannot touch a tenant's ServiceTitan or Sheet;
+#   - never runs `st-export`, so it writes no tab and drains no outbox;
+#   - takes its own concurrency group, so it cannot queue behind, or hold up,
+#     any customer's export run.
+#
+# ##############################################################################
+# THIS WORKFLOW IS ADVISORY UNTIL `test` IS A REQUIRED STATUS CHECK ON `main`.
+#
+# GitHub honours `[skip ci]`, `[ci skip]` and `[no ci]` in the HEAD commit
+# message of a push or PR and does not start the run AT ALL. Nothing in this file
+# can prevent that — `if:` conditions are evaluated only once a run exists, so a
+# skipped workflow is not a failed one, it is an absent one. A pull request with
+# no runs is mergeable by default.
+#
+# The only fix is outside the repository:
+#   Settings -> Branches -> branch protection rule for `main`
+#     -> "Require status checks to pass before merging" -> add `test`.
+# A required check that never reported blocks the merge, which is what turns
+# every guard below — the contract fixtures, the published register, the
+# append-only anchor — from a courtesy into a gate. Whoever administers this
+# repository owns that setting; see docs/export-contract.md, "What CI cannot do
+# for itself".
+# ##############################################################################
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  # Per branch/PR, and superseding an in-flight run of ITSELF only. Nothing here
+  # writes anything, so cancelling a stale run is free.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Tests
+        run: pytest
+
+      # The producer half of the contract guard, run the way a reviewer cannot
+      # forget to. `--check` writes nothing: it fails if the committed fixtures
+      # are not what the exporter produces, and it REFUSES (exit 2) if producing
+      # them would rewrite a version that has already been released.
+      - name: Contract fixtures are neither stale nor a silent rewrite
+        run: python scripts/gen_contract_fixtures.py --check
+
+      # The trust anchor. Every check above judges the register against itself,
+      # and the register is a file in the branch under review — so all of them
+      # rest on nobody having hand-edited it. This one reads the copy on the BASE
+      # branch, which is already merged and released, and requires this branch's
+      # to be a superset: nothing published may change or disappear. It is the
+      # only step here whose authority comes from outside the branch.
+      - name: The published register is append-only vs the base branch
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          python scripts/check_register_append_only.py FETCH_HEAD
+
+      - name: Lint
+        run: |
+          ruff check src/st_exporter tests/st_exporter
+          ruff format --check src/st_exporter tests/st_exporter

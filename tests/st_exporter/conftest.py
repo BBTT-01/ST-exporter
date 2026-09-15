@@ -46,7 +46,7 @@ def mock_auth_token(auth_url: str, token: str = "test-token") -> None:
 
 @pytest.fixture(autouse=True)
 def clear_traderated_env(monkeypatch):
-    """Make every st_exporter test hermetic against ambient ``TRADERATED_*`` vars.
+    """Make every st_exporter test hermetic against ambient outbox-lane vars.
 
     ``TradeRatedSettings`` reads the process environment, so any test that
     constructs one without patching it (``TestFeedsFlag``, parts of
@@ -55,8 +55,15 @@ def clear_traderated_env(monkeypatch):
     convention below. Tests that *want* those vars set them with their own
     ``monkeypatch.setenv``, which runs after this fixture and wins.
     """
-    monkeypatch.delenv("TRADERATED_MACHINE_TOKEN", raising=False)
-    monkeypatch.delenv("TRADERATED_OUTBOX_BASE_URL", raising=False)
+    for prefix in ("TRADERATED", "TRUEQUOTE", "PROFITWIZARD"):
+        for suffix in (
+            "MACHINE_TOKEN",
+            "OUTBOX_URL",
+            "OUTBOX_BASE_URL",
+            "OUTBOX_DIALECT",
+            "IMAGE_TOKEN",
+        ):
+            monkeypatch.delenv(f"{prefix}_{suffix}", raising=False)
 
 
 @pytest.fixture(autouse=True)

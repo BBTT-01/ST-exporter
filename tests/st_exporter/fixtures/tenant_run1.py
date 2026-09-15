@@ -14,7 +14,7 @@ TENANT_ID = 12345
 
 JOB_1 = {
     "id": 1,
-    "number": "J-1",
+    "jobNumber": "J-1",
     "customerId": 10,
     "locationId": 20,
     "jobStatus": "Scheduled",
@@ -26,15 +26,15 @@ JOB_1 = {
 # into it in run 2 (tenant_run2.py).
 JOB_2 = {
     "id": 2,
-    "number": "J-2",
+    "jobNumber": "J-2",
     "customerId": 11,
     "locationId": 21,
     "jobStatus": "Scheduled",
     "modifiedOn": "2026-01-01T00:00:00Z",
 }
 
-CUSTOMER_10 = {"id": 10, "name": "Jane Doe", "phone": "555-1111", "email": "jane@example.com"}
-CUSTOMER_11 = {"id": 11, "name": "Bob Smith", "phone": "555-3333", "email": "bob@example.com"}
+CUSTOMER_10 = {"id": 10, "name": "Jane Doe", "phone": "555-0111", "email": "jane@example.com"}
+CUSTOMER_11 = {"id": 11, "name": "Bob Smith", "phone": "555-0133", "email": "bob@example.com"}
 
 LOCATION_20 = {
     "id": 20,

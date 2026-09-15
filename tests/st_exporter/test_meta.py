@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import pytest
+
 from st_exporter.meta import (
     META_COLUMNS,
     CursorBundle,
     MetaRow,
+    MetaRowSet,
     build_meta_grid,
     parse_meta_grid,
 )
@@ -82,7 +85,10 @@ def test_build_meta_grid_has_header_and_is_sorted_by_feed() -> None:
     assert grid[0] == list(META_COLUMNS)
     assert grid[1][0] == "jobs"
     assert grid[2][0] == "technicians"
-    assert grid[1] == ["jobs", "t1", "{}", "10", "0.1.0"]
+    # Trailing "" is contract_version: MetaRow defaults it to blank, which is what
+    # an exporter of 0.2.8 or older wrote. Every feed declares a real one now (see
+    # st_exporter.contracts); this test is about the grid shape, not the value.
+    assert grid[1] == ["jobs", "t1", "{}", "10", "0.1.0", ""]
 
 
 def test_parse_meta_grid_round_trips_build_meta_grid() -> None:
@@ -103,8 +109,33 @@ def test_parse_meta_grid_of_empty_grid_is_empty() -> None:
 
 
 def test_parse_meta_grid_skips_blank_rows() -> None:
-    grid = [list(META_COLUMNS), ["", "", "", "", ""]]
+    grid = [list(META_COLUMNS), ["", "", "", "", "", ""]]
     assert parse_meta_grid(grid) == {}
+
+
+def test_meta_row_round_trips_contract_version() -> None:
+    rows = [
+        MetaRow(
+            feed="pricebook.services",
+            last_run_at="t1",
+            row_count=2,
+            exporter_version="0.2.8",
+            contract_version="pricebook.v1",
+        )
+    ]
+    parsed = parse_meta_grid(build_meta_grid(rows))
+    assert parsed["pricebook.services"].contract_version == "pricebook.v1"
+    assert parsed["pricebook.services"].last_cursor == ""
+
+
+def test_parse_meta_grid_of_a_pre_contract_version_grid_reads_it_as_blank() -> None:
+    # A _meta tab written by an older exporter has no contract_version column at
+    # all. "missing column" must read back as blank, not crash.
+    grid = [
+        ["feed", "last_run_at", "last_cursor", "row_count", "exporter_version"],
+        ["jobs", "t1", "{}", "10", "0.1.0"],
+    ]
+    assert parse_meta_grid(grid)["jobs"].contract_version == ""
 
 
 def test_parse_meta_grid_tolerates_non_numeric_row_count() -> None:
@@ -118,3 +149,48 @@ def test_parse_meta_grid_tolerates_non_numeric_row_count() -> None:
 def test_parse_meta_grid_row_count_blank_cell_is_zero() -> None:
     grid = [list(META_COLUMNS), ["jobs", "t1", "{}", "", "0.1.0"]]
     assert parse_meta_grid(grid)["jobs"].row_count == 0
+
+
+class TestOneRowPerTab:
+    """`_meta` is parsed last-wins, so a duplicated tab does not read downstream
+    as an error — it reads as the WRONG `last_run_at`, on a tab that was just
+    refreshed, quietly, forever. `docs/export-contract.md` tells consumers to
+    trust exactly that cell for freshness."""
+
+    def test_a_fresh_row_wins_over_a_carried_one_whatever_the_order(self) -> None:
+        old = MetaRow(feed="pricebook.categories", last_run_at="yesterday", row_count=7)
+        fresh = MetaRow(feed="pricebook.categories", last_run_at="today", row_count=3)
+
+        carry_first = MetaRowSet()
+        carry_first.carry(old)
+        carry_first.add(fresh)
+
+        add_first = MetaRowSet()
+        add_first.add(fresh)
+        add_first.carry(old)
+
+        assert list(carry_first) == [fresh]
+        assert list(add_first) == [fresh]
+
+    def test_carrying_the_same_row_repeatedly_adds_one_row(self) -> None:
+        rows = MetaRowSet()
+        for _ in range(4):
+            rows.carry(MetaRow(feed="jobs", last_run_at="yesterday"))
+        assert len(rows) == 1
+
+    def test_membership_is_by_tab_name(self) -> None:
+        rows = MetaRowSet()
+        rows.add(MetaRow(feed="jobs", last_run_at="today"))
+        assert "jobs" in rows
+        assert "technicians" not in rows
+
+    def test_build_meta_grid_refuses_two_rows_for_one_tab(self) -> None:
+        """The assertion at the boundary. `MetaRowSet` already makes this
+        unrepresentable for a real run; this is what a future caller that
+        hand-rolls a list gets instead of a stale timestamp."""
+        rows = [
+            MetaRow(feed="pricebook.services", last_run_at="today"),
+            MetaRow(feed="pricebook.services", last_run_at="yesterday"),
+        ]
+        with pytest.raises(ValueError, match="pricebook.services"):
+            build_meta_grid(rows)

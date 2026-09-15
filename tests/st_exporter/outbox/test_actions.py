@@ -150,13 +150,109 @@ class TestReferralLead:
         assert listed.call_count == 1
 
 
+def _rating_item(**overrides) -> OutboxItem:
+    """A `technician_rating` item shaped exactly like TradeRated's enqueue.
+
+    `update-servicetitan-rating/index.ts:251-259`: string ids, a 1-5 star
+    rating, and three fields the exporter never sends on.
+    """
+    payload = {
+        "review_id": "477de553-0000-0000-0000-000000000000",
+        "rating": 5,
+        "servicetitan_job_id": "27073478",
+        "servicetitan_technician_id": "14941693",
+        "customer_name": "Jane Doe",
+    }
+    payload.update(overrides)
+    return OutboxItem(
+        id="2",
+        idempotency_key="technician_rating:477de553",
+        kind="technician_rating",
+        payload=payload,
+    )
+
+
+def _rating_route(st_settings: Settings) -> respx.Route:
+    return respx.post(
+        f"{st_settings.api_base}/customer-interactions/v2/tenant/"
+        f"{st_settings.tenant_id}/technician-ratings"
+    ).mock(return_value=httpx.Response(200, json={}))
+
+
 class TestTechnicianRating:
-    def test_raises_unsupported_kind(self, st_settings: Settings) -> None:
+    """The kind that used to raise. The registry has shipped
+    `Resource("technician-ratings", ops="LRC")` since 2026-06-01 and every
+    contractor grants Customer Interactions -> Technician Rating -> WRITE at
+    setup, so every one of these failures was against a granted permission."""
+
+    @respx.mock
+    def test_posts_the_rating_to_customer_interactions(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        route = _rating_route(st_settings)
         client = ServiceTitanClient(st_settings)
         try:
-            item = OutboxItem(id="2", idempotency_key="key-2", kind="technician_rating", payload={})
-            with pytest.raises(UnsupportedOutboxKindError, match="technician_rating"):
-                perform_item(client, item)
+            st_id = perform_item(client, _rating_item())
+        finally:
+            client.close()
+
+        assert route.called
+        body = json.loads(route.calls.last.request.content)
+        # Integers, not TradeRated's strings — ServiceTitan's ids are numeric.
+        assert body["technicianId"] == 14941693
+        assert body["jobId"] == 27073478
+        # THE conversion that makes this worth writing: 5 stars is 10/10, not
+        # 5/10. `convertRating` (same file, lines 117-120) is `rating * 2`.
+        assert body["rating"] == 10
+        # The endpoint is keyed on (technician, job) and its response carries no
+        # id, so the reported st_id names that pair.
+        assert st_id == "14941693:27073478"
+
+    @respx.mock
+    def test_three_stars_is_six_out_of_ten(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        route = _rating_route(st_settings)
+        client = ServiceTitanClient(st_settings)
+        try:
+            perform_item(client, _rating_item(rating=3))
+        finally:
+            client.close()
+        assert json.loads(route.calls.last.request.content)["rating"] == 6
+
+    @respx.mock
+    def test_a_rating_off_the_scale_is_clamped_not_rejected(self, st_settings: Settings) -> None:
+        """A rating is not worth failing an item over five times. If TradeRated
+        ever changes its scale, the nearest legal number beats a red row."""
+        mock_auth_token(st_settings.auth_url)
+        route = _rating_route(st_settings)
+        client = ServiceTitanClient(st_settings)
+        try:
+            perform_item(client, _rating_item(rating=9))
+        finally:
+            client.close()
+        assert json.loads(route.calls.last.request.content)["rating"] == 10
+
+    @respx.mock
+    def test_a_missing_job_id_fails_the_item_without_claiming_the_kind_is_unknown(
+        self, st_settings: Settings
+    ) -> None:
+        """A `ValueError`, deliberately NOT `UnsupportedOutboxKindError`: the
+        kind is supported and this one row is unusable, and the distinction is
+        what tells a reader whether to fix the exporter or fix the row."""
+        mock_auth_token(st_settings.auth_url)
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(ValueError, match="servicetitan_technician_id"):
+                perform_item(client, _rating_item(servicetitan_job_id=None))
+        finally:
+            client.close()
+
+    @respx.mock
+    def test_a_non_numeric_rating_fails_the_item(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(ValueError, match="non-numeric rating"):
+                perform_item(client, _rating_item(rating="excellent"))
         finally:
             client.close()
 

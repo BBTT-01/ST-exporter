@@ -12,7 +12,7 @@ def _cache(*records: dict) -> RawCache:
 
 def test_basic_join_produces_one_row_per_appointment() -> None:
     jobs = _cache(
-        {"id": 1, "number": "J-1", "customerId": 10, "locationId": 20, "jobStatus": "Scheduled"}
+        {"id": 1, "jobNumber": "J-1", "customerId": 10, "locationId": 20, "jobStatus": "Scheduled"}
     )
     appointments = _cache(
         {
@@ -182,7 +182,7 @@ def test_three_technician_crew_each_get_the_same_job() -> None:
     three-technician install exported as a single row and the job was invisible
     to two of the three technicians.
     """
-    jobs = _cache({"id": 1, "number": "J-1", "jobStatus": "InProgress"})
+    jobs = _cache({"id": 1, "jobNumber": "J-1", "jobStatus": "InProgress"})
     appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-09T14:00:00Z"})
     assignments = _cache(
         {
@@ -420,10 +420,320 @@ def test_unrelated_run_untouched_appointment_formats_identically() -> None:
     # Denormalisation itself is deterministic given identical raw input — this is
     # the guarantee run.py's "byte-identical unchanged rows" acceptance criterion
     # (tested at the run.py integration level) rests on.
-    jobs = _cache({"id": 1, "number": "J-1"})
+    jobs = _cache({"id": 1, "jobNumber": "J-1"})
     appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
 
     first = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
     second = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
 
     assert first.rows == second.rows
+
+
+def test_job_number_comes_from_servicetitan_jobnumber_field() -> None:
+    """A job payload in ServiceTitan's real shape must fill `job_number`.
+
+    The JPM job object names the field `jobNumber`. The exporter read `number`,
+    so the column was emitted but never filled — 0 non-empty cells across 2431
+    live rows — and the consumer's NOT NULL `jobs.job_number` rejected every
+    insert. Every job fixture in this suite used `number` too, so the whole
+    suite passed vacuously. This test fails if anyone reads only `number` again.
+    """
+    jobs = _cache({"id": 1, "jobNumber": "JOB-4821", "jobStatus": "Scheduled"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert len(result.rows) == 1
+    assert result.rows[0]["job_number"] == "JOB-4821"
+    assert result.rows[0]["job_number"] not in (None, "")
+
+
+def test_job_number_falls_back_to_legacy_number_field() -> None:
+    """The contract only ever widens: a payload carrying the old `number`
+    spelling (and no `jobNumber`) must still fill the column."""
+    jobs = _cache({"id": 1, "number": "LEGACY-7", "jobStatus": "Scheduled"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["job_number"] == "LEGACY-7"
+
+
+def test_job_number_prefers_jobnumber_when_both_spellings_are_present() -> None:
+    jobs = _cache({"id": 1, "jobNumber": "REAL-1", "number": "STALE-1"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["job_number"] == "REAL-1"
+
+
+def test_job_number_is_blank_only_when_servicetitan_sends_neither_spelling() -> None:
+    jobs = _cache({"id": 1, "jobStatus": "Scheduled"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["job_number"] is None
+
+
+def _rows_for_customer(customer: dict) -> dict:
+    """One job row for a single customer record — the contact columns under test."""
+    result = build_job_rows(
+        _cache({"id": 1, "jobNumber": "J-1", "customerId": 10}),
+        _cache({"id": 100, "jobId": 1}),
+        _cache(),
+        _cache(customer),
+        _cache(),
+    )
+    return result.rows[0]
+
+
+class TestCustomerContactColumns:
+    """ServiceTitan carries contact details as settings ARRAYS, not scalars.
+
+    Profit Wizard's production client reads `c.phoneSettings[].phone` /
+    `c.emailSettings[].email` and treats the flat scalars only as a fallback
+    (`lib/crm/servicetitan.ts:903-906`). Reading only the scalar is exactly the
+    `job_number` failure again: a column blank on every row, which reads as "this
+    contractor has no phone numbers" rather than as an error.
+    """
+
+    def test_the_settings_arrays_are_preferred(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane Doe",
+                "phoneSettings": [{"phone": "555-2222"}, {"phone": "555-3333"}],
+                "emailSettings": [{"email": "jane@settings.test"}],
+            }
+        )
+        # One cell, not a list: the first non-empty entry is ServiceTitan's own
+        # primary ordering.
+        assert row["customer_phone"] == "555-2222"
+        assert row["customer_email"] == "jane@settings.test"
+
+    def test_the_scalars_remain_the_fallback(self) -> None:
+        # Widen-only, so it cannot regress: today's behaviour is preserved
+        # underneath the array lookup.
+        row = _rows_for_customer(
+            {"id": 10, "name": "Jane", "phone": "555-1111", "email": "jane@flat.test"}
+        )
+        assert row["customer_phone"] == "555-1111"
+        assert row["customer_email"] == "jane@flat.test"
+
+    def test_an_empty_or_blank_settings_entry_falls_back_rather_than_blanking(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "phoneSettings": [{"phone": ""}],
+                "emailSettings": [],
+                "phone": "555-1111",
+                "email": "jane@flat.test",
+            }
+        )
+        assert row["customer_phone"] == "555-1111"
+        assert row["customer_email"] == "jane@flat.test"
+
+    def test_the_documented_phone_number_spelling_is_read_too(self) -> None:
+        """ServiceTitan's documented `CustomerPhoneSettings` is {phoneNumber, doNotText}.
+
+        Which spelling a live tenant actually returns is UNVERIFIED
+        (KNOWN_UNVERIFIED.md), and every other fixture here says `phone` — the
+        exact arrangement that hid `job_number` for the life of that feature. So
+        both are read, and both are tested.
+        """
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane Doe",
+                "phoneSettings": [{"phoneNumber": "555-4444", "doNotText": False}],
+                "emailSettings": [{"emailAddress": "jane@documented.test"}],
+            }
+        )
+        assert row["customer_phone"] == "555-4444"
+        assert row["customer_email"] == "jane@documented.test"
+
+    def test_a_bare_number_key_in_the_settings_entry_is_read(self) -> None:
+        row = _rows_for_customer(
+            {"id": 10, "name": "Jane", "phoneSettings": [{"number": "555-5555"}]}
+        )
+        assert row["customer_phone"] == "555-5555"
+
+    def test_the_phone_spelling_still_wins_when_both_are_present(self) -> None:
+        # Widen-only: adding spellings must not change what an existing tenant sees.
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "phoneSettings": [{"phone": "555-2222", "phoneNumber": "555-4444"}],
+            }
+        )
+        assert row["customer_phone"] == "555-2222"
+
+    def test_the_scalar_fallback_also_covers_the_alternative_spellings(self) -> None:
+        row = _rows_for_customer({"id": 10, "name": "Jane", "phoneNumber": "555-6666"})
+        assert row["customer_phone"] == "555-6666"
+
+    def test_no_customer_at_all_is_still_none(self) -> None:
+        result = build_job_rows(
+            _cache({"id": 1, "jobNumber": "J-1", "customerId": 99}),
+            _cache({"id": 100, "jobId": 1}),
+            _cache(),
+            _cache(),
+            _cache(),
+        )
+        assert result.rows[0]["customer_phone"] is None
+
+
+class TestCustomerContactsArray:
+    """The shape ServiceTitan's own customer schema documents: `contacts[]`.
+
+    The documented v2 customer object is
+    `id, active, name, type, address, contacts, balance, doNotMail,
+    doNotService, hasActiveMembership, memberships, customFields, createdOn,
+    modifiedOn, mergedToId, externalData` — with
+    `contacts[] {id, type ∈ Phone|MobilePhone|Email|Fax, value, memo}` and
+    **none** of `phone`, `phoneNumber`, `email`, `emailAddress`,
+    `phoneSettings` or `emailSettings` on the customer at all. If that is the
+    real shape, every spelling the previous round widened to is read off an
+    object that carries none of them and both columns are blank on every row —
+    `job_number` again. So `contacts[]` is read too.
+    """
+
+    def test_a_phone_contact_is_read_when_nothing_else_is_there(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane Doe",
+                "contacts": [
+                    {"id": 1, "type": "Phone", "value": "555-7777", "memo": "home"},
+                    {"id": 2, "type": "Email", "value": "jane@contacts.test"},
+                ],
+            }
+        )
+        assert row["customer_phone"] == "555-7777"
+        assert row["customer_email"] == "jane@contacts.test"
+
+    def test_a_mobile_phone_counts_as_a_phone(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "contacts": [{"id": 1, "type": "MobilePhone", "value": "555-8888"}],
+            }
+        )
+        assert row["customer_phone"] == "555-8888"
+
+    def test_the_type_is_matched_case_insensitively(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "contacts": [{"type": "phone", "value": "555-9999"}],
+            }
+        )
+        assert row["customer_phone"] == "555-9999"
+
+    def test_a_fax_is_not_a_phone_number(self) -> None:
+        """Selection is by `type`, never by position — the phone column is what
+        somebody rings, and a wrong number is worse than a blank one."""
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "contacts": [
+                    {"type": "Fax", "value": "555-0000"},
+                    {"type": "Phone", "value": "555-1234"},
+                ],
+            }
+        )
+        assert row["customer_phone"] == "555-1234"
+
+    def test_an_email_never_lands_in_the_phone_column(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "contacts": [{"type": "Email", "value": "jane@contacts.test"}],
+            }
+        )
+        assert row["customer_phone"] is None
+        assert row["customer_email"] == "jane@contacts.test"
+
+    def test_an_untyped_contact_is_skipped_rather_than_guessed_at(self) -> None:
+        row = _rows_for_customer({"id": 10, "name": "Jane", "contacts": [{"value": "555-????"}]})
+        assert row["customer_phone"] is None
+
+    def test_a_blank_contact_value_falls_through_to_the_next_entry(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "contacts": [
+                    {"type": "Phone", "value": ""},
+                    {"type": "Phone", "value": "555-2468"},
+                ],
+            }
+        )
+        assert row["customer_phone"] == "555-2468"
+
+    def test_contacts_sit_above_the_flat_scalar_and_below_the_settings_array(self) -> None:
+        """The new layer is INSERTED between the two that existed.
+
+        NOT "no shape resolves a different value now" — that was wrong, and the
+        second case below is the counter-example: contacts[] + a populated flat
+        scalar used to give the scalar and now gives the contact. Deliberate
+        (contacts[] is the documented shape; the scalar is a guess), but a changed
+        value, not a filled blank. The property that does hold: nothing that
+        resolved a value before is blank now.
+        """
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "phoneSettings": [{"phone": "from-settings"}],
+                "contacts": [{"type": "Phone", "value": "from-contacts"}],
+                "phone": "from-scalar",
+            }
+        )
+        assert row["customer_phone"] == "from-settings"
+
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "contacts": [{"type": "Phone", "value": "from-contacts"}],
+                "phone": "from-scalar",
+            }
+        )
+        assert row["customer_phone"] == "from-contacts"
+
+    def test_a_customer_carrying_only_the_documented_schema_is_not_blank(self) -> None:
+        """The whole point: if `contacts[]` is the only real shape, neither
+        column is blank across the whole tab."""
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "active": True,
+                "name": "Jane Doe",
+                "type": "Residential",
+                "address": {"street": "1 Main St"},
+                "contacts": [
+                    {"id": 1, "type": "MobilePhone", "value": "555-3141", "memo": None},
+                    {"id": 2, "type": "Email", "value": "jane@doe.test", "memo": None},
+                    {"id": 3, "type": "Fax", "value": "555-0000", "memo": None},
+                ],
+                "balance": 0,
+                "createdOn": "2026-01-01T00:00:00Z",
+            }
+        )
+        assert row["customer_phone"] == "555-3141"
+        assert row["customer_email"] == "jane@doe.test"
+
+    def test_garbage_in_contacts_does_not_crash_the_feed(self) -> None:
+        row = _rows_for_customer(
+            {"id": 10, "name": "Jane", "contacts": ["not-a-dict", None, {"type": "Phone"}]}
+        )
+        assert row["customer_phone"] is None

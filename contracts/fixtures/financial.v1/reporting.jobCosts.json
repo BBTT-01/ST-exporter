@@ -1,0 +1,21 @@
+{
+  "feed": "financial",
+  "contract_version": "financial.v1",
+  "tab": "reporting.jobCosts",
+  "grain": "one row per Job Costing Summary report row that has a JobNumber; columns beyond the frozen set are dropped, never appended",
+  "row_key": [
+    "JobNumber"
+  ],
+  "columns": [
+    "JobNumber",
+    "MaterialEquipmentPurchaseOrderCosts",
+    "MaterialTotals",
+    "EquipmentCosts",
+    "TotalCosts",
+    "TotalRevenue"
+  ],
+  "rows": [
+    ["J-7", "0", "100", "50", "500", "900"],
+    ["J-8", "250", "", "", "250", "400"]
+  ]
+}

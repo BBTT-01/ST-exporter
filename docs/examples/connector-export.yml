@@ -1,0 +1,279 @@
+# The CALLER workflow every connector repository runs.
+#
+# This copy is the SOURCE OF TRUTH. `BBTT-01/st-connector-template` and each
+# contractor's repository hold near-copies of it, and those copies live in
+# repositories this one cannot update — a contractor owns theirs. So the shape
+# is kept here, beside the reusable workflow it calls, and it is covered by
+# `tests/st_exporter/test_workflow.py`: the set of jobs, the cadences, the
+# absence of any per-feed gate, and the one-drain rule are asserted on THIS file
+# every time the suite runs. Change this file and the template together.
+#
+# It is under `docs/examples/` and not `.github/workflows/` on purpose: dropped
+# into `.github/workflows/` it would run here, in the exporter's own repository,
+# against no secrets at all.
+#
+# ===========================================================================
+# WHAT A CONTRACTOR RUNS — THE SAME FILE, FOR EVERYBODY
+# ===========================================================================
+#
+#   Feed job            Cadence     Exports for a contractor who bought
+#   ------------------  ----------  -----------------------------------------
+#   jobs-feed           */5         TradeRated, Profit Wizard
+#   technicians-feed    */30        TradeRated, Profit Wizard
+#   pricebook-feed      hourly      TrueQuote
+#   financial-feed      */6 hours   Profit Wizard
+#   outbox-drain        */5         everyone — see below, it is not a feed
+#
+# EVERY JOB RUNS ON ITS SCHEDULE, FOR EVERY CONTRACTOR. There is nothing here to
+# switch on, and no repository variable decides which feeds export. What a
+# contractor bought is already stated, once, in the boxes they ticked when they
+# created the ServiceTitan app: the scopes on that app are what actually control
+# access, and a feed they did not buy is refused by ServiceTitan with a 403.
+#
+# There used to be four variables (`JOBS_FEED`, `TECHNICIANS_FEED`,
+# `PRICEBOOK_FEED`, `FINANCIAL_FEED`), one per feed, all off by default. They
+# were a second, hand-maintained copy of a fact ServiceTitan already holds, and
+# two copies of one fact drift:
+#
+#   * variable ON, scope MISSING  -> a red run every hour, forever.
+#   * variable OFF, scope GRANTED -> a feed they paid for silently not running,
+#     on green runs, which is the failure mode everything else in this file
+#     exists to prevent.
+#
+# The exporter tells the two 403s apart from `_meta`, which records the last
+# successful run of every tab (`src/st_exporter/scopes.py`):
+#
+#   * A TAB with NO `_meta` row ever, and no such tab in the Sheet, has never
+#     been written, so the entity was never granted: it is skipped quietly,
+#     writes no tab, and does not fail the run. An absent tab means "not bought".
+#   * A TAB whose `_meta` row names a past run HAS worked, so a 403 now means
+#     the permission was REVOKED: the run is annotated `::error`, that tab keeps
+#     its last good contents, and the run goes red.
+#
+# Per TAB, not per feed, because ServiceTitan grants per entity. A contractor who
+# bought TrueQuote but not Profit Wizard has Pricebook Services, Equipment and
+# Categories ticked and NOT Materials, so `pricebook.materials` is refused on
+# every run of every such tenant, forever, while the other three tabs export
+# normally and the run stays green. Likewise a Profit Wizard tenant missing the
+# Reporting box exports invoices, timesheets and business units and no
+# `reporting.jobCosts`. One refused tab never costs its siblings.
+#
+# So a reviews-only contractor still exports nothing they did not buy — no
+# pricebook, no invoices, no timesheets, no payroll — but that is enforced by
+# ServiceTitan rather than restated here.
+#
+# MIGRATING A CONNECTOR THAT ALREADY HAS THEM SET: nothing to do first, and
+# nothing to do in a particular order — that ordering hazard is what this change
+# removes. Merging this file simply starts running every job; a job whose scope
+# is missing skips quietly. The old variables are inert and can be deleted
+# whenever convenient (`gh variable delete JOBS_FEED`, and so on).
+#
+# ===========================================================================
+# THE ONE DRAIN
+# ===========================================================================
+#
+# `outbox-drain` is not a feed. It writes no tab and fetches nothing from
+# ServiceTitan's read API. It drains the outbox queue of every product whose
+# machine token it is given, and it must exist EXACTLY ONCE.
+#
+# The previous version of this workflow relied on a COMMENT to keep the
+# technicians job from draining a second time every cycle. That comment was
+# deleted from a live connector repository, and the next maintainer there was
+# one "fix the inconsistency" commit away from doubling the drain rate. With
+# three product queues instead of one, that trap got three times worse. So the
+# rule is no longer carried by a comment. Three independent things now have to
+# be true at once before anything drains, and NO feed job has any of them:
+#
+#   1. `feeds:` must name `outbox`. The exporter drains if and only if it is
+#      asked to (`cli.py`, `drain_requested`); handing it outbox secrets is
+#      inert on its own. No feed job below names `outbox`.
+#   2. A product's `*_MACHINE_TOKEN` must be set on the job. A lane is built
+#      only when BOTH the token and the URL are non-empty, so a job holding one
+#      and not the other configures no lane and drains nothing even if somebody
+#      does add `outbox` to its feeds. No feed job below is given ANY machine
+#      token — `pricebook-feed` gets `TRUEQUOTE_OUTBOX_URL` and the separate
+#      image-upload token, and that pair cannot form a drain lane.
+#   3. It has to win the lock. Every drain names the same `feeds: "outbox"`
+#      string, so every drain lands in the same concurrency group in the
+#      reusable workflow, and two of them can never run at once.
+#
+# And if somebody copies this job anyway, it is LOUD rather than silent: the
+# reusable workflow prints a `::notice title=Outbox drain::` and a run summary
+# on every run that drains. One per five-minute cycle is correct. Two is a
+# second drainer, visible in the Actions list without reading any YAML.
+#
+# The drain has NO enable variable, deliberately. Every product's write path
+# runs through its outbox, so every contractor needs it; and a drain that can
+# be switched off by forgetting a variable is a drain that stops silently. When
+# a contractor has no outbox secrets at all the run is a cheap no-op: it opens
+# no Sheet and calls nothing.
+#
+# ===========================================================================
+# WHY PRICEBOOK CAN STILL DELAY JOBS
+# ===========================================================================
+#
+# The drain now takes its own lock, so the 5-minute drain no longer queues
+# behind an hourly pricebook run. The four FEED jobs still share one lock, and
+# that is not an oversight: every export feed reads the whole `_meta` grid and
+# writes the whole `_meta` grid back, carrying over the rows for the feeds it
+# did not run. Two feeds running at once would roll each other's cursors and
+# row counts back. Giving them per-feed locks today would trade a latency
+# problem for a data-integrity one. Making `_meta` merge on write — so a feed
+# only ever replaces its own rows — is what unlocks per-feed keys, and it is a
+# change in the exporter's Python, not here.
+#
+# The cadences below are offset (`:07`, `03:37`) rather than landing on the
+# hour, so the long feeds do not start in the same minute as a `*/5` jobs run
+# and queue behind it.
+
+name: ServiceTitan Export
+
+on:
+  schedule:
+    # GitHub Actions cron has a five-minute floor and is best-effort — under
+    # load these fire every ~12 minutes rather than every 5. Measured, not
+    # theoretical, so nothing anywhere should promise five minutes.
+    - cron: "*/5 * * * *"    # jobs-feed + outbox-drain
+    - cron: "*/30 * * * *"   # technicians-feed
+    - cron: "7 * * * *"      # pricebook-feed
+    - cron: "37 */6 * * *"     # financial-feed
+  workflow_dispatch:
+    inputs:
+      feed:
+        description: "Which single feed to run by hand"
+        type: choice
+        default: jobs
+        options:
+          - jobs
+          - technicians
+          - pricebook
+          - financial
+          - outbox
+# A manual dispatch runs ONE job, chosen above, rather than all of them. It used
+# to start every job at once; they all take the same lock, and GitHub keeps only
+# one queued run per group, so the surplus jobs were cancelled before running a
+# step — a `cancelled` result that looked like a failure and was not.
+
+jobs:
+  # ==========================================================================
+  # FEED JOBS — none of these drains. None of them is given a machine token.
+  #
+  # All four run for every contractor. ServiceTitan's scopes decide which of them
+  # actually export: a feed the tenant's app was never granted answers 403, and
+  # the exporter skips it quietly and writes no tab. See the header.
+  # ==========================================================================
+
+  jobs-feed:
+    if: >-
+      github.event.schedule == '*/5 * * * *' || github.event.inputs.feed == 'jobs'
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.9
+    with:
+      feeds: "jobs"
+    secrets:
+      ST_CLIENT_ID: ${{ secrets.SERVICETITAN_CLIENT_ID }}
+      ST_CLIENT_SECRET: ${{ secrets.SERVICETITAN_CLIENT_SECRET }}
+      ST_APP_KEY: ${{ secrets.SERVICETITAN_APP_KEY }}
+      ST_TENANT_ID: ${{ secrets.SERVICETITAN_TENANT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SHEETS_WRITER_JSON }}
+      GOOGLE_SHEET_ID: ${{ secrets.EXPORT_SPREADSHEET_ID }}
+      GOOGLE_RAW_CACHE_SHEET_ID: ${{ secrets.GOOGLE_RAW_CACHE_SHEET_ID }}
+
+  technicians-feed:
+    if: >-
+      github.event.schedule == '*/30 * * * *' || github.event.inputs.feed == 'technicians'
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.9
+    with:
+      feeds: "technicians"
+    secrets:
+      ST_CLIENT_ID: ${{ secrets.SERVICETITAN_CLIENT_ID }}
+      ST_CLIENT_SECRET: ${{ secrets.SERVICETITAN_CLIENT_SECRET }}
+      ST_APP_KEY: ${{ secrets.SERVICETITAN_APP_KEY }}
+      ST_TENANT_ID: ${{ secrets.SERVICETITAN_TENANT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SHEETS_WRITER_JSON }}
+      GOOGLE_SHEET_ID: ${{ secrets.EXPORT_SPREADSHEET_ID }}
+      GOOGLE_RAW_CACHE_SHEET_ID: ${{ secrets.GOOGLE_RAW_CACHE_SHEET_ID }}
+
+  pricebook-feed:
+    if: >-
+      github.event.schedule == '7 * * * *' || github.event.inputs.feed == 'pricebook'
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.9
+    with:
+      feeds: "pricebook"
+      # CONFIGURATION, not a gate: it narrows WHAT the pricebook feed exports,
+      # it does not decide WHETHER it runs. Blank exports the whole catalogue,
+      # which is what almost every tenant wants. Each id costs one extra request
+      # per item resource. The feed itself is gated by nothing but ServiceTitan's
+      # Pricebook scope.
+      pricebook_category_ids: ${{ vars.PRICEBOOK_CATEGORY_IDS }}
+    secrets:
+      ST_CLIENT_ID: ${{ secrets.SERVICETITAN_CLIENT_ID }}
+      ST_CLIENT_SECRET: ${{ secrets.SERVICETITAN_CLIENT_SECRET }}
+      ST_APP_KEY: ${{ secrets.SERVICETITAN_APP_KEY }}
+      ST_TENANT_ID: ${{ secrets.SERVICETITAN_TENANT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SHEETS_WRITER_JSON }}
+      GOOGLE_SHEET_ID: ${{ secrets.EXPORT_SPREADSHEET_ID }}
+      GOOGLE_RAW_CACHE_SHEET_ID: ${{ secrets.GOOGLE_RAW_CACHE_SHEET_ID }}
+      # The pricebook feed uploads item image BYTES to TrueQuote, so it needs
+      # TrueQuote's host and an `image_upload`-scoped token. This is NOT a
+      # drain lane and cannot become one: a lane needs
+      # TRUEQUOTE_MACHINE_TOKEN (scope `booking_outbox`) with the URL, and that
+      # token is issued separately and is given only to `outbox-drain` below.
+      # Adding `outbox` to this job's feeds would therefore drain nothing —
+      # which is the point. Omit both and the image identifiers still reach the
+      # Sheet; only the bytes are skipped.
+      TRUEQUOTE_OUTBOX_URL: ${{ secrets.TRUEQUOTE_OUTBOX_URL }}
+      TRUEQUOTE_IMAGE_TOKEN: ${{ secrets.TRUEQUOTE_IMAGE_TOKEN }}
+
+  financial-feed:
+    if: >-
+      github.event.schedule == '37 */6 * * *' || github.event.inputs.feed == 'financial'
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.9
+    with:
+      feeds: "financial"
+    secrets:
+      ST_CLIENT_ID: ${{ secrets.SERVICETITAN_CLIENT_ID }}
+      ST_CLIENT_SECRET: ${{ secrets.SERVICETITAN_CLIENT_SECRET }}
+      ST_APP_KEY: ${{ secrets.SERVICETITAN_APP_KEY }}
+      ST_TENANT_ID: ${{ secrets.SERVICETITAN_TENANT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SHEETS_WRITER_JSON }}
+      GOOGLE_SHEET_ID: ${{ secrets.EXPORT_SPREADSHEET_ID }}
+      GOOGLE_RAW_CACHE_SHEET_ID: ${{ secrets.GOOGLE_RAW_CACHE_SHEET_ID }}
+
+  # ==========================================================================
+  # THE DRAIN — the only job in this file that may name `outbox`, and the only
+  # one holding a product machine token. Do not copy it. Do not add `outbox` to
+  # a feed job. Read the "THE ONE DRAIN" section at the top before changing it.
+  # ==========================================================================
+
+  outbox-drain:
+    if: >-
+      github.event.schedule == '*/5 * * * *' || github.event.inputs.feed == 'outbox'
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.9
+    with:
+      # `outbox` and nothing else. Adding an export feed here would put this job
+      # back on the shared export lock and back behind the hourly pricebook run,
+      # and would make it write `_meta`.
+      feeds: "outbox"
+    secrets:
+      ST_CLIENT_ID: ${{ secrets.SERVICETITAN_CLIENT_ID }}
+      ST_CLIENT_SECRET: ${{ secrets.SERVICETITAN_CLIENT_SECRET }}
+      ST_APP_KEY: ${{ secrets.SERVICETITAN_APP_KEY }}
+      ST_TENANT_ID: ${{ secrets.SERVICETITAN_TENANT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SHEETS_WRITER_JSON }}
+      GOOGLE_SHEET_ID: ${{ secrets.EXPORT_SPREADSHEET_ID }}
+      GOOGLE_RAW_CACHE_SHEET_ID: ${{ secrets.GOOGLE_RAW_CACHE_SHEET_ID }}
+      # One pair per product. A pair that is not set is an empty string, which
+      # builds no lane, so a contractor lists only what they bought and nothing
+      # here needs to know what that was.
+      #
+      # The names on the LEFT belong to the reusable workflow and can only be
+      # renamed by ST-exporter, in a new tag. The names on the RIGHT are this
+      # repository's own secrets. `PLATFORM_*` is the reviews platform's pair,
+      # named neutrally because it predates there being more than one product;
+      # the two newer pairs have to name their product to stay distinguishable.
+      TRADERATED_MACHINE_TOKEN: ${{ secrets.PLATFORM_MACHINE_TOKEN }}
+      TRADERATED_OUTBOX_BASE_URL: ${{ secrets.PLATFORM_OUTBOX_URL }}
+      TRUEQUOTE_MACHINE_TOKEN: ${{ secrets.TRUEQUOTE_MACHINE_TOKEN }}
+      TRUEQUOTE_OUTBOX_URL: ${{ secrets.TRUEQUOTE_OUTBOX_URL }}
+      PROFITWIZARD_MACHINE_TOKEN: ${{ secrets.PROFITWIZARD_MACHINE_TOKEN }}
+      PROFITWIZARD_OUTBOX_URL: ${{ secrets.PROFITWIZARD_OUTBOX_URL }}

@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from tests.conftest import make_envelope
 
+# ServiceTitan's JPM job object names this field `jobNumber`, NOT `number` —
+# the fixture said `number` and so the blank Number column looked correct here
+# for as long as it has been wrong against every real tenant. (`number` IS
+# legitimate on invoices and projects; PROJECT below keeps it deliberately.)
 JOB = {
     "id": 1,
-    "number": "J-001",
+    "jobNumber": "J-001",
     "customerId": 10,
     "jobStatus": "Completed",
     "jobTypeName": "Repair",
@@ -91,3 +95,37 @@ class TestProjects:
         mock_client.get.return_value = PROJECT
         result = invoke(["jobs", "projects-get", "1"])
         assert result.exit_code == 0
+
+
+class TestTheJobNumberColumn:
+    """`number` is blank on every ServiceTitan job; `jobNumber` is the field.
+
+    The exporter shipped the identical bug and measured it: 0 non-empty cells
+    across 2431 live rows. This column has been permanently blank in
+    `st jobs list` for the same reason.
+    """
+
+    def test_the_number_column_reads_jobnumber(self, invoke, mock_client):
+        mock_client.get.return_value = make_envelope([{"id": 1, "jobNumber": "J-777"}])
+        result = invoke(["jobs", "list"])
+        assert "J-777" in result.output
+
+    def test_number_is_still_accepted_as_a_fallback(self, invoke, mock_client):
+        # Widen-only: a tenant (or a recorded fixture) that answers with the old
+        # spelling must not start showing a blank column.
+        mock_client.get.return_value = make_envelope([{"id": 1, "number": "J-888"}])
+        result = invoke(["jobs", "list"])
+        assert "J-888" in result.output
+
+    def test_jobnumber_wins_when_both_are_present(self, invoke, mock_client):
+        mock_client.get.return_value = make_envelope(
+            [{"id": 1, "jobNumber": "J-999", "number": "wrong"}]
+        )
+        result = invoke(["jobs", "list"])
+        assert "J-999" in result.output
+
+    def test_a_project_still_reads_its_own_number_field(self, invoke, mock_client):
+        # `number` is legitimate on projects — only the JOB object renamed it.
+        mock_client.get.return_value = make_envelope([PROJECT])
+        result = invoke(["jobs", "projects-list"])
+        assert "P-001" in result.output

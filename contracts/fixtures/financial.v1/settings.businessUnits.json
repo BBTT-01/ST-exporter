@@ -1,0 +1,23 @@
+{
+  "feed": "financial",
+  "contract_version": "financial.v1",
+  "tab": "settings.businessUnits",
+  "grain": "one row per business unit, active and retired alike",
+  "row_key": [
+    "BusinessUnitId"
+  ],
+  "columns": [
+    "BusinessUnitId",
+    "Name",
+    "Address",
+    "Active",
+    "Email",
+    "Phone",
+    "Code",
+    "ModifiedOn"
+  ],
+  "rows": [
+    ["3", "Doors", "1 Main St, Denver, CO, 80202", "true", "doors@example.com", "555-0100", "DR", "2026-08-01T00:00:00Z"],
+    ["4", "Retired Unit", "", "false", "", "", "", ""]
+  ]
+}

@@ -17,6 +17,7 @@ Customer-Built-App integration-path warning.
 | [MCP server](mcp-server.md) | Running `st-mcp`, tool naming, pagination model, Claude hookup |
 | [Architecture](architecture.md) | Registry + engine design, how to add a resource, internals |
 | [Development](development.md) | Tests, lint, type-check, project layout |
+| [Export Store contract](export-contract.md) | Contract version per feed, what forces a bump, the committed fixtures, how a consumer verifies itself |
 | [Changelog](../CHANGELOG.md) | Release notes — what shipped in each version |
 
 ## Quick links

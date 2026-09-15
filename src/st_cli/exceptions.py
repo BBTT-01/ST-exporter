@@ -13,6 +13,17 @@ class AuthError(STCLIError):
     """Authentication failure (bad credentials, expired token, etc.)."""
 
 
+class TransportError(STCLIError):
+    """The request never produced an HTTP status at all.
+
+    A DNS failure, a refused connection, a read timeout, a TLS error: anything
+    ``httpx`` raises instead of answering. It is deliberately an ``STCLIError``
+    so that every ``except STCLIError`` guard in this repo — the exporter's
+    per-tab financial guard above all — is COMPLETE. A transport error used to
+    escape those guards and take down work that had already succeeded.
+    """
+
+
 class APIError(STCLIError):
     """Non-success response from the ServiceTitan API."""
 

@@ -17,6 +17,8 @@ from unittest.mock import patch
 import httpx
 import respx
 
+from st_exporter.contracts import CONTRACT_VERSIONS
+from st_exporter.format import JOB_COLUMNS, dedupe_technician_rows
 from st_exporter.meta import CursorBundle, parse_meta_grid
 from st_exporter.run import _apply_window, run_export
 from st_exporter.sheets import InMemorySheetsStore
@@ -59,6 +61,10 @@ def test_two_runs_incremental_fetch_and_byte_identical_unchanged_rows(
     assert summary1.jobs_row_count == 1
     jobs_grid_1 = export_store.tabs["jobs"]
     assert {row[0] for row in jobs_grid_1[1:]} == {"1"}
+    # The written cell, not just the dict: `job_number` must not reach the tab blank
+    # (the consumer's `jobs.job_number` is NOT NULL, so a blank rejects the row).
+    job_number_col = JOB_COLUMNS.index("job_number")
+    assert [row[job_number_col] for row in jobs_grid_1[1:]] == ["J-1"]
 
     # --- Run 2: only tenant_run2's routes exist now — any request that doesn't
     # carry exactly run 1's cursor fails inside the fixture's own assertion,
@@ -90,6 +96,14 @@ def test_two_runs_incremental_fetch_and_byte_identical_unchanged_rows(
     assert bundle.get("appointments") == tenant_run2.APPOINTMENTS_CURSOR
     assert bundle.get("customers") == tenant_run2.CUSTOMERS_CURSOR
     assert meta["jobs"].row_count == 2
+
+    # Both feeds declare a real contract version. Blank is what an exporter older
+    # than 0.2.9 wrote, and a consumer must be able to tell the two apart — a
+    # blank `jobs` version cannot even say whether the tab is the pre-0.2.7
+    # one-row-per-appointment shape.
+    assert meta["jobs"].contract_version == CONTRACT_VERSIONS["jobs"] == "jobs.v2"
+    technicians_version = meta["technicians"].contract_version
+    assert technicians_version == CONTRACT_VERSIONS["technicians"] == "technicians.v1"
 
 
 @respx.mock
@@ -335,3 +349,61 @@ def test_technicians_only_run_preserves_existing_jobs_tab_and_meta(
     assert raw_cache_store.tabs == raw_cache_snapshot, (
         "a technicians-only run must not touch the raw-cache sheet"
     )
+
+
+def test_duplicate_technician_id_is_collapsed_to_one_row() -> None:
+    """The list endpoint returning the same technician twice (e.g. across a page
+    boundary) must not put two identical rows on the tab."""
+    rows = dedupe_technician_rows(
+        [
+            {"st_technician_id": 51, "name": "Ada", "email": "a@example.com", "active": True},
+            {"st_technician_id": 52, "name": "Bo", "email": "b@example.com", "active": True},
+            {"st_technician_id": 51, "name": "Ada", "email": "a@example.com", "active": True},
+        ]
+    )
+
+    assert [r["st_technician_id"] for r in rows] == [51, 52]
+
+
+def test_two_distinct_technician_ids_sharing_an_email_are_both_kept() -> None:
+    """A shared address is a real ServiceTitan state; dropping one would delete a
+    technician that `jobs` rows reference. Both are exported, and the collision is
+    logged for the consumer that requires unique emails."""
+    st_exporter_logger = logging.getLogger("st_exporter")
+    list_handler = _ListHandler()
+    st_exporter_logger.addHandler(list_handler)
+    try:
+        rows = dedupe_technician_rows(
+            [
+                {
+                    "st_technician_id": 51,
+                    "name": "Ada",
+                    "email": "testemail51@gmail.com",
+                    "active": True,
+                },
+                {
+                    "st_technician_id": 77,
+                    "name": "Bo",
+                    "email": "TestEmail51@gmail.com",
+                    "active": True,
+                },
+            ]
+        )
+    finally:
+        st_exporter_logger.removeHandler(list_handler)
+
+    assert [r["st_technician_id"] for r in rows] == [51, 77]
+    logged = " ".join(record.getMessage() for record in list_handler.records_captured)
+    assert "testemail51@gmail.com" in logged
+    assert "51" in logged and "77" in logged
+
+
+def test_technicians_without_an_email_are_never_collapsed_together() -> None:
+    rows = dedupe_technician_rows(
+        [
+            {"st_technician_id": 1, "name": "Ada", "email": None, "active": True},
+            {"st_technician_id": 2, "name": "Bo", "email": "", "active": True},
+        ]
+    )
+
+    assert len(rows) == 2

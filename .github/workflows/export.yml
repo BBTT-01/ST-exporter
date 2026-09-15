@@ -4,7 +4,21 @@ on:
   workflow_call:
     inputs:
       feeds:
-        description: "Comma-separated feeds to run: jobs, technicians, or both"
+        description: >-
+          Comma-separated feeds to run: jobs, technicians, pricebook, financial,
+          outbox.
+
+          `outbox` is not an export feed — it writes no tab and fetches nothing.
+          It DRAINS the outbox queue of every product whose secrets this job was
+          given, and it MUST appear in exactly one caller job.
+
+          This is the structural half of the one-drain rule. Before it, the
+          exporter drained on any invocation whose outbox secrets happened to be
+          set, and the only thing stopping a second job from draining the same
+          queue again was a comment in the caller workflow — a comment that was
+          already stripped from one live connector repo. Now the secrets alone
+          do nothing: a job that does not ask for `outbox` cannot drain, however
+          many secrets it is handed.
         type: string
         default: "jobs,technicians"
       window:
@@ -15,10 +29,30 @@ on:
         description: "Export target; only 'sheets' is supported today"
         type: string
         default: "sheets"
-      pricebook:
-        description: "Reserved; has no effect (the CLI has no price-book commands)"
-        type: boolean
-        default: false
+      financial_window:
+        description: >-
+          Financial window in days for the `financial` feed (invoices, timesheets
+          and the Job Costing Summary report). Separate from `window` on purpose:
+          the two share the number 90 but not the reason. 90 is the shortest
+          window covering every Profit Wizard surface fed from ServiceTitan; raise
+          it to 365 only for a tenant that uses the reports page's "Last year".
+        type: number
+        default: 90
+      financial_max_jobs:
+        description: >-
+          Cap on how many completed jobs the `financial` feed pulls timesheets for.
+          ServiceTitan has no bulk endpoint carrying the timesheet fields Profit
+          Wizard reads, so this costs one request per job.
+        type: number
+        default: 500
+      pricebook_category_ids:
+        description: >-
+          Optional comma-separated ServiceTitan pricebook category ids to restrict
+          the pricebook feed to. Blank exports the whole catalogue. Each id costs
+          one extra request per item resource (ServiceTitan honours one id per
+          request), so leave it blank unless a tenant really needs it.
+        type: string
+        default: ""
     secrets:
       ST_CLIENT_ID:
         required: true
@@ -34,27 +68,95 @@ on:
         required: true
       GOOGLE_RAW_CACHE_SHEET_ID:
         required: true
+      # ---------------------------------------------------------------------
+      # OUTBOX LANES — one pair of secrets per product the contractor bought.
+      # A lane runs only when BOTH of its values are non-empty, so an unbought
+      # product is simply absent. All optional: `required: false` is what lets
+      # a caller omit the ones it did not buy.
+      #
+      # Handing these to a second job is now INERT rather than harmful: the
+      # drain is gated on `feeds: outbox`, not on the secrets being present.
+      # ---------------------------------------------------------------------
       TRADERATED_MACHINE_TOKEN:
         required: false
       TRADERATED_OUTBOX_BASE_URL:
+        required: false
+      TRUEQUOTE_MACHINE_TOKEN:
+        required: false
+      TRUEQUOTE_OUTBOX_URL:
+        required: false
+      PROFITWIZARD_MACHINE_TOKEN:
+        required: false
+      PROFITWIZARD_OUTBOX_URL:
+        required: false
+      # A SEPARATE machine token, scope `image_upload`, issued from the same
+      # TrueQuote panel as TRUEQUOTE_MACHINE_TOKEN (scope `booking_outbox`).
+      # Every app rejects a token presented to the wrong scope with a flat 401,
+      # and the three apps do not even share a scope vocabulary
+      # (`crm_outbox` / `booking_outbox` + `image_upload` / `servicetitan_outbox`),
+      # so no token is ever interchangeable with another. Absent = pricebook
+      # image bytes are simply not uploaded; the `image_refs` identifiers still
+      # go to the Sheet.
+      #
+      # TRADERATED_IMAGE_TOKEN is the ORIGINAL name for this same TrueQuote
+      # token and is still accepted — a connector pinned in a contractor's own
+      # repository cannot be updated on our schedule, so names widen.
+      TRUEQUOTE_IMAGE_TOKEN:
+        required: false
+      TRADERATED_IMAGE_TOKEN:
         required: false
 
 jobs:
   export:
     runs-on: ubuntu-latest
     if: ${{ inputs.target == 'sheets' }}
-    # The jobs feed runs every 5 minutes and technicians every 30, and a large
-    # tenant's first full drain can exceed 5 minutes — so runs really can
-    # overlap. Both write the same `_meta` grid and may drain the same
-    # `_outbox_ledger` tab, each via read-then-full-replace, so an overlapping
-    # run can read stale state and silently roll back the other's cursor/ledger
-    # writes. Serialize instead. `github.repository` is the CALLING repo, so
-    # each customer gets their own group: a customer never collides with
-    # themselves, and different customers never block each other.
+    # TWO LOCKS, NOT ONE, AND NOT ONE PER FEED. Which one a run takes is decided
+    # by what that run WRITES, not by which caller job asked for it.
+    #
+    # `github.repository` is the CALLING repo, so each customer gets their own
+    # pair: a customer never collides with themselves, and different customers
+    # never block each other.
+    #
+    #   ...-export  every run with at least one EXPORT feed (jobs, technicians,
+    #               pricebook, financial). All of them read the whole `_meta`
+    #               grid and write the whole `_meta` grid back — carrying over
+    #               the rows for the feeds they did not run. Two such runs
+    #               overlapping therefore roll each other's cursors, row counts
+    #               and `last_run_at` back, whatever feeds they asked for. They
+    #               MUST stay serialised with each other. This is why there is
+    #               no per-feed key here: a per-feed key would make exactly that
+    #               race possible, and the fix for it is a merge-on-write
+    #               `_meta` in Python, not a YAML change (see docs/examples/
+    #               connector-export.yml, "Why pricebook can still delay jobs").
+    #
+    #   ...-outbox  a run that asks for `outbox` AND NOTHING ELSE. `cli.py` does
+    #               not call `run_export` at all for such a run: it touches no
+    #               export tab, does not read `_meta`, does not write `_meta`,
+    #               and makes no Export Store round-trip. The only tab it
+    #               read-modify-writes is `_outbox_ledger`, on the private
+    #               raw-cache Sheet, which no export feed writes. So it is safe
+    #               to run beside an export — and taking its own lock is what
+    #               keeps the 5-minute drain off the back of an hourly
+    #               pricebook run.
+    #
+    # The comparison is against the exact string `outbox` and nothing fancier,
+    # because the SAFE side of any ambiguity is the shared export lock. A run
+    # asking for `jobs,outbox`, or for ` outbox ` with a stray space, writes
+    # `_meta` (or might) and lands in `...-export` with everything else. Adding
+    # a `contains()` here would move the fail-safe to the wrong side.
+    #
+    # This split does NOT weaken the one-drain rule. Every drain names the same
+    # feeds string, so every drain takes the same `...-outbox` lock: even if
+    # somebody did add `feeds: outbox` to a second job, the two drains could
+    # never run at the same time and could never interleave their ledger writes
+    # — the damage would be a doubled drain RATE, not a corrupted ledger or a
+    # duplicated ServiceTitan write (every app's claim is skip-locked, so two
+    # drainers never receive the same row).
+    #
     # cancel-in-progress: false — killing a run mid-drain is exactly the
     # crash the ledger has to recover from; better to just queue.
     concurrency:
-      group: st-export-${{ github.repository }}
+      group: st-export-${{ github.repository }}-${{ inputs.feeds == 'outbox' && 'outbox' || 'export' }}
       cancel-in-progress: false
     timeout-minutes: 10
     permissions:
@@ -67,7 +169,7 @@ jobs:
       # checkout ref and the expected version the guard asserts — is derived
       # from this string.
       # ---------------------------------------------------------------------
-      EXPORTER_TAG: exporter-v0.2.8
+      EXPORTER_TAG: exporter-v0.2.9
     steps:
       # A reusable (workflow_call) workflow runs in the CALLER's context, so a
       # bare checkout would fetch the caller's repo (which has no pyproject.toml)
@@ -134,6 +236,43 @@ jobs:
           fi
           echo "exporter $actual matches the pinned tag"
 
+      # THE DRAIN ANNOUNCES ITSELF. The one-drain rule is enforced structurally
+      # (the drain needs `feeds: outbox`, and only the drain job is given a
+      # product's MACHINE TOKEN), but "structurally impossible" is a claim that
+      # has to stay checkable by a human looking at the Actions tab. A comment
+      # explaining the rule was already deleted once from a live connector repo;
+      # a notice on every drain cannot be deleted from there at all, because it
+      # is printed from this file, in this repository, at a tag the connector
+      # pins.
+      #
+      # So: exactly one notice per cycle is correct. Two notices in the same
+      # five minutes is a second drain, visible in the run list without reading
+      # anyone's YAML.
+      #
+      # `contains()` here, but an exact `== 'outbox'` on the concurrency group
+      # above, and the asymmetry is deliberate in both directions: ANY run that
+      # drains must announce it (so `jobs,outbox` is caught), while only a run
+      # that provably writes no `_meta` may leave the shared export lock.
+      - name: Announce the drain
+        if: ${{ contains(inputs.feeds, 'outbox') }}
+        env:
+          FEEDS: ${{ inputs.feeds }}
+        run: |
+          echo "::notice title=Outbox drain::This run drains the outbox queues (feeds: $FEEDS)." \
+               "EXACTLY ONE job in ${{ github.repository }}'s caller workflow may do this." \
+               "Two of these notices in one cycle means the queues are being drained twice."
+          {
+            echo "### Outbox drain"
+            echo
+            echo "This run asked for \`$FEEDS\`, so it drained the outbox queue of every"
+            echo "product whose **machine token** is set on this job."
+            echo
+            echo "Exactly one caller job may do this. If you are looking at two of these"
+            echo "summaries for the same cycle, a second job has been given \`outbox\` in"
+            echo "its \`feeds:\` **and** a product machine token, and the queues are being"
+            echo "drained twice."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run export
         env:
           ST_CLIENT_ID: ${{ secrets.ST_CLIENT_ID }}
@@ -146,11 +285,25 @@ jobs:
           EXPORTER_WINDOW_DAYS: ${{ inputs.window }}
           TRADERATED_MACHINE_TOKEN: ${{ secrets.TRADERATED_MACHINE_TOKEN }}
           TRADERATED_OUTBOX_BASE_URL: ${{ secrets.TRADERATED_OUTBOX_BASE_URL }}
+          TRUEQUOTE_MACHINE_TOKEN: ${{ secrets.TRUEQUOTE_MACHINE_TOKEN }}
+          TRUEQUOTE_OUTBOX_URL: ${{ secrets.TRUEQUOTE_OUTBOX_URL }}
+          PROFITWIZARD_MACHINE_TOKEN: ${{ secrets.PROFITWIZARD_MACHINE_TOKEN }}
+          PROFITWIZARD_OUTBOX_URL: ${{ secrets.PROFITWIZARD_OUTBOX_URL }}
+          TRUEQUOTE_IMAGE_TOKEN: ${{ secrets.TRUEQUOTE_IMAGE_TOKEN }}
+          TRADERATED_IMAGE_TOKEN: ${{ secrets.TRADERATED_IMAGE_TOKEN }}
+          EXPORTER_PRICEBOOK_CATEGORY_IDS: ${{ inputs.pricebook_category_ids }}
+          EXPORTER_FINANCIAL_WINDOW_DAYS: ${{ inputs.financial_window }}
+          EXPORTER_FINANCIAL_MAX_JOBS: ${{ inputs.financial_max_jobs }}
           FEEDS: ${{ inputs.feeds }}
-          PRICEBOOK_FLAG: ${{ inputs.pricebook && '--pricebook' || '' }}
         run: |
-          case "$FEEDS" in
-            jobs|technicians|jobs,technicians) ;;
-            *) echo "::error::invalid feeds input: $FEEDS" >&2; exit 1 ;;
-          esac
-          st-export --feeds "$FEEDS" $PRICEBOOK_FLAG
+          # Per-segment check rather than an enumeration of every combination —
+          # `st-export` validates the same set again (parse_feeds), this is just
+          # the earlier, clearer failure.
+          IFS=',' read -ra FEED_PARTS <<< "$FEEDS"
+          for feed in "${FEED_PARTS[@]}"; do
+            case "$(echo "$feed" | tr -d '[:space:]')" in
+              jobs|technicians|pricebook|financial|outbox) ;;
+              *) echo "::error::invalid feeds input: $FEEDS" >&2; exit 1 ;;
+            esac
+          done
+          st-export --feeds "$FEEDS"

@@ -1,0 +1,36 @@
+{
+  "feed": "jobs",
+  "contract_version": "jobs.v2",
+  "tab": "jobs",
+  "grain": "one row per (appointment, assigned technician); an appointment with no assigned technician still emits one row with a blank st_technician_id",
+  "row_key": [
+    "st_job_id",
+    "st_appointment_id",
+    "st_technician_id"
+  ],
+  "columns": [
+    "st_job_id",
+    "st_appointment_id",
+    "job_number",
+    "st_technician_id",
+    "customer_name",
+    "customer_phone",
+    "customer_email",
+    "service_address",
+    "latitude",
+    "longitude",
+    "appointment_start",
+    "appointment_end",
+    "job_status",
+    "job_type",
+    "summary",
+    "business_unit",
+    "modified_on"
+  ],
+  "rows": [
+    ["1", "100", "J-1", "901", "Jane Doe", "555-0111", "jane@example.com", "1 Main St, Springfield, IL, 62701", "", "", "2026-09-03T09:00:00-05:00", "2026-09-03T11:00:00-05:00", "Scheduled", "", "", "", "2026-05-01T00:00:00Z"],
+    ["1", "100", "J-1", "900", "Jane Doe", "555-0111", "jane@example.com", "1 Main St, Springfield, IL, 62701", "", "", "2026-09-03T09:00:00-05:00", "2026-09-03T11:00:00-05:00", "Scheduled", "", "", "", "2026-05-01T00:00:00Z"],
+    ["3", "300", "J-3", "", "Fixture Customer Ltd", "555-0199", "fixture@example.invalid", "", "", "", "2026-09-04T09:00:00-05:00", "2026-09-04T11:00:00-05:00", "Completed", "", "No location on this job", "", "2026-09-04T00:00:00Z"],
+    ["4", "400", "J-4", "900", "Jane Doe", "555-0111", "jane@example.com", "3 Fixture Way, Springfield, IL, 62701", "39.7817", "-89.6501", "2026-09-04T13:00:00-05:00", "2026-09-04T15:00:00-05:00", "Scheduled", "Install", "Install, whole crew", "Doors", "2026-09-04T00:00:00Z"]
+  ]
+}

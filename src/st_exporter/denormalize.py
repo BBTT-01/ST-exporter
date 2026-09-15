@@ -77,6 +77,110 @@ def _first_present(*sources: dict[str, Any] | None, keys: tuple[str, ...]) -> An
     return None
 
 
+#: ServiceTitan's documented customer object carries contact details as
+#: ``contacts: [{id, type, value, memo}]`` with ``type`` one of
+#: ``Phone | MobilePhone | Email | Fax``. Matched case-folded. Fax is
+#: deliberately NOT a phone: the tab's `customer_phone` is what somebody rings.
+_PHONE_CONTACT_TYPES = ("phone", "mobilephone")
+_EMAIL_CONTACT_TYPES = ("email",)
+
+
+def _contact_detail(
+    customer: dict[str, Any] | None,
+    *,
+    settings_key: str,
+    fields: tuple[str, ...],
+    contact_types: tuple[str, ...] = (),
+) -> Any:
+    """One customer phone/email, from every place ServiceTitan might put it.
+
+    Three layers, tried in order, first non-empty wins:
+    ``customer[settings_key][i][field]`` -> ``customer['contacts'][i]`` selected
+    by ``type`` -> the flat ``customer[field]`` scalar. The middle layer is the
+    one ServiceTitan's own customer schema documents (see ``_typed_contact``);
+    the other two are prior readings kept because this contract only widens.
+
+    ServiceTitan's CRM customer carries its contact details as
+    ``phoneSettings: [{phone: ...}]`` / ``emailSettings: [{email: ...}]``. Profit
+    Wizard's production client reads exactly those and treats the flat ``phone``
+    / ``email`` scalars only as a fallback (``lib/crm/servicetitan.ts:903-906``),
+    so reading only the scalars is the same shape of mistake that left
+    ``job_number`` blank on every row ever exported — a column that is empty on
+    every row, which reads as "this contractor has no phone numbers".
+
+    Widen-only, so it cannot regress: the array is preferred when it has a
+    usable entry and the old scalar behaviour is preserved underneath it. The
+    tab has one cell, not a list, so the FIRST non-empty entry wins — that is
+    the customer's primary number in ServiceTitan's own ordering.
+
+    ``fields`` is a TUPLE of spellings for the same fact, tried in order on each
+    entry, because the element's own field name is not verified against a live
+    tenant: ServiceTitan's documented ``CustomerPhoneSettings`` looks like
+    ``{phoneNumber, doNotText}`` while every fixture here says ``phone``. Reading
+    only one of them is precisely how ``job_number`` stayed blank on every row
+    ever exported. Reading all of them costs nothing and cannot be wrong — see
+    ``KNOWN_UNVERIFIED.md``.
+    """
+    if not customer:
+        return None
+    for entry in customer.get(settings_key) or []:
+        if not isinstance(entry, dict):
+            continue
+        for field in fields:
+            value = entry.get(field)
+            if value is not None and str(value).strip():
+                return value
+    contact_value = _typed_contact(customer, contact_types)
+    if contact_value is not None:
+        return contact_value
+    return _first_present(customer, keys=fields)
+
+
+def _typed_contact(customer: dict[str, Any], contact_types: tuple[str, ...]) -> Any:
+    """First non-empty ``contacts[]`` entry of one of ``contact_types``.
+
+    This is the shape ServiceTitan's own customer schema documents — ``id,
+    active, name, type, address, contacts, balance, …`` with
+    ``contacts[] {id, type, value, memo}`` and ``type`` in
+    ``Phone | MobilePhone | Email | Fax``. That schema lists **none** of
+    ``phone``/``phoneNumber``/``email``/``emailAddress`` on the customer, and no
+    ``phoneSettings``/``emailSettings`` array either: `phoneSettings` appears to
+    belong to the CONTACT record and to be an object rather than an array. So
+    this is the reading most likely to be the real one.
+
+    It is added BENEATH the settings-array and ABOVE the flat scalar rather than
+    replacing either. **This is not purely widening, and the precedent matters.**
+    A tenant carrying BOTH a typed ``contacts[]`` entry and a populated flat
+    ``phone`` used to export the scalar and now exports the contact:
+
+        {"contacts": [{"type": "Phone", "value": "A"}], "phone": "B"}
+
+    gave ``B`` before and gives ``A`` now. That is deliberate — ``contacts[]`` is
+    the shape ServiceTitan's schema actually documents, and the flat scalar is a
+    guess kept as a fallback — but it IS a changed value for that shape, not a
+    newly-filled blank. What the layering does guarantee is the weaker and more
+    important property: no column that resolved a value before is blank now, and
+    a tenant that only ever had ``contacts[]`` stops exporting a blank column.
+    Selection is by ``type``, never by position — index 0 of a customer's contacts can just
+    as easily be their fax number, and an email in the phone column is a wrong
+    answer, which is worse than a blank one.
+
+    Untyped entries are skipped for the same reason. An empty ``contact_types``
+    means the caller is not asking about contacts at all.
+    """
+    if not contact_types:
+        return None
+    for contact in customer.get("contacts") or []:
+        if not isinstance(contact, dict):
+            continue
+        if str(contact.get("type") or "").strip().lower() not in contact_types:
+            continue
+        value = contact.get("value")
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
 def _coordinate(location: dict[str, Any] | None) -> tuple[Any, Any]:
     """Latitude/longitude for a location, or (None, None) if ServiceTitan has none.
 
@@ -238,11 +342,26 @@ def build_job_rows(
                 {
                     "st_job_id": job.get("id"),
                     "st_appointment_id": appointment_id,
-                    "job_number": job.get("number"),
+                    # ServiceTitan's JPM job object names this `jobNumber`; reading
+                    # only `number` left the column blank on every row ever exported
+                    # (0 non-empty cells across 2431 live rows), which hard-blocked
+                    # the consumer's NOT NULL `jobs.job_number`. `number` is kept as a
+                    # fallback because the contract only ever widens, never narrows.
+                    "job_number": _first_present(job, keys=("jobNumber", "number")),
                     "st_technician_id": technician_id,
                     "customer_name": customer.get("name") if customer else None,
-                    "customer_phone": customer.get("phone") if customer else None,
-                    "customer_email": customer.get("email") if customer else None,
+                    "customer_phone": _contact_detail(
+                        customer,
+                        settings_key="phoneSettings",
+                        fields=("phone", "phoneNumber", "number"),
+                        contact_types=_PHONE_CONTACT_TYPES,
+                    ),
+                    "customer_email": _contact_detail(
+                        customer,
+                        settings_key="emailSettings",
+                        fields=("email", "emailAddress"),
+                        contact_types=_EMAIL_CONTACT_TYPES,
+                    ),
                     "service_address": build_service_address(location.get("address"))
                     if location
                     else "",
