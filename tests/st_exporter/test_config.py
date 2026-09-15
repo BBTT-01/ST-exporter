@@ -64,3 +64,37 @@ def test_service_account_json_is_excluded_from_repr(monkeypatch) -> None:
     _set_env(monkeypatch, GOOGLE_SERVICE_ACCOUNT_JSON='{"secret": "sentinel-value"}')
     settings = ExporterSettings()  # type: ignore[call-arg]
     assert "sentinel-value" not in repr(settings)
+
+
+def test_pricebook_category_ids_default_to_the_whole_catalogue(monkeypatch) -> None:
+    _set_env(monkeypatch)
+    assert ExporterSettings().pricebook_category_ids == ()  # type: ignore[call-arg]
+
+
+def test_pricebook_category_ids_split_on_commas(monkeypatch) -> None:
+    _set_env(monkeypatch, EXPORTER_PRICEBOOK_CATEGORY_IDS=" 10, 11 ,")
+    assert ExporterSettings().pricebook_category_ids == ("10", "11")  # type: ignore[call-arg]
+
+
+def test_financial_window_defaults_to_ninety_but_is_a_separate_knob(monkeypatch) -> None:
+    # Same number as the jobs window, different reason — and raising one must
+    # never move the other. See window.FINANCIAL_WINDOW_DAYS.
+    _set_env(monkeypatch, EXPORTER_FINANCIAL_WINDOW_DAYS="365")
+    settings = ExporterSettings()  # type: ignore[call-arg]
+    assert settings.financial_window_days == 365
+    assert settings.window_days == 90
+
+
+def test_financial_window_zero_is_rejected(monkeypatch) -> None:
+    # Zero would silently empty three money tabs rather than error.
+    _set_env(monkeypatch, EXPORTER_FINANCIAL_WINDOW_DAYS="0")
+    with pytest.raises(pydantic.ValidationError):
+        ExporterSettings()  # type: ignore[call-arg]
+
+
+def test_financial_max_jobs_defaults_and_rejects_zero(monkeypatch) -> None:
+    _set_env(monkeypatch)
+    assert ExporterSettings().financial_max_jobs == 500  # type: ignore[call-arg]
+    _set_env(monkeypatch, EXPORTER_FINANCIAL_MAX_JOBS="0")
+    with pytest.raises(pydantic.ValidationError):
+        ExporterSettings()  # type: ignore[call-arg]

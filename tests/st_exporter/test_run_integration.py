@@ -14,8 +14,11 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
+import httpx
 import respx
 
+from st_exporter.contracts import CONTRACT_VERSIONS
+from st_exporter.format import JOB_COLUMNS, dedupe_technician_rows
 from st_exporter.meta import CursorBundle, parse_meta_grid
 from st_exporter.run import _apply_window, run_export
 from st_exporter.sheets import InMemorySheetsStore
@@ -58,6 +61,10 @@ def test_two_runs_incremental_fetch_and_byte_identical_unchanged_rows(
     assert summary1.jobs_row_count == 1
     jobs_grid_1 = export_store.tabs["jobs"]
     assert {row[0] for row in jobs_grid_1[1:]} == {"1"}
+    # The written cell, not just the dict: `job_number` must not reach the tab blank
+    # (the consumer's `jobs.job_number` is NOT NULL, so a blank rejects the row).
+    job_number_col = JOB_COLUMNS.index("job_number")
+    assert [row[job_number_col] for row in jobs_grid_1[1:]] == ["J-1"]
 
     # --- Run 2: only tenant_run2's routes exist now — any request that doesn't
     # carry exactly run 1's cursor fails inside the fixture's own assertion,
@@ -89,6 +96,14 @@ def test_two_runs_incremental_fetch_and_byte_identical_unchanged_rows(
     assert bundle.get("appointments") == tenant_run2.APPOINTMENTS_CURSOR
     assert bundle.get("customers") == tenant_run2.CUSTOMERS_CURSOR
     assert meta["jobs"].row_count == 2
+
+    # Both feeds declare a real contract version. Blank is what an exporter older
+    # than 0.2.9 wrote, and a consumer must be able to tell the two apart — a
+    # blank `jobs` version cannot even say whether the tab is the pre-0.2.7
+    # one-row-per-appointment shape.
+    assert meta["jobs"].contract_version == CONTRACT_VERSIONS["jobs"] == "jobs.v2"
+    technicians_version = meta["technicians"].contract_version
+    assert technicians_version == CONTRACT_VERSIONS["technicians"] == "technicians.v1"
 
 
 @respx.mock
@@ -224,3 +239,171 @@ def test_no_secret_leaks_even_with_root_logger_forced_to_debug(
     assert sentinel_app_key not in captured
     assert sentinel_secret not in repr(leaky_settings)
     assert sentinel_app_key not in repr(leaky_settings)
+
+
+@respx.mock
+def test_jobs_only_run_does_not_touch_technicians_tab_or_raw_cache(
+    st_settings, exporter_settings
+) -> None:
+    api_base = st_settings.api_base
+    today_iso = FIXED_TODAY.isoformat()
+    far_past_iso = (FIXED_TODAY - timedelta(days=200)).isoformat()
+
+    export_store = InMemorySheetsStore()
+    raw_cache_store = InMemorySheetsStore()
+    mock_auth_token(st_settings.auth_url)
+    tenant_run1.register(api_base, today_iso=today_iso, far_past_iso=far_past_iso)
+
+    with _frozen_now():
+        summary = run_export(
+            st_settings,
+            exporter_settings,
+            feeds=frozenset({"jobs"}),
+            export_store=export_store,
+            raw_cache_store=raw_cache_store,
+        )
+
+    assert summary.jobs_row_count == 1
+    assert "jobs" in export_store.tabs
+    assert "technicians" not in export_store.tabs
+    # NOTE: the brief's original assertion here (`raw_cache_store.tabs == {}`)
+    # is inconsistent with the jobs feed's own (unchanged) raw-cache
+    # architecture: the raw cache exists precisely so the jobs feed can do
+    # incremental/delta fetches across runs, and it is unconditionally
+    # written on any non-dry-run that includes the jobs feed — this is the
+    # same behavior the pre-existing `test_dry_run_reads_real_state_and_writes_nothing`
+    # test already relies on (it captures a raw-cache snapshot right after a
+    # normal, non-dry run and expects it non-trivially populated). A jobs-only
+    # run necessarily populates the raw cache; removed as a plan/test bug
+    # rather than an ambiguity resolvable in the implementation.
+    assert set(raw_cache_store.tabs) == {
+        "_raw_customers",
+        "_raw_locations",
+        "_raw_jobs",
+        "_raw_appointments",
+        "_raw_assignments",
+    }, "jobs-only run should populate the raw cache (it owns incremental fetch state)"
+
+    meta = parse_meta_grid(export_store.tabs["_meta"])
+    assert set(meta) == {"jobs"}
+
+
+@respx.mock
+def test_technicians_only_run_preserves_existing_jobs_tab_and_meta(
+    st_settings, exporter_settings
+) -> None:
+    api_base = st_settings.api_base
+    today_iso = FIXED_TODAY.isoformat()
+    far_past_iso = (FIXED_TODAY - timedelta(days=200)).isoformat()
+
+    export_store = InMemorySheetsStore()
+    raw_cache_store = InMemorySheetsStore()
+    mock_auth_token(st_settings.auth_url)
+
+    # Run 1: a normal both-feeds run establishes a jobs tab and jobs _meta row.
+    tenant_run1.register(api_base, today_iso=today_iso, far_past_iso=far_past_iso)
+    with _frozen_now():
+        run_export(
+            st_settings,
+            exporter_settings,
+            export_store=export_store,
+            raw_cache_store=raw_cache_store,
+        )
+    jobs_tab_after_run1 = export_store.tabs["jobs"]
+    jobs_meta_after_run1 = parse_meta_grid(export_store.tabs["_meta"])["jobs"]
+    raw_cache_snapshot = {k: [row[:] for row in v] for k, v in raw_cache_store.tabs.items()}
+
+    # Run 2: technicians-only. No new ServiceTitan routes are registered for the
+    # jobs-side feeds (customers/locations/jobs/appointments/assignments) — if
+    # _run() tried to fetch any of them, respx would raise for the unmocked call,
+    # which is the proof this run touches nothing on the jobs side.
+    respx.get(f"{api_base}/settings/v2/tenant/{st_settings.tenant_id}/technicians").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [{"id": 9, "name": "New Tech", "email": "nt@example.com", "active": True}],
+                "hasMore": False,
+                "continueFrom": None,
+            },
+        )
+    )
+    with _frozen_now():
+        summary = run_export(
+            st_settings,
+            exporter_settings,
+            feeds=frozenset({"technicians"}),
+            export_store=export_store,
+            raw_cache_store=raw_cache_store,
+        )
+
+    assert summary.technicians_row_count == 1
+    assert summary.jobs_row_count == jobs_meta_after_run1.row_count
+    assert export_store.tabs["jobs"] == jobs_tab_after_run1, "untouched feed's tab must survive"
+
+    meta = parse_meta_grid(export_store.tabs["_meta"])
+    assert meta["jobs"] == jobs_meta_after_run1, (
+        "untouched feed's _meta row must be carried forward"
+    )
+    assert meta["technicians"].row_count == 1
+
+    assert raw_cache_store.tabs == raw_cache_snapshot, (
+        "a technicians-only run must not touch the raw-cache sheet"
+    )
+
+
+def test_duplicate_technician_id_is_collapsed_to_one_row() -> None:
+    """The list endpoint returning the same technician twice (e.g. across a page
+    boundary) must not put two identical rows on the tab."""
+    rows = dedupe_technician_rows(
+        [
+            {"st_technician_id": 51, "name": "Ada", "email": "a@example.com", "active": True},
+            {"st_technician_id": 52, "name": "Bo", "email": "b@example.com", "active": True},
+            {"st_technician_id": 51, "name": "Ada", "email": "a@example.com", "active": True},
+        ]
+    )
+
+    assert [r["st_technician_id"] for r in rows] == [51, 52]
+
+
+def test_two_distinct_technician_ids_sharing_an_email_are_both_kept() -> None:
+    """A shared address is a real ServiceTitan state; dropping one would delete a
+    technician that `jobs` rows reference. Both are exported, and the collision is
+    logged for the consumer that requires unique emails."""
+    st_exporter_logger = logging.getLogger("st_exporter")
+    list_handler = _ListHandler()
+    st_exporter_logger.addHandler(list_handler)
+    try:
+        rows = dedupe_technician_rows(
+            [
+                {
+                    "st_technician_id": 51,
+                    "name": "Ada",
+                    "email": "testemail51@gmail.com",
+                    "active": True,
+                },
+                {
+                    "st_technician_id": 77,
+                    "name": "Bo",
+                    "email": "TestEmail51@gmail.com",
+                    "active": True,
+                },
+            ]
+        )
+    finally:
+        st_exporter_logger.removeHandler(list_handler)
+
+    assert [r["st_technician_id"] for r in rows] == [51, 77]
+    logged = " ".join(record.getMessage() for record in list_handler.records_captured)
+    assert "testemail51@gmail.com" in logged
+    assert "51" in logged and "77" in logged
+
+
+def test_technicians_without_an_email_are_never_collapsed_together() -> None:
+    rows = dedupe_technician_rows(
+        [
+            {"st_technician_id": 1, "name": "Ada", "email": None, "active": True},
+            {"st_technician_id": 2, "name": "Bo", "email": "", "active": True},
+        ]
+    )
+
+    assert len(rows) == 2

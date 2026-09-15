@@ -13,7 +13,16 @@ uv run python -m pytest -x                               # stop on first failure
 uv run ruff check src/ tests/
 uv run ruff format src/ tests/
 uv run mypy src/                                         # see note below
+
+# Export Store contract fixtures (contracts/fixtures/)
+uv run python scripts/gen_contract_fixtures.py --check    # CI: is the suite stale?
+uv run python scripts/gen_contract_fixtures.py            # regenerate — deliberately
 ```
+
+> Regenerating the contract fixtures is not a way to make a red test green: three
+> other codebases test themselves against those exact bytes. Read
+> [the contract doc](export-contract.md) first — a column change needs a version
+> bump and a message to the app teams.
 
 > Run tests as `uv run python -m pytest` (not bare `uv run pytest`) so they
 > always use the project venv's interpreter rather than a stray shim.

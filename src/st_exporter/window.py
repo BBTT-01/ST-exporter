@@ -54,3 +54,46 @@ def _parse_utc_date(iso_timestamp: str) -> date:
         # No offset present — treat as already UTC rather than guessing a local zone.
         return dt.date()
     return dt.astimezone(timezone.utc).date()
+
+
+# ---------------------------------------------------------------------------
+# The financial window — a SEPARATE decision from DEFAULT_WINDOW_DAYS above
+# ---------------------------------------------------------------------------
+
+#: How far back the `financial` feed reaches: invoices, job timesheets and the
+#: Job Costing Summary report.
+#:
+#: **This is 90 for an entirely different reason than the jobs window is 90, and
+#: the two must never be collapsed into one constant.** The jobs window is 90
+#: because a five-month-old job scheduled for today has to appear on a
+#: technician's screen; nothing about that applies to an invoice. This one is 90
+#: because it is the shortest window that still covers every Profit Wizard
+#: surface fed from ServiceTitan — measured against Profit Wizard's own code
+#: rather than picked as a round number:
+#:
+#:   - ``lib/company/operating-metrics.ts`` — ``OPERATING_METRIC_WINDOW_DAYS = 90``
+#:     (warranty %, financing %)
+#:   - ``lib/services/safety-analysis.ts`` — ``ANALYSIS_WINDOW_DAYS = 90``, with
+#:     7/30/90 rolling buckets
+#:   - ``app/api/cron/sync-job-costs/route.ts`` — the six-hourly cron pulls
+#:     invoices, hours and quotes with ``maxLookbackDays: 90``
+#:   - the dashboard's health margin (30 days + last calendar month), the
+#:     technicians page (30) and goals (month-to-date) all sit inside 90
+#:
+#: The shortest thing that covers all of those is 90 days, so 90 it is. Anything
+#: shorter silently truncates the 90-day buckets the safety engine and the
+#: operating metrics are built on.
+#:
+#: Two known gaps, deliberate:
+#:   - Profit Wizard's reports page offers a 365-day ("Last year") timeframe.
+#:     That is NOT covered here; covering it would quadruple a six-hourly pull to
+#:     serve one optional picker value. Raise ``EXPORTER_FINANCIAL_WINDOW_DAYS``
+#:     to 365 for a tenant that needs it.
+#:   - The 12-month forecasting/variable-calculator inputs and the 36-month
+#:     QuickBooks history are fed from QuickBooks, not ServiceTitan, so they are
+#:     not this feed's problem.
+#:
+#: The ServiceTitan job-cost sync's own default in Profit Wizard is 45 days
+#: (``cost-sync-schedule.ts``, ``maxLookbackDays = 45``); 45 is not enough for
+#: the feed as a whole because the same tabs feed the 90-day surfaces above.
+FINANCIAL_WINDOW_DAYS = 90

@@ -1,0 +1,23 @@
+{
+  "_what_this_is": "sha256 of every contract fixture AS RELEASED, per contract version. A file under a version listed here may never change: bump the version instead. Written by scripts/gen_contract_fixtures.py; asserted by tests/st_exporter/test_contract_fixtures.py.",
+  "versions": {
+    "financial.v1": {
+      "accounting.invoices.json": "4d6db765396e0a7aee56bcbf5a38d8e860ae088b12fb7c0850b90963b360fcf7",
+      "payroll.timesheets.json": "96188cb1ce4d26e546c2a07a4f1281bfba7fc90c3ef5a33e45f7b1910de49315",
+      "reporting.jobCosts.json": "9375121d643085b79d6073cafca61a6ada7745e755c0ae2cf391c136ef3e11cd",
+      "settings.businessUnits.json": "3f4cd017ed9dbbaf49fa5f6f57cc3296d82ff6a55bb947e88d64085e23aa5f60"
+    },
+    "jobs.v2": {
+      "jobs.json": "f61e695cbeda2008a25b903858ab4da92057b2ae2ac3eef61c51ab45f15833a0"
+    },
+    "pricebook.v1": {
+      "pricebook.categories.json": "a0e9d2d529ed8d3334adba6bbd279386135e7ebea0ec20d65b8bef77e7d1e047",
+      "pricebook.equipment.json": "1704cbc33abce7b8d3a4581a828e5d9acb6a93d1aec727251bffe515e41f20a0",
+      "pricebook.materials.json": "83bb2618d9348b3265f7af8a40753104d9c91f0dacbfa857cb10c0ba7f6c5b65",
+      "pricebook.services.json": "ffb73be1678c16cb60e81c673e7260c3774f6d7a0aafc48e1b46823a16414a55"
+    },
+    "technicians.v1": {
+      "technicians.json": "3e9eeb3433a53750e1cf0469495d52004731b3c66cc20d60dfb743b999b98d8a"
+    }
+  }
+}

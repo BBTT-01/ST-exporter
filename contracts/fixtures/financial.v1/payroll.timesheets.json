@@ -1,0 +1,24 @@
+{
+  "feed": "financial",
+  "contract_version": "financial.v1",
+  "tab": "payroll.timesheets",
+  "grain": "one row per job timesheet segment, cancelled segments included",
+  "row_key": [
+    "Id"
+  ],
+  "columns": [
+    "JobId",
+    "TechnicianId",
+    "ArrivedOn",
+    "DoneOn",
+    "CanceledOn",
+    "Id",
+    "AppointmentId",
+    "DispatchedOn"
+  ],
+  "rows": [
+    ["7", "9", "2026-09-01T09:00:00Z", "2026-09-01T11:30:00Z", "", "11", "21", "2026-09-01T08:00:00Z"],
+    ["7", "10", "", "", "2026-09-01T08:15:00Z", "12", "21", "2026-09-01T08:00:00Z"],
+    ["8", "9", "2026-09-02T08:30:00Z", "2026-09-02T10:00:00Z", "", "13", "22", "2026-09-02T08:00:00Z"]
+  ]
+}

@@ -78,3 +78,6 @@ def register(api_base: str, *, today_iso: str) -> None:
     respx.get(f"{api_base}/settings/v2/tenant/{TENANT_ID}/business-units").mock(
         return_value=httpx.Response(200, json={"data": [], "hasMore": False})
     )
+    # Contacts have no cursor — run 2 asks again, for both customers this time
+    # (job 2's appointment has been rescheduled into the window).
+    run1.register_customer_contacts(api_base)

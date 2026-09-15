@@ -8,8 +8,16 @@ added later) that reads one.
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from st_exporter.feeds.contacts import (
+    DEFAULT_MAX_CONTACT_CUSTOMERS,
+    ROUTE_PER_CUSTOMER,
+    ROUTES,
+)
+from st_exporter.feeds.financial import DEFAULT_MAX_TIMESHEET_JOBS
+from st_exporter.window import FINANCIAL_WINDOW_DAYS
 
 
 class ExporterSettings(BaseSettings):
@@ -33,3 +41,78 @@ class ExporterSettings(BaseSettings):
     # than error — the exact silent-failure mode this package treats as its
     # highest-stakes risk (see window.py's module docstring).
     window_days: int = Field(default=90, ge=1, validation_alias="EXPORTER_WINDOW_DAYS")
+
+    # How far back the `financial` feed reaches. A SEPARATE knob from
+    # `window_days` on purpose: the two windows happen to share the number 90 but
+    # not the reason, and one tenant needing a longer financial history (Profit
+    # Wizard's reports page offers a 365-day timeframe) must not be able to drag
+    # the jobs window along with it. See window.FINANCIAL_WINDOW_DAYS.
+    # ge=1 for the same reason as window_days: a zero window would silently empty
+    # three money tabs rather than error.
+    financial_window_days: int = Field(
+        default=FINANCIAL_WINDOW_DAYS, ge=1, validation_alias="EXPORTER_FINANCIAL_WINDOW_DAYS"
+    )
+
+    # Cap on how many completed jobs the `financial` feed asks for timesheets.
+    # ServiceTitan has no bulk endpoint carrying the dispatch-shaped timesheet
+    # fields Profit Wizard reads, so this costs one request per job — see
+    # feeds/financial.py. ge=1 because zero would write an empty
+    # `payroll.timesheets` tab that looks like "this tenant logs no labour".
+    financial_max_jobs: int = Field(
+        default=DEFAULT_MAX_TIMESHEET_JOBS, ge=1, validation_alias="EXPORTER_FINANCIAL_MAX_JOBS"
+    )
+
+    # Which route the jobs feed reads customer phone/email from. `per-customer`
+    # (the default) is the one route with live evidence behind it — TradeRated's
+    # Direct-path function has been reading `customers/{id}/contacts` in
+    # production for both tenants. `export` opts into the bulk
+    # `crm/export/customers/contacts` change-feed, which could not be shown to
+    # exist without a live tenant to ask; if it answers 404/400 the run says so
+    # and falls back to per-customer rather than blanking two columns. See
+    # feeds/contacts.py. Not GOOGLE_-prefixed; see window_days.
+    contacts_route: str = Field(
+        default=ROUTE_PER_CUSTOMER, validation_alias="EXPORTER_CONTACTS_ROUTE"
+    )
+
+    # Cap on how many DISTINCT customers one run asks for contacts on the
+    # per-customer route — the financial feed's EXPORTER_FINANCIAL_MAX_JOBS knob
+    # for the same N+1 shape. ge=1 because zero would blank both contact columns
+    # on every row, which is the bug this cap's feed exists to fix.
+    contacts_max_customers: int = Field(
+        default=DEFAULT_MAX_CONTACT_CUSTOMERS,
+        ge=1,
+        validation_alias="EXPORTER_CONTACTS_MAX_CUSTOMERS",
+    )
+
+    @field_validator("contacts_route")
+    @classmethod
+    def _known_contacts_route(cls, value: str) -> str:
+        """Reject an unknown route rather than silently exporting blank columns.
+
+        A typo'd `EXPORTER_CONTACTS_ROUTE` must not fall through to "fetch
+        nothing": that is indistinguishable, on the tab, from the very bug this
+        setting exists to fix.
+        """
+        route = value.strip().lower()
+        if route not in ROUTES:
+            raise ValueError(f"EXPORTER_CONTACTS_ROUTE must be one of {', '.join(ROUTES)}")
+        return route
+
+    # Optional comma-separated ServiceTitan pricebook category ids to restrict the
+    # pricebook feed to. Blank (the default) exports the whole catalogue, which is
+    # what the tab contract describes. Kept as a raw string rather than a tuple
+    # field because pydantic-settings parses a complex-typed env var as JSON, and
+    # "1,2,3" is not JSON. Not GOOGLE_-prefixed; see window_days.
+    #
+    # Each id costs one extra serial request per item resource — ServiceTitan's
+    # `categoryIds` filter honours exactly ONE id per request (see
+    # feeds/pricebook.py), so ids are never batched.
+    pricebook_category_ids_raw: str = Field(
+        default="", validation_alias="EXPORTER_PRICEBOOK_CATEGORY_IDS"
+    )
+
+    @property
+    def pricebook_category_ids(self) -> tuple[str, ...]:
+        """``pricebook_category_ids_raw`` split into ids, blanks dropped."""
+        parts = self.pricebook_category_ids_raw.split(",")
+        return tuple(part.strip() for part in parts if part.strip())

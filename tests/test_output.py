@@ -25,6 +25,38 @@ class TestResolve:
         assert _resolve(data, "a.b.c") == "deep"
 
 
+class TestResolveAlternation:
+    """`a|b` widens a spelling. The FIRST NON-EMPTY alternative wins.
+
+    "First not-None" was wrong on the shape ServiceTitan actually returns:
+    `phoneSettings: [{"phone": ""}]` next to a populated flat `phone` hid a
+    number that was right there — the blank-column failure this DSL exists to
+    prevent, caused by the DSL itself.
+    """
+
+    def test_the_first_alternative_wins_when_it_is_populated(self):
+        assert _resolve({"jobNumber": "J-1", "number": "9"}, "jobNumber|number") == "J-1"
+
+    def test_a_missing_first_alternative_falls_through(self):
+        assert _resolve({"number": "9"}, "jobNumber|number") == "9"
+
+    def test_a_blank_first_alternative_falls_through(self):
+        rec = {"phoneSettings": [{"phone": ""}], "phone": "555-0199"}
+        assert _resolve(rec, "phoneSettings.0.phone|phone") == "555-0199"
+
+    def test_a_whitespace_only_alternative_falls_through(self):
+        assert _resolve({"a": "   ", "b": "real"}, "a|b") == "real"
+
+    def test_blank_everywhere_still_reports_present_but_blank(self):
+        # "" and None are different facts; neither alternative had anything, so
+        # the value that WAS there (blank) is returned rather than invented.
+        assert _resolve({"a": "", "b": ""}, "a|b") == ""
+        assert _resolve({}, "a|b") is None
+
+    def test_zero_is_a_value_not_a_blank(self):
+        assert _resolve({"a": 0, "b": 5}, "a|b") == 0
+
+
 class TestRender:
     def test_json_output(self, capsys):
         data = [{"id": 1, "name": "Acme"}]

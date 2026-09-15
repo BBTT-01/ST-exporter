@@ -1,0 +1,26 @@
+{
+  "feed": "pricebook",
+  "contract_version": "pricebook.v1",
+  "tab": "pricebook.equipment",
+  "grain": "one row per pricebook item that has an st_id; id-less records are dropped",
+  "row_key": [
+    "st_id"
+  ],
+  "columns": [
+    "st_id",
+    "code",
+    "name",
+    "description",
+    "price",
+    "active",
+    "category_ids",
+    "category_names",
+    "manufacturer",
+    "model",
+    "image_refs",
+    "modified_on"
+  ],
+  "rows": [
+    ["100", "DOOR-16x7", "16x7 Steel Door", "Insulated", "1299.5", "true", "10,11", "Service,Doors", "Acme", "A-16", "a1,Images/Pricebook/9f2c-uuid.jpg", "2026-09-03T00:00:00Z"]
+  ]
+}

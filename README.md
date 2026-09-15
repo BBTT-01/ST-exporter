@@ -27,6 +27,8 @@ Full docs live in **[`docs/`](docs/README.md)**:
 | [MCP server](docs/mcp-server.md) | Running `st-mcp`, tool naming, pagination model, Claude hookup |
 | [Architecture](docs/architecture.md) | Registry + engine design, how to add a resource, internals |
 | [Development](docs/development.md) | Tests, lint, type-check, project layout |
+| [Export Store contract](docs/export-contract.md) | The contract three other codebases read: version per feed, what forces a bump, the committed fixtures, the scrubbing rule |
+| [Connector workflow](docs/examples/connector-export.yml) | The caller workflow a contractor's repo runs: per-product feed flags, cadences, the one drain |
 
 Release notes live in **[`CHANGELOG.md`](CHANGELOG.md)** — see
 [0.2.0 · Full API coverage](CHANGELOG.md#020--2026-06-03--full-servicetitan-api-coverage).

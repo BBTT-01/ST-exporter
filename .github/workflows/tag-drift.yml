@@ -1,0 +1,115 @@
+# WARNS when the integration branch has moved ahead of the newest exporter tag.
+# It never fails. This is information, not a gate.
+#
+# It answers the OTHER half of the v0.2.9 failure. The release dance has two ways
+# to go wrong, and `.github/workflows/release.yml` closes each of them by a
+# different mechanism:
+#
+#   1. a tag that does not match its own commit -> STRUCTURALLY impossible: the
+#      release job tags the commit it just made and reads the literals back out
+#      of the tagged tree before pushing anything.
+#   2. a tag that is simply OLD -> exporter-v0.2.9 was cut, then PR #16 (a cursor
+#      loss fix) and PR #17 merged. Live contractors pin the tag, so they ran an
+#      exporter WITHOUT the fix that was merged for them, on green runs, with no
+#      symptom but the bug still happening.
+#
+# (2) is now answered by releasing on every merge — but that is a WORKFLOW, and a
+# workflow can be skipped, can fail, can be disabled in the Actions tab, and
+# deliberately declines to release a merge that changes nothing a tenant runs.
+# Each of those leaves the branch ahead of the newest tag again, silently. So the
+# condition is still worth measuring directly, by something that does not depend
+# on the release workflow having run at all.
+#
+# WARN, NEVER FAIL, deliberately. Drift is often correct — a docs-only merge, or
+# the minutes between a merge and its release run finishing — and a red check for
+# a normal state is a check people stop reading. It has no `pull_request` trigger
+# for the same reason: it would annotate every PR in the repository with a fact
+# about the branch that has nothing to do with that PR.
+#
+# It cannot interfere with `export.yml`: no `workflow_call` (no connector can
+# call it), no secrets, no `st-export`, read-only token, its own concurrency
+# group, and it writes nothing at all.
+
+name: Tag drift
+
+on:
+  schedule:
+    # Once a day, early UTC. Anything more often just repeats yesterday's answer.
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: tag-drift-${{ github.repository }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # Keep in step with INTEGRATION_BRANCH in .github/workflows/release.yml.
+      # If they disagree this job reports on a branch nobody releases from, which
+      # is why the branch it looked at is printed in the summary below.
+      INTEGRATION_BRANCH: feat/servicetitan-hosted
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare the newest exporter tag with the integration branch
+        # Belt and braces: the script below ends `exit 0`, and this makes even a
+        # crash in it advisory.
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          git fetch --no-tags origin "$INTEGRATION_BRANCH" || true
+          head="$(git rev-parse FETCH_HEAD 2>/dev/null || git rev-parse HEAD)"
+
+          # Newest by version order, not by date: tags are cut by hand often
+          # enough that creation order and version order have already disagreed.
+          newest="$(git tag --list 'exporter-v*' | sed 's/^exporter-v//' \
+                    | sort -V | tail -1)"
+          if [ -z "$newest" ]; then
+            echo "::notice::no exporter-v* tags yet — nothing to compare."
+            exit 0
+          fi
+          tag="exporter-v$newest"
+          behind="$(git rev-list --count "$tag..$head" 2>/dev/null || echo "?")"
+
+          {
+            echo "### Tag drift"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| newest tag | \`$tag\` (\`$(git rev-list -n1 "$tag" | cut -c1-9)\`) |"
+            echo "| branch | \`$INTEGRATION_BRANCH\` (\`$(echo "$head" | cut -c1-9)\`) |"
+            echo "| commits since the tag | $behind |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$behind" = "0" ]; then
+            echo "::notice::$tag is the tip of $INTEGRATION_BRANCH — contractors pinned to it are current."
+            echo "\`$tag\` is the tip of the branch. Contractors pinned to it run what integration has." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "::warning title=Tag drift::$INTEGRATION_BRANCH is $behind commit(s) ahead of $tag. Contractors pin the tag, so none of those commits is running anywhere. Cut a release when they should be."
+          {
+            echo "\`$INTEGRATION_BRANCH\` is **$behind commit(s) ahead** of \`$tag\`."
+            echo "Contractors pin the tag, so none of these is running for any tenant:"
+            echo
+            git log --no-merges --format='- `%h` %s' "$tag..$head" | head -40
+            echo
+            echo "This is a WARNING, not a failure. A merge normally releases itself"
+            echo "(\`.github/workflows/release.yml\`), so a list that is not empty for long"
+            echo "means one of: the release run failed, it was skipped because nothing under"
+            echo "\`src/\`, \`pyproject.toml\` or \`export.yml\` changed, a merge said"
+            echo "\`[skip release]\`, or Actions is disabled. If these should ship:"
+            echo "**Actions -> Release -> Run workflow** from \`$INTEGRATION_BRANCH\`"
+            echo "(\`force: true\` if the skip was deliberate)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
