@@ -291,12 +291,12 @@ def test_the_cadences_are_the_ones_the_products_were_sold_on(caller: dict[Any, A
     }
     for name, schedule in expected.items():
         assert _evaluate(caller["jobs"][name]["if"], variables=_ALL_ON, schedule=schedule)
-    # Hourly and daily, on offset minutes so the long feeds do not start in the
-    # same minute as a */5 jobs run and queue behind it on the export lock.
-    hourly, daily = "7 * * * *", "37 3 * * *"
-    assert hourly in _schedules(caller) and daily in _schedules(caller)
+    # Hourly and six-hourly, on offset minutes so the long feeds do not start in
+    # the same minute as a */5 jobs run and queue behind it on the export lock.
+    hourly, six_hourly = "7 * * * *", "37 */6 * * *"
+    assert hourly in _schedules(caller) and six_hourly in _schedules(caller)
     assert _evaluate(caller["jobs"]["pricebook-feed"]["if"], variables=_ALL_ON, schedule=hourly)
-    assert _evaluate(caller["jobs"]["financial-feed"]["if"], variables=_ALL_ON, schedule=daily)
+    assert _evaluate(caller["jobs"]["financial-feed"]["if"], variables=_ALL_ON, schedule=six_hourly)
 
 
 def test_no_schedule_fires_nothing(caller: dict[Any, Any]) -> None:
