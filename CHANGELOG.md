@@ -4,7 +4,56 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.10] — 2026-09-15 · A feed that fails is a run that fails
+
+Three changes, all about the same thing: a feed that did not export must not end
+green. 0.2.9's two fixes each caught an exception that used to end the run, and
+between them they left one path where the exporter exported nothing and the
+contractor saw a tick.
+
+### Fixed: a jobs/technicians feed failure reds the run again
+
+**This is the one to read before bumping.** A non-403 failure on the `jobs` or
+`technicians` feed now exits **non-zero** — a red Actions run the contractor is
+notified about — and its annotation is `::error` rather than `::warning`.
+
+On 0.2.9 that failure raised out of `run_export` and the run was red by accident
+of the crash. The cursor-loss fix below catches it, which is right, but the run
+then exited 0: the only trace of a feed that exported nothing was a
+`feed_failed=` token in the summary line, next to `jobs=0` and a green tick.
+
+Reddening it costs nothing now, and that is precisely why it was not safe before.
+The exception was tolerable only because the crash jumped over the `_meta` write;
+`_meta` is now written inside the run before the CLI decides the exit code, and
+the drain has already finished. No cursor is lost, no tab is lost, no outbox item
+is redelivered.
+
+**Pricebook and financial per-tab failures are unchanged and stay green.** One
+tab of a four-tab catalogue feed left at last run's contents was a warning on
+0.2.9, and reddening it would be a new regression the other way —
+`pricebook.materials` is refused on every TrueQuote-only tenant, every run,
+forever. Only `feed_failures` (jobs, technicians) decides the exit code.
+
+### Fixed: the write-back no longer advises a `feeds:` change that would fix nothing
+
+In a `--feeds jobs,outbox` run whose jobs feed ran and *failed* with a non-403,
+the write-back reported the deferred case: "this run did not run the `jobs` feed…
+the drain job's feeds must be `jobs,outbox`" — which is exactly what the run
+already was. That path exists only because the guard now swallows non-403s. It
+gets its own branch, `write_back_feed_failed=<n>`, and points at `feed_failed=`
+instead. The writes themselves are unaffected: live in ServiceTitan, reported
+succeeded, exported by the next successful jobs run.
+
+### Noted: a Google Sheets outage still ends the run
+
+`SheetsClient` does not wrap gspread, so `gspread.exceptions.APIError` is not an
+`STCLIError` and the per-feed guard does not catch it — a Sheets 429 on the jobs
+tab write ends the run with the technicians feed unattempted. Unchanged from
+0.2.9, and left that way deliberately: wrapping it would widen every
+`except STCLIError` at once, including the per-tab guard whose failures are
+warnings, so a whole-store outage would file itself as four stale tabs behind a
+green run. The cursor still trails the data either way. Pinned by test now rather
+than asserted away.
 
 ### Fixed: a failing feed no longer discards a committed feed's cursor
 

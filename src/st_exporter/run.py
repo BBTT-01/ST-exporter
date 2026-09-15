@@ -539,9 +539,19 @@ def _announce_feed_failure(feed: str, exc: Exception, consequence: str) -> None:
     not just the error, is the point: "403 on technicians" reads as a small local
     problem, while "the cursor did not advance and every run now re-drains" is the
     thing somebody has to act on.
+
+    At ``::error``, not ``::warning``: a whole top-level feed did not export, and
+    ``cli.py`` now exits non-zero for exactly this (``summary.feed_failures``). A
+    yellow annotation on a red run reads as a suspicion to check later; this is
+    the reason the run failed, and the annotation is the only place the run says
+    WHICH feed and why without anyone opening the log.
     """
     logger.warning("FEED FAILED: %s was not refreshed this run (%s). %s", feed, exc, consequence)
-    announce_to_actions("Feed failed", f"{feed} was not refreshed this run ({exc}). {consequence}")
+    announce_to_actions(
+        "Feed failed",
+        f"{feed} was not refreshed this run ({exc}). {consequence}",
+        level="error",
+    )
 
 
 def _guarded_feed(
