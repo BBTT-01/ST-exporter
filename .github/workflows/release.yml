@@ -137,8 +137,8 @@
 # the `job` context, which GitHub documents for a reusable workflow checking out
 # its own source. The release commit touches `pyproject.toml` and
 # `docs/examples/connector-export.yml` and nothing under `.github/workflows/`,
-# so GITHUB_TOKEN can push it. The step "Assert all two literals moved and
-# agree" enforces that by refusing any bump that touched a workflow file.
+# so GITHUB_TOKEN can push it. The step "Assert both literals moved and agree"
+# enforces that by refusing any bump that touched a workflow file.
 #
 # WHY NOT A STORED CREDENTIAL. Whatever went into such a secret would be able to
 # rewrite the reusable workflow every contractor runs against their own live
@@ -151,10 +151,18 @@
 # (A CLASSIC PAT with `workflow` scope was never an option — it carries `repo`
 # across every repository that human can reach.)
 #
-# `RELEASE_PUSH_TOKEN` survives as an UNSET seam: the checkout falls back to
-# `github.token`, and the refusal step below passes on its own now that
-# `export.yml` carries no literal. If a version literal ever creeps back into a
-# workflow file, that step starts refusing again and explains this.
+# THERE WAS A SEAM FOR ONE, AND IT WAS DELIBERATELY REMOVED. Before the literal
+# was deleted, this file carried a `RELEASE_PUSH_TOKEN` secret reference: the
+# checkout fell back to `github.token` when it was unset, and the refusal step
+# below stood down when it was set. It was never populated. It is gone now, and
+# its absence is the point — an empty secret slot labelled "put a privileged
+# token here" is a standing invitation to solve the next workflow-file push by
+# minting exactly the credential this repository decided not to hold. Nothing
+# here needs one: the release commit touches no workflow file. If a version
+# literal ever creeps back into one, the refusal step below fails the run and
+# says so, and the fix is to delete the literal again — NOT to add the secret
+# back. `test_no_credential_that_could_rewrite_a_workflow_file_returns` fails
+# the suite if a reference to ANY repository secret reappears in this file.
 #
 # ===========================================================================
 # `scripts/release.sh` IS STILL THE SOURCE OF TRUTH
@@ -447,19 +455,21 @@ jobs:
           # The push at the end uses this checkout's credentials. GitHub starts no
           # workflow run for a push made with GITHUB_TOKEN, which is loop guard (3).
           persist-credentials: true
-          # Unset by default, and everything up to the push works without it —
-          # the refusal step below is what stops a run before it spends a commit
-          # and a tag it cannot publish. When it IS set it must be able to write
-          # `.github/workflows/**`; see the header of this file for what to put
-          # in it and what that costs.
+          # SPELLED OUT even though it is `actions/checkout`'s default, because
+          # loop guard (3) depends on it: GitHub starts no workflow run for a
+          # push made with GITHUB_TOKEN, and a push made with ANY other
+          # credential does start one. This line is the thing that would have to
+          # change for that guard to weaken, so it is written where the change
+          # would be made rather than left implicit. Guards (1) and (2) — the
+          # `[skip release]` marker and the bot-author check in `decide` — do not
+          # depend on the credential and close the loop either way.
           #
-          # Loop guard (3) weakens when this is set: a push made with anything
-          # other than GITHUB_TOKEN DOES start workflow runs. Guards (1) and (2)
-          # — the `[skip release]` marker and the bot-author check in `decide` —
-          # do not depend on the credential and still close the loop. The
-          # `decide` job's bot-author check is keyed on the committer this job
-          # configures, not on the token, so it holds either way.
-          token: ${{ secrets.RELEASE_PUSH_TOKEN || github.token }}
+          # This used to fall back to a RELEASE_PUSH_TOKEN repository secret when
+          # one was set — a stored credential that could write
+          # `.github/workflows/**`. That seam is gone, and this file now names no
+          # secret at all; see the header for why it was removed rather than
+          # merely left unset.
+          token: ${{ github.token }}
 
       - name: Refuse if this file's own branch constants disagree
         run: |
@@ -542,8 +552,6 @@ jobs:
       # credential: a rehearsal must still be able to run the whole sequence.
       - name: Refuse if this push needs a credential GITHUB_TOKEN cannot have
         if: ${{ !inputs.dry_run }}
-        env:
-          HAVE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN != '' }}
         run: |
           set -euo pipefail
           current="$(sed -n 's/^ *EXPORTER_TAG: \(.*\)/\1/p' .github/workflows/export.yml | head -1)"
@@ -556,29 +564,26 @@ jobs:
             echo "export.yml already names $TAG — this bump touches no workflow file."
             exit 0
           fi
-          if [ "$HAVE_PUSH_TOKEN" = "true" ]; then
-            echo "the bump will rewrite .github/workflows/export.yml ($current -> $TAG);" \
-                 "RELEASE_PUSH_TOKEN is set, so the push can carry it."
-            exit 0
-          fi
           echo "::error::this release would rewrite EXPORTER_TAG in" \
                ".github/workflows/export.yml ($current -> $TAG), and GITHUB_TOKEN may not" \
                "push a commit that touches .github/workflows/. That is not a missing" \
-               "'permissions:' entry — no such scope exists for GITHUB_TOKEN. Set the" \
-               "RELEASE_PUSH_TOKEN secret to a credential that may write workflow files" \
-               "(a repo-scoped GitHub App token is the narrowest; see this file's header)," \
-               "or remove the EXPORTER_TAG literal from export.yml so releases stop" \
-               "touching workflows at all. Refusing now, before a commit or a tag is made," \
-               "because run 35024004355 discovered this at its final push instead."
+               "'permissions:' entry — no such scope exists for GITHUB_TOKEN. THE FIX IS" \
+               "TO DELETE THE LITERAL AGAIN: export.yml resolves its own commit via" \
+               "job.workflow_sha and needs no version written into it. Do NOT answer this" \
+               "by adding a secret that may write workflow files — that credential can" \
+               "rewrite the exporter every contractor runs against their own live" \
+               "ServiceTitan tenant, which is why the seam for one was removed (see this" \
+               "file's header). Refusing now, before a commit or a tag is made, because" \
+               "run 35024004355 discovered this at its final push instead."
           exit 1
 
       # ------------------------------------------------------------------
       # THE BUMP — delegated, not reimplemented.
       # ------------------------------------------------------------------
-      - name: Bump all two version literals (scripts/release.sh)
+      - name: Bump both version literals (scripts/release.sh)
         run: ./scripts/release.sh "$VERSION"
 
-      - name: Assert all two literals moved and agree
+      - name: Assert both literals moved and agree
         run: |
           set -euo pipefail
           # `release.sh` already cross-checks these. It is asserted AGAIN here,

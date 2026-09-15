@@ -577,7 +577,7 @@ def test_the_release_token_starts_empty_and_only_the_pushing_job_can_write(
 
 # The complete set of scopes the Actions `permissions:` key accepts. `workflows`
 # is deliberately absent: it does not exist for GITHUB_TOKEN, which is the whole
-# reason this repository needs `RELEASE_PUSH_TOKEN`.
+# reason the release bump must not touch a workflow file in the first place.
 GITHUB_TOKEN_SCOPES = frozenset(
     {
         "actions",
@@ -628,8 +628,9 @@ def test_no_workflows_scope_is_invented_to_fix_the_push(path: Path) -> None:
         unknown = set(block) - GITHUB_TOKEN_SCOPES
         assert not unknown, (
             f"{path.name} asks GITHUB_TOKEN for {sorted(unknown)}, which is not a scope the "
-            "`permissions:` key grants. If this is `workflows`, it cannot be granted at all "
-            "— use RELEASE_PUSH_TOKEN (see release.yml's header)."
+            "`permissions:` key grants. If this is `workflows`, it cannot be granted at all, "
+            "and the answer is not a stored credential either — keep version literals out of "
+            "workflow files (see release.yml's header)."
         )
 
 
@@ -654,7 +655,7 @@ def test_the_release_refuses_early_when_it_cannot_publish_what_it_would_build(
     assert guard in names, "the release can once again spend a tag on a push it cannot make"
     step = steps[names.index(guard)]
     # Before the bump, which is the first thing that writes.
-    assert names.index(guard) < names.index("Bump all two version literals (scripts/release.sh)")
+    assert names.index(guard) < names.index("Bump both version literals (scripts/release.sh)")
     # ...and therefore before the commit and the tag, which is the point.
     assert names.index(guard) < names.index("Commit the bump") < names.index("Tag that commit")
     # It reads the live file rather than asserting a remembered answer.
@@ -665,35 +666,61 @@ def test_the_release_refuses_early_when_it_cannot_publish_what_it_would_build(
         "with EXPORTER_TAG gone this step reads an empty string and would refuse every "
         "release — the retirement it documents has to actually be implemented"
     )
-    # It is keyed on whether the credential exists, not on a hardcoded "no".
-    assert step["env"]["HAVE_PUSH_TOKEN"] == "${{ secrets.RELEASE_PUSH_TOKEN != '' }}"
+    # There is no escape hatch. This step once stood down when a
+    # RELEASE_PUSH_TOKEN secret was set; a literal back in a workflow file must
+    # now fail the run outright, not be waved through by a stored credential.
+    assert "env" not in step, step.get("env")
+    assert "secrets." not in step["run"]
+    assert "exit 1" in step["run"], "the creep-back detector no longer refuses anything"
     # A rehearsal pushes nothing, so it needs no credential and must still run.
     assert step["if"] == "${{ !inputs.dry_run }}"
 
 
-def test_the_push_credential_is_optional_and_defaults_to_the_scoped_token(
+def test_no_credential_that_could_rewrite_a_workflow_file_returns(
     release: dict[Any, Any],
 ) -> None:
-    """`RELEASE_PUSH_TOKEN` is a seam, not a dependency. Unset, the checkout
-    falls back to GITHUB_TOKEN and everything short of publishing a workflow
-    change still works — including `dry_run`, which is how this file is
-    rehearsed. Nothing about the security posture changes until somebody
-    deliberately creates the secret, and the header of release.yml is where the
-    choice between an app token, a deploy key and a PAT is argued."""
+    """THE SEAM EXISTED, AND REMOVING IT IS THE ASSERTION.
+
+    This file briefly carried a `RELEASE_PUSH_TOKEN` seam — the checkout fell
+    back to it when set, and the refusal step above stood down when it was. It
+    was never populated, and it became unnecessary the moment the `EXPORTER_TAG`
+    literal left `export.yml`: the release commit touches no workflow file, so
+    GITHUB_TOKEN can push it.
+
+    It was removed rather than left unset because anything that could go in that
+    slot can rewrite the reusable workflow every contractor runs UNATTENDED
+    against their own live ServiceTitan tenant. An empty slot labelled for a
+    privileged token is an invitation to reopen that path the next time a push
+    is refused; the right answer then is to delete the literal again.
+
+    So: the release workflow names NO secret at all. That is the blanket claim
+    it started with, recoverable now that the seam is gone, and a stronger
+    statement than any allow-list of "safe" secret names.
+    """
     checkout = next(
         step
         for step in _release_steps(release)
         if str(step.get("uses", "")).startswith("actions/checkout")
     )
-    assert checkout["with"]["token"] == "${{ secrets.RELEASE_PUSH_TOKEN || github.token }}"
+    # Plain GITHUB_TOKEN, spelled out because loop guard (3) depends on it: a
+    # push made with anything else DOES start workflow runs.
+    assert checkout["with"]["token"] == "${{ github.token }}"
     assert checkout["with"]["persist-credentials"] is True
     text = RELEASE.read_text()
+    assert "secrets." not in text, (
+        "release.yml references a repository secret again. A credential this workflow can "
+        "reach is a credential that can be given permission to rewrite .github/workflows/"
+        "export.yml — the exporter every contractor runs against their own live tenant. The "
+        "RELEASE_PUSH_TOKEN seam was deliberately deleted; do not reopen it."
+    )
     # The decision is documented where it is made, with the run that forced it.
     assert "35024004355" in text, "the run that forced this is not named anywhere"
     assert "job.workflow_sha" in text, "the condition for removing the credential is not recorded"
-    # The narrower options are named, cheapest-surface first.
+    # The seam's removal is recorded rather than erased, and so are the narrower
+    # options that were considered and rejected, cheapest-surface first.
+    assert "RELEASE_PUSH_TOKEN" in text, "the seam was deleted silently, with no record of why"
     for option in ("create-github-app-token", "deploy key", "fine-grained PAT"):
-        assert option in text, f"{option!r} is not offered as an alternative"
+        assert option in text, f"{option!r} is no longer recorded as a rejected alternative"
 
 
 def test_the_bump_can_touch_no_workflow_file_at_all(
@@ -714,7 +741,7 @@ def test_the_bump_can_touch_no_workflow_file_at_all(
     steps = _release_steps(release)
     names = [step.get("name", "") for step in steps]
     guard = next(
-        step for step in steps if step.get("name") == "Assert all two literals moved and agree"
+        step for step in steps if step.get("name") == "Assert both literals moved and agree"
     )
     run = guard["run"]
     assert "unexpected" in run and "release.sh touched files it should not have" in run
@@ -724,7 +751,7 @@ def test_the_bump_can_touch_no_workflow_file_at_all(
         r"docs/examples/connector-export\.yml",
     ], allowed
     # And it gates the commit, which gates the tag, which gates the push.
-    assert names.index("Assert all two literals moved and agree") < names.index("Commit the bump")
+    assert names.index("Assert both literals moved and agree") < names.index("Commit the bump")
     committed = next(step for step in steps if step.get("name") == "Commit the bump")["run"]
     add_line = next(line for line in committed.splitlines() if line.strip().startswith("git add"))
     assert add_line.strip() == "git add pyproject.toml docs/examples/connector-export.yml"
@@ -808,13 +835,12 @@ def test_the_release_workflow_cannot_touch_a_tenant(release: dict[Any, Any]) -> 
     assert "workflow_call" not in _triggers(release)
     assert "pull_request" not in _triggers(release), "a fork's PR must not reach a write token"
     text = RELEASE.read_text()
-    # It reads exactly ONE secret, and it is not a tenant's. This used to be a
-    # blanket `"secrets." not in text`, which was the stronger statement while it
-    # was true; `RELEASE_PUSH_TOKEN` made it false without making the release
-    # workflow any closer to a ServiceTitan tenant, so the claim is now spelled
-    # out instead of implied.
+    # It reads NO secret at all. The `RELEASE_PUSH_TOKEN` seam briefly made this
+    # weaker — it had to be spelled out as an allow-list of one — and deleting
+    # the seam restored the blanket claim, which is the one worth holding: a
+    # release workflow that can reach no secret cannot leak a tenant's.
     referenced = set(re.findall(r"secrets\.([A-Z_][A-Z0-9_]*)", text))
-    assert referenced == {"RELEASE_PUSH_TOKEN"}, referenced
+    assert referenced == set(), referenced
     tenant_secrets = set(yaml.safe_load(WORKFLOW.read_text())[True]["workflow_call"]["secrets"])
     assert not (referenced & tenant_secrets), (
         "the release workflow names a secret export.yml hands to a live tenant"
@@ -866,7 +892,7 @@ def test_the_release_refuses_the_ways_this_has_gone_wrong(release: dict[Any, Any
     ):
         assert fragment in names, f"{fragment!r} is gone from the release workflow"
     # And every one of them runs before the first thing that writes.
-    bumped = names.index("Bump all two version literals (scripts/release.sh)")
+    bumped = names.index("Bump both version literals (scripts/release.sh)")
     assert names.index("Refuse to overwrite an existing tag") < bumped
 
 
