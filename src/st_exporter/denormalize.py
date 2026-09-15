@@ -81,7 +81,7 @@ def _contact_detail(
     customer: dict[str, Any] | None,
     *,
     settings_key: str,
-    field: str,
+    fields: tuple[str, ...],
 ) -> Any:
     """One customer phone/email, preferring the settings ARRAY over the scalar.
 
@@ -97,16 +97,25 @@ def _contact_detail(
     usable entry and the old scalar behaviour is preserved underneath it. The
     tab has one cell, not a list, so the FIRST non-empty entry wins — that is
     the customer's primary number in ServiceTitan's own ordering.
+
+    ``fields`` is a TUPLE of spellings for the same fact, tried in order on each
+    entry, because the element's own field name is not verified against a live
+    tenant: ServiceTitan's documented ``CustomerPhoneSettings`` looks like
+    ``{phoneNumber, doNotText}`` while every fixture here says ``phone``. Reading
+    only one of them is precisely how ``job_number`` stayed blank on every row
+    ever exported. Reading all of them costs nothing and cannot be wrong — see
+    ``KNOWN_UNVERIFIED.md``.
     """
     if not customer:
         return None
     for entry in customer.get(settings_key) or []:
         if not isinstance(entry, dict):
             continue
-        value = entry.get(field)
-        if value is not None and str(value).strip():
-            return value
-    return customer.get(field)
+        for field in fields:
+            value = entry.get(field)
+            if value is not None and str(value).strip():
+                return value
+    return _first_present(customer, keys=fields)
 
 
 def _coordinate(location: dict[str, Any] | None) -> tuple[Any, Any]:
@@ -279,10 +288,14 @@ def build_job_rows(
                     "st_technician_id": technician_id,
                     "customer_name": customer.get("name") if customer else None,
                     "customer_phone": _contact_detail(
-                        customer, settings_key="phoneSettings", field="phone"
+                        customer,
+                        settings_key="phoneSettings",
+                        fields=("phone", "phoneNumber", "number"),
                     ),
                     "customer_email": _contact_detail(
-                        customer, settings_key="emailSettings", field="email"
+                        customer,
+                        settings_key="emailSettings",
+                        fields=("email", "emailAddress"),
                     ),
                     "service_address": build_service_address(location.get("address"))
                     if location

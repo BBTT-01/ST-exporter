@@ -126,10 +126,12 @@ an error.
   report POST — the most timeout-prone call in the repo — walked straight past
   the financial feed's per-tab guard and discarded invoices, timesheets and
   business units that had already been fetched, leaving every `_meta` row stale.
-  Transport errors are also retried on the same budget a 429 gets, since a
-  timeout is more often a blip than a verdict. Every `except STCLIError` in the
-  repo is now a complete guard rather than one that holds until the network
-  hiccups; `st` prints a clean error instead of a traceback.
+  Transport errors on a **read** are also retried on the same budget a 429 gets,
+  since a timeout is more often a blip than a verdict; a write is retried only
+  when the failure proves nothing was sent (see "a write is never re-sent"
+  below). Every `except STCLIError` in the repo is now a complete guard rather
+  than one that holds until the network hiccups; `st` prints a clean error
+  instead of a traceback.
 - **A TrueQuote image upload that never reaches an HTTP status is a retryable
   rejection, not an exception.** `upload.py` promised "401/429/5xx ends the pass,
   not the run", but a DNS failure is neither. It aborted the run *after* four
@@ -167,11 +169,16 @@ an error.
   way (`jobNumber` preferred, `number` kept as a fallback), and the job fixture
   now carries the real field name. `number` on invoices and projects is untouched.
 - **`customer_phone` / `customer_email` read the settings arrays.** ServiceTitan
-  returns `phoneSettings[].phone` / `emailSettings[].email`; Profit Wizard's
-  production client treats the flat scalars only as a fallback. Reading only the
-  scalars is the `job_number` failure again. Widen-only in both
+  returns the details as `phoneSettings[]` / `emailSettings[]` arrays; Profit
+  Wizard's production client treats the flat scalars only as a fallback. Reading
+  only the scalars is the `job_number` failure again. Widen-only in both
   `st_exporter.denormalize` and `st crm customers-list`, so nothing that worked
-  before can stop working.
+  before can stop working. **The element's own field name is a guess, not a
+  fact**: this originally said `phoneSettings[].phone` as though it were
+  established, while ServiceTitan's documented `CustomerPhoneSettings` element
+  looks like `{phoneNumber, doNotText}` and every fixture here happened to say
+  `phone`, so the suite could not tell the difference. All the plausible
+  spellings are now read and the guess is tracked in `KNOWN_UNVERIFIED.md`.
 - **A tripwire for the unverified date-filter parameter names.** ServiceTitan
   ignores query parameters it does not recognise, so a wrong spelling exports the
   tenant's entire history and says nothing. The feed now logs a WARNING naming
@@ -179,6 +186,54 @@ an error.
   filtering locally would mask the very symptom that proves the name is wrong.
 - **Deleted three tests that asserted `f(x) == f(x)`** and replaced them with
   tests that fail when the behaviour regresses.
+
+### Fixed — round two: two of those fixes were incomplete, two were new defects
+
+An adversarial re-review of the pass above. Same failure class, and two of the
+entries are the fixes themselves.
+
+- **A write is never re-sent after a transport failure.** Retrying every
+  `httpx.HTTPError` on the same budget as a 429 was safe for a GET and wrong for
+  everything else: a `ReadTimeout` or a `RemoteProtocolError` after a POST means
+  the request very likely *reached* ServiceTitan and only the answer was lost, so
+  the retry created a second job, a second booking, a second lead — and each
+  outbox lane writes its idempotency ledger only after `perform` returns, so
+  nothing downstream could de-duplicate it. Reads are still retried freely; a
+  write is retried only on `ConnectError`/`ConnectTimeout`, which prove the
+  request never left. Anything else raises `TransportError` immediately, as it
+  did before the branch.
+- **The image lane now runs AFTER the `_meta` write, not just inside a guard.**
+  `ImageLedger.flush()` sat in a `finally`, outside the lane's `except`, so a
+  routine Sheets 429 on the raw-cache spreadsheet escaped anyway and left four
+  fresh pricebook tabs with an absent or stale `_meta` and the outbox drain
+  skipped. The flush now has its own guard — but the real fix is structural: the
+  side lane runs after `_meta`, so no exception, hang or `timeout-minutes` kill
+  in it can get between a written tab and the row that describes it.
+- **A report data page that declares no fields is refused.** Metadata with no
+  `fields` deferred to the data page; if the data page had none either, the
+  column guard checked nothing, every row zipped to `{}`, and
+  `reporting.jobCosts` was written with zero rows, a fresh `_meta` row and no
+  recorded failure — the exact silent-blank-money case the guard exists for,
+  reached *through* the guard. The data page is the backstop and is never a
+  second deferral.
+- **A failed pricebook tab no longer lets the image pass prune the ledger.**
+  Isolating the four tabs meant a failing `pricebook.equipment` left its items
+  out of the records handed to the image pass — which still called itself
+  complete and dropped every equipment image key as "gone", re-uploading
+  identical bytes next run. The pass is told whether the catalogue was whole.
+- **An unreachable ServiceTitan images endpoint stops the image pass.** A
+  per-asset `TransportError` was swallowed and the next asset tried, at a full
+  retry budget of timeouts each; a handful of them exceeded the workflow's
+  `timeout-minutes` on their own. It now stops the pass the way a 403 does.
+- **`fetch_timesheets` raises at its page cap instead of writing a truncated
+  tab.** A server ignoring `page` answers `hasMore` forever with the same page,
+  which was written as a complete `payroll.timesheets`. It is now a named
+  failure, so the tab keeps last run's contents.
+- **`a|b` column alternation picks the first NON-EMPTY alternative.** "First
+  not-None" hid a populated flat `phone` behind a `phoneSettings: [{"phone":
+  ""}]`, which is a real ServiceTitan answer — the mini-DSL producing the blank
+  column it was added to prevent. `""` is still returned when every alternative
+  is blank, so "present but blank" stays distinguishable from "absent".
 
 ## [Unreleased] · Financial feed
 

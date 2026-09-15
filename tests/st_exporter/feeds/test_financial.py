@@ -14,6 +14,7 @@ import pytest
 
 from st_cli.exceptions import APIError, NotFoundError
 from st_exporter.feeds.financial import (
+    TimesheetPaginationError,
     fetch_business_units,
     fetch_completed_job_ids,
     fetch_invoices,
@@ -137,11 +138,18 @@ class TestTimesheets:
         pages = [c.kwargs["params"]["page"] for c in mock_client.get.call_args_list]
         assert pages == [1, 2, 3]
 
-    def test_an_endless_hasmore_stops_rather_than_looping_forever(self, mock_client) -> None:
+    def test_an_endless_hasmore_raises_rather_than_truncating(self, mock_client) -> None:
+        """A server ignoring `page` answers hasMore forever with the same page.
+
+        Writing the tab from those 20 pages reports a truncated (here: 20x
+        duplicated) payroll as a complete success. It must be a NAMED failure,
+        so `_TabGuard` skips the tab and keeps last run's contents.
+        """
         mock_client.get.return_value = _envelope([{"id": 1, "jobId": 7}], has_more=True)
-        segments = fetch_timesheets(mock_client, ["7"])
+        with pytest.raises(TimesheetPaginationError) as excinfo:
+            fetch_timesheets(mock_client, ["7"])
+        assert "job 7" in str(excinfo.value)
         assert mock_client.get.call_count <= 21
-        assert len(segments) == mock_client.get.call_count
 
     def test_a_bare_array_is_by_definition_the_whole_answer(self, mock_client) -> None:
         mock_client.get.return_value = [{"id": 1, "jobId": 7}]

@@ -15,6 +15,29 @@ _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.0  # seconds
 
 
+def _is_retriable_transport(method: str, exc: httpx.HTTPError) -> bool:
+    """Whether a request that never got a status may be sent AGAIN.
+
+    A ``ReadTimeout`` or a ``RemoteProtocolError`` after a POST means the
+    request very likely *reached* ServiceTitan and only the answer was lost —
+    re-sending it creates a second booking, a second lead, a second job. The
+    outbox writes its idempotency ledger only after ``perform`` returns, so a
+    duplicate there cannot be deduplicated afterwards. Duplicating a real
+    contractor's ServiceTitan record is far worse than failing a run, so:
+
+    - a read (``GET``, which ``get_bytes`` also uses) is retried freely — it has
+      no effect to duplicate;
+    - any other method is retried ONLY when the failure proves the request was
+      never sent, i.e. the connection itself was never established
+      (``ConnectError`` / ``ConnectTimeout``);
+    - everything else raises ``TransportError`` immediately, which is the
+      pre-branch behaviour and what every per-tab guard already handles.
+    """
+    if method.upper() == "GET":
+        return True
+    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+
+
 class ServiceTitanClient:
     """HTTP client for ServiceTitan API v2."""
 
@@ -119,17 +142,20 @@ class ServiceTitanClient:
                 )
             except httpx.HTTPError as exc:
                 # No status came back at all — DNS, connect, TLS, read timeout.
-                # Retried on the same budget as a 429 (a timeout is far more
-                # often a blip than a verdict), then raised as an STCLIError so
-                # the per-tab guards in st_exporter can catch it. Letting a bare
-                # httpx exception escape killed three already-fetched tabs.
-                if retries < _MAX_RETRIES:
+                # Raised as an STCLIError (never a bare httpx exception, which
+                # once killed three already-fetched tabs) — but retried only
+                # when re-sending is PROVABLY safe, see `_is_retriable_transport`.
+                if _is_retriable_transport(method, exc) and retries < _MAX_RETRIES:
                     retries += 1
                     time.sleep(_BACKOFF_BASE * (2 ** (retries - 1)))
                     continue
+                attempts = (
+                    f"after {retries} retr{'y' if retries == 1 else 'ies'}"
+                    if retries
+                    else "and was not retried (a re-send could duplicate the write)"
+                )
                 raise TransportError(
-                    f"{method} {url} failed without an HTTP response after "
-                    f"{retries} retr{'y' if retries == 1 else 'ies'} "
+                    f"{method} {url} failed without an HTTP response {attempts} "
                     f"({type(exc).__name__}: {exc})"
                 ) from exc
 

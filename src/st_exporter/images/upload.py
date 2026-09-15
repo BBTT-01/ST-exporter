@@ -24,7 +24,11 @@ Failure policy, in one place because it is the whole point of the module:
   (the permission is tenant-wide, so the 404th 403 teaches us nothing the first
   did not) and the run reports it; public HTTPS assets keep uploading.
 - Any single asset failing — download or upload — is counted and stepped over.
-  A pricebook run must not end because one image is a broken link.
+  A pricebook run must not end because one image is a broken link. The one
+  exception is a ``TransportError`` from ServiceTitan's authenticated images
+  endpoint: that is the connection, not the asset, so it stops the pass the way
+  a 403 does rather than burning a retry budget per asset until the workflow's
+  ``timeout-minutes`` kills the run before `_meta` is written.
 - 401/429/5xx from TrueQuote — **and a TrueQuote request that never reached a
   status at all**, a DNS failure or a timeout — ends the *pass*, not the run:
   those are about the connection, and every unsent asset is simply retried by
@@ -42,7 +46,7 @@ from typing import Any, Iterable
 import httpx
 
 from st_cli.client import ServiceTitanClient
-from st_cli.exceptions import APIError, STCLIError
+from st_cli.exceptions import APIError, STCLIError, TransportError
 from st_exporter.images.assets import (
     MAX_IMAGE_BYTES,
     PricebookAsset,
@@ -162,7 +166,11 @@ def _upload_one(
 
     payload = _download(client, public, asset, summary)
     if payload is None:
-        return True
+        # `_download` sets `stopped` when the failure is about the CONNECTION to
+        # ServiceTitan rather than about this one asset; carrying on would spend
+        # the same doomed retry budget on every remaining asset and can run the
+        # whole workflow past its `timeout-minutes`.
+        return summary.stopped is None
 
     if len(payload) > MAX_IMAGE_BYTES:
         summary.too_large += 1
@@ -256,6 +264,24 @@ def _download(
             )
         else:
             summary.download_failed += 1
+            logger.info("pricebook image download failed: %s", exc)
+        return None
+    except TransportError as exc:
+        summary.download_failed += 1
+        if is_storage_path(asset.source_url):
+            # ServiceTitan itself is unreachable, not this one image. The same
+            # failure awaits every other authenticated asset, and each one now
+            # costs a full retry budget of timeouts — five of them exceed the
+            # workflow's timeout-minutes on their own. Stop the PASS, the way a
+            # 403 already does; the next scheduled run retries every asset.
+            summary.stopped = f"ServiceTitan images endpoint unreachable: {exc}"
+            logger.warning(
+                "pricebook image download could not reach ServiceTitan (%s); stopping "
+                "the image pass rather than timing the run out one asset at a time. "
+                "Every pricebook tab was still written.",
+                exc,
+            )
+        else:
             logger.info("pricebook image download failed: %s", exc)
         return None
     except (STCLIError, httpx.HTTPError) as exc:

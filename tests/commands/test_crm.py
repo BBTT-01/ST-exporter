@@ -189,3 +189,28 @@ class TestCustomerContactColumns:
             [{"id": 1, "name": "Acme", "phoneSettings": [], "phone": "555-0199"}]
         )
         assert "555-0199" in invoke(["crm", "customers-list"]).output
+
+    def test_a_blank_settings_entry_falls_back_rather_than_blanking(self, invoke, mock_client):
+        # `[{"phone": ""}]` is a real ServiceTitan answer, and the flat scalar
+        # next to it is a real number. Showing the blank hides it.
+        mock_client.get.return_value = make_envelope(
+            [{"id": 1, "name": "Acme", "phoneSettings": [{"phone": ""}], "phone": "555-0199"}]
+        )
+        assert "555-0199" in invoke(["crm", "customers-list"]).output
+
+    def test_the_documented_phone_number_spelling_is_read_too(self, invoke, mock_client):
+        # ServiceTitan documents the element as {phoneNumber, doNotText}; which
+        # spelling a live tenant returns is UNVERIFIED, so both are read.
+        mock_client.get.return_value = make_envelope(
+            [
+                {
+                    "id": 1,
+                    "name": "Acme",
+                    "phoneSettings": [{"phoneNumber": "555-0177", "doNotText": False}],
+                    "emailSettings": [{"emailAddress": "doc@acme.test"}],
+                }
+            ]
+        )
+        result = invoke(["crm", "customers-list"])
+        assert "555-0177" in result.output
+        assert "doc@acme.test" in result.output

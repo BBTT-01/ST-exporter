@@ -22,8 +22,14 @@ CUSTOMER_COLUMNS: list[Column] = [
     # Profit Wizard's production client reads them the same way round
     # (`lib/crm/servicetitan.ts:903-906`). Reading only the scalar leaves the
     # column blank on every row, which looks like a customer with no phone.
-    ("Email", "emailSettings.0.email|email"),
-    ("Phone", "phoneSettings.0.phone|phone"),
+    # Every plausible spelling, widest first: ServiceTitan's documented
+    # `CustomerPhoneSettings` element looks like `{phoneNumber, doNotText}`, but
+    # `phone` is what the fixtures (and the previous reading of the docs) say —
+    # so BOTH are read, plus the flat scalar. Unverified against a live tenant;
+    # tracked in KNOWN_UNVERIFIED.md. Narrowing this to one spelling is how
+    # `job_number` stayed blank for the life of that feature.
+    ("Email", "emailSettings.0.email|emailSettings.0.emailAddress|email"),
+    ("Phone", "phoneSettings.0.phoneNumber|phoneSettings.0.phone|phone"),
     ("Active", "active"),
     ("Created", "createdOn"),
 ]

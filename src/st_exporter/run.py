@@ -289,16 +289,15 @@ def _run(
     pricebook_row_counts: dict[str, int] | None = None
     pricebook_failures: dict[str, str] | None = None
     image_summary: ImageUploadSummary | None = None
+    pricebook_item_records: list[dict[str, Any]] | None = None
     if "pricebook" in feeds:
-        pricebook_row_counts, pricebook_failures, image_summary = _run_pricebook_feed(
+        pricebook_row_counts, pricebook_failures, pricebook_item_records = _run_pricebook_feed(
             client,
             export_store,
-            raw_cache_store,
             meta_rows=meta_rows,
             new_meta_rows=new_meta_rows,
             run_at=run_at,
             category_ids=pricebook_category_ids,
-            image_client=image_client,
             dry_run=dry_run,
         )
     else:
@@ -336,6 +335,27 @@ def _run(
         )
     else:
         export_store.replace_grid("_meta", build_meta_grid(new_meta_rows))
+
+    # The image pass runs AFTER `_meta`, deliberately and structurally. It is a
+    # side lane: it writes no export tab, and the four pricebook tabs it draws
+    # its work from are already written. Running it here means nothing it does —
+    # not an exception, not a Sheets 429 on the ledger, not a forty-minute
+    # download stall against `timeout-minutes` — can come between a written tab
+    # and the `_meta` row that describes it. Handling those failures is not
+    # enough; ordering makes the whole class of "fresh tabs, stale `_meta`"
+    # impossible. Never move it back above the `_meta` write.
+    if pricebook_item_records is not None:
+        image_summary = _upload_pricebook_images(
+            client,
+            raw_cache_store,
+            pricebook_item_records,
+            image_client=image_client,
+            run_at=run_at,
+            dry_run=dry_run,
+            # A failed item tab means `item_records` is missing that tab's items,
+            # so this pass did NOT see the whole catalogue however well it ran.
+            catalogue_complete=not pricebook_failures,
+        )
 
     return ExportSummary(
         jobs_row_count=jobs_row_count,
@@ -583,16 +603,18 @@ class _TabGuard:
 def _run_pricebook_feed(
     client: ServiceTitanClient,
     export_store: SheetsPort,
-    raw_cache_store: SheetsPort,
     *,
     meta_rows: dict[str, MetaRow],
     new_meta_rows: list[MetaRow],
     run_at: str,
     category_ids: tuple[str, ...] = (),
-    image_client: TrueQuoteImageClient | None = None,
     dry_run: bool,
-) -> tuple[dict[str, int], dict[str, str], ImageUploadSummary | None]:
+) -> tuple[dict[str, int], dict[str, str], list[dict[str, Any]]]:
     """Write the four `pricebook.*` tabs; append one MetaRow per tab that succeeded.
+
+    Returns the item records it fetched along with the row counts and failures:
+    the image pass consumes them, but runs in ``_run`` *after* the `_meta` write
+    rather than here, so no side lane can ever precede `_meta`.
 
     A full replace every run, with no window and no cursor: pricebook is a
     catalogue, so re-deriving every row from a fresh full list is both the simplest
@@ -642,18 +664,7 @@ def _run_pricebook_feed(
 
     guard.write(export_store, dry_run=dry_run)
 
-    return (
-        guard.row_counts,
-        guard.failures,
-        _upload_pricebook_images(
-            client,
-            raw_cache_store,
-            item_records,
-            image_client=image_client,
-            run_at=run_at,
-            dry_run=dry_run,
-        ),
-    )
+    return guard.row_counts, guard.failures, item_records
 
 
 def _run_financial_feed(
@@ -746,6 +757,7 @@ def _upload_pricebook_images(
     image_client: TrueQuoteImageClient | None,
     run_at: str,
     dry_run: bool,
+    catalogue_complete: bool = True,
 ) -> ImageUploadSummary | None:
     """Push image bytes to TrueQuote for the items this feed just exported.
 
@@ -758,6 +770,12 @@ def _upload_pricebook_images(
     Returns None — not an empty summary — when the pass did not run at all:
     "nothing to upload" and "never looked" are different facts to whoever reads
     the run's output.
+
+    ``catalogue_complete`` is False when any pricebook item tab failed. The
+    summary cannot know that — it only sees the records it was handed — but
+    ``ImageLedger.keep``'s precondition is that the caller saw the WHOLE
+    catalogue, and a failed `pricebook.equipment` means every equipment image
+    key is simply absent from ``seen_keys`` rather than gone.
     """
     if image_client is None or dry_run:
         return None
@@ -769,18 +787,17 @@ def _upload_pricebook_images(
         # Only prune on a pass that actually saw the whole catalogue — a run
         # stopped by a 403, a rate limit or a failed download has "not looked
         # at" assets that must not be mistaken for "gone" and re-uploaded next
-        # run.
-        if summary.complete:
+        # run. A failed ITEM TAB is the same fact one level up: its items never
+        # reached `item_records`, so `catalogue_complete` vetoes the prune too.
+        if summary.complete and catalogue_complete:
             ledger.keep(summary.seen_keys)
     except Exception as exc:
-        # The image lane is a SIDE lane. The four pricebook tabs are already
-        # written by the time it runs, and the `_meta` rows that describe them
-        # are written after it — so anything escaping here would leave four
-        # fresh tabs described by stale `_meta` (wrong row_count, wrong
-        # last_run_at), forget every upload this pass had already made, and
-        # skip the outbox drain. Whatever it is, it is logged with its
-        # traceback, named in the summary, and does not decide whether the
-        # export succeeded.
+        # The image lane is a SIDE lane. Every pricebook tab AND its `_meta` row
+        # are already written by the time this runs (see the call site in
+        # `_run`), so nothing escaping here can leave a fresh tab described by a
+        # stale `_meta` row or skip the outbox drain. Whatever it is, it is
+        # logged with its traceback, named in the summary, and does not decide
+        # whether the export succeeded.
         summary.stopped = f"image pass aborted: {type(exc).__name__}: {exc}"
         logger.exception(
             "pricebook image pass aborted (%s). Every pricebook tab and its _meta row "
@@ -791,7 +808,23 @@ def _upload_pricebook_images(
         # In a `finally` because the uploads this pass DID make are recorded in
         # this ledger and nowhere else: losing it re-sends bytes TrueQuote
         # already has, every run, forever.
-        ledger.flush()
+        #
+        # In its OWN try/except because the flush is a Sheets write to the
+        # raw-cache spreadsheet, and a 429 there is routine. An exception from a
+        # `finally` replaces whatever the body was doing and walks straight past
+        # the `except` above — so guarding the body alone left this lane able to
+        # abort the run after all. Losing the ledger costs re-uploaded bytes;
+        # that is a named `stopped`, not a failed export.
+        try:
+            ledger.flush()
+        except Exception as exc:  # noqa: BLE001 - a side lane may not end the run
+            summary.stopped = f"image ledger flush failed: {type(exc).__name__}: {exc}"
+            logger.exception(
+                "pricebook image ledger flush failed (%s). Every pricebook tab and its "
+                "_meta row were still written; the uploads this pass made are not "
+                "recorded, so their bytes are re-sent next run.",
+                exc,
+            )
 
     logger.info("pricebook images: %s", summary.as_log_fields())
     if summary.permission_denied:

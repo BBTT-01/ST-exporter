@@ -40,7 +40,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from st_cli.client import ServiceTitanClient
-from st_cli.exceptions import APIError
+from st_cli.exceptions import APIError, STCLIError
 from st_cli.pagination import fetch_all
 from st_exporter.feeds import reporting
 from st_exporter.financial import JOB_COST_COLUMNS
@@ -194,7 +194,11 @@ def fetch_timesheets(
     Every page is read. The envelope form carries ``hasMore``, and a job worked
     by a large crew over several days genuinely exceeds one page — stopping at
     the first would silently drop labour hours off the end, which reads
-    downstream as a cheaper job rather than as an error.
+    downstream as a cheaper job rather than as an error. A job that exceeds
+    ``_MAX_TIMESHEET_PAGES`` raises :class:`TimesheetPaginationError` rather than
+    truncating: the cap is there to stop a runaway loop, and the only way to
+    reach it is a genuinely absurd job or a server ignoring ``page``, neither of
+    which may be reported as a complete tab.
     """
     segments: list[dict[str, Any]] = []
     missing = 0
@@ -218,17 +222,26 @@ def fetch_timesheets(
                 break
             page += 1
             if page > _MAX_TIMESHEET_PAGES:
-                logger.warning(
-                    "financial: job %s still reported hasMore after %d pages of "
-                    "timesheets; stopping rather than looping forever. Its later "
-                    "segments are NOT in this run's payroll.timesheets tab.",
-                    job_id,
-                    _MAX_TIMESHEET_PAGES,
+                raise TimesheetPaginationError(
+                    f"job {job_id} still reported hasMore after {_MAX_TIMESHEET_PAGES} "
+                    "pages of timesheets. Refusing to write the tab from a truncated "
+                    "pull: the missing segments read downstream as a cheaper job, not "
+                    "as an error, and a server ignoring `page` would hand us "
+                    f"{_MAX_TIMESHEET_PAGES} copies of page 1. The tab keeps last run's "
+                    "contents and its `_meta` row; the failure is named in the summary."
                 )
-                break
     if missing:
         logger.info("financial: %d job(s) had no timesheets endpoint response (404)", missing)
     return segments
+
+
+class TimesheetPaginationError(STCLIError):
+    """The timesheets pull for one job hit the page cap.
+
+    An ``STCLIError`` — so ``_TabGuard`` catches it, skips ``payroll.timesheets``
+    for this run and NAMES the failure — rather than a truncated tab written as
+    a success, which is the shape of every defect in this file's history.
+    """
 
 
 def _has_more(result: Any) -> bool:

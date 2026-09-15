@@ -22,16 +22,29 @@ def _resolve(record: dict[str, Any], key: str) -> Any:
     - ``'phoneSettings.0.phone'`` — a numeric segment indexes a list, because
       ServiceTitan returns a customer's contact details as arrays of setting
       objects rather than as scalars.
-    - ``'jobNumber|number'`` — alternatives, left to right, first non-``None``
+    - ``'jobNumber|number'`` — alternatives, left to right, first NON-EMPTY
       wins. This is how a spelling is WIDENED without narrowing: the new, right
       spelling goes first and the old one stays as a fallback, so no tenant that
       worked before can stop working.
+
+    "Non-empty" rather than "not ``None``" because ServiceTitan really does
+    return ``phoneSettings: [{"phone": ""}]`` alongside a populated flat
+    ``phone``, and letting the blank win hides a number that is right there —
+    the same rule ``st_exporter.denormalize._contact_detail`` already applies.
+    A value that is empty everywhere is still returned (as the first one seen)
+    so "present but blank" stays distinguishable from "absent".
     """
+    first_seen: Any = None
+    seen = False
     for alternative in key.split("|"):
         value = _resolve_one(record, alternative)
-        if value is not None:
+        if value is None:
+            continue
+        if str(value).strip():
             return value
-    return None
+        if not seen:
+            first_seen, seen = value, True
+    return first_seen if seen else None
 
 
 def _resolve_one(record: dict[str, Any], key: str) -> Any:

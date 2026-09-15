@@ -8,6 +8,7 @@ is the actual download-and-POST path, not a mock of it.
 from __future__ import annotations
 
 from typing import Generator
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -356,3 +357,54 @@ class TestLedgerPruning:
         summary = _run(st_client, image_client, [PUBLIC_ITEM, NO_IMAGE_ITEM])
 
         assert summary.complete is True
+
+
+class TestServiceTitanUnreachable:
+    """A transport failure on the AUTHENTICATED endpoint is about the connection.
+
+    `_download` used to swallow it per asset and carry on. Each such asset now
+    costs a full retry budget of timeouts, so a handful of unreachable images
+    burn more than the workflow's `timeout-minutes` and the run is killed —
+    which is how a stale `_meta` row happens without anything raising. The 403
+    already stops the pass for the same reason; so does this.
+    """
+
+    @respx.mock
+    def test_a_timeout_on_the_images_endpoint_stops_the_pass(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        images = respx.get(_images_url(st_settings)).mock(
+            side_effect=httpx.ReadTimeout("servicetitan never answered")
+        )
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=PNG))
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        import st_cli.client as client_module
+
+        with patch.object(client_module.time, "sleep"):
+            summary = _run(st_client, image_client, [STORAGE_ITEM, STORAGE_ITEM, PUBLIC_ITEM])
+
+        assert summary.stopped is not None
+        assert summary.complete is False
+        # The second storage asset was never even attempted: one retry budget,
+        # not one per asset.
+        assert images.call_count == 4
+        assert summary.uploaded == 0
+
+    @respx.mock
+    def test_a_broken_public_link_still_only_costs_that_one_asset(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        # Widen-only in the other direction: a dead CDN host is about that URL,
+        # not about ServiceTitan, and must not end the pass.
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(side_effect=httpx.ConnectError("cdn host is gone"))
+        respx.get(_images_url(st_settings)).mock(return_value=httpx.Response(200, content=JPEG))
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [PUBLIC_ITEM, STORAGE_ITEM])
+
+        assert summary.stopped is None
+        assert summary.download_failed == 1
+        assert summary.uploaded == 1

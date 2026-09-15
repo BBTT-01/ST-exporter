@@ -67,8 +67,39 @@ and the other three tabs still land — the failure is visible, not silent.
 JSON array on some tenants and a `{"data": [...]}` envelope on others (Profit
 Wizard accepts both). Both are accepted here. Whether it paginates on a job with
 very many segments is unknown, so the envelope form is now followed while it
-reports `hasMore` (up to a 20-page stop that is logged loudly); a bare array is
-taken as the whole answer, since there is nowhere for a cursor to live.
+reports `hasMore` (up to a 20-page stop); a bare array is taken as the whole
+answer, since there is nowhere for a cursor to live. Reaching the 20-page stop
+**raises** `TimesheetPaginationError` rather than truncating: the only ways to
+get there are an absurd job or a server that ignores `page` and hands back the
+same page forever, and neither may be written as a complete tab. The tab is
+skipped for that run, keeps its previous contents and is named in the summary.
+
+## CRM customer contact details: the settings-array element field names
+
+`src/st_exporter/denormalize.py`, `_contact_detail`;
+`src/st_cli/commands/crm.py`, `CUSTOMER_COLUMNS`
+
+That a customer's contact details live in `phoneSettings[]` / `emailSettings[]`
+arrays rather than flat scalars is well-evidenced (Profit Wizard's production
+client reads them that way, `lib/crm/servicetitan.ts:903-906`). **The field name
+inside each element is not.** ServiceTitan's documented `CustomerPhoneSettings`
+element appears to be `{phoneNumber, doNotText}` — `phoneNumber`, not `phone` —
+and the v2 customer object may document no `emailSettings` at all, with email
+living on `crm/v2/.../customers/{id}/contacts` instead.
+
+This is the `job_number` trap exactly: every fixture in this repo spells it
+`phone`, so the suite is green whichever spelling a real tenant returns, and a
+wrong guess is a column blank on every row that reads as "this contractor has no
+phone numbers" rather than as an error. So all the plausible spellings are read,
+widest-first and widen-only — `phone`, `phoneNumber`, `number` for the phone and
+`email`, `emailAddress` for the email, in the settings entry and then in the flat
+scalar. Fixtures now cover both spellings, so neither can go untested.
+
+**Check on the first real tenant:** which key each settings element actually
+uses, and whether `emailSettings` exists at all. If email turns out to live only
+on the contacts sub-resource, `customer_email` will be blank on every row and
+this feed needs that extra call — the column being blank across the whole tab is
+the signal to look for.
 
 ## `appointment-assignments` "removed" status values
 

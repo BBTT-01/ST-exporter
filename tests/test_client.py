@@ -203,3 +203,83 @@ class TestTransportFailures:
         with patch("st_cli.client.time.sleep"):
             with pytest.raises(TransportError):
                 client.get_bytes("pricebook", "images", params={"path": "x.jpg"})
+
+
+class TestWritesAreNeverResent:
+    """A retry must never be able to create a SECOND ServiceTitan record.
+
+    A `ReadTimeout` or a `RemoteProtocolError` after a POST means the request
+    very likely reached the server and only the answer was lost. Re-issuing it
+    books a second job, a second lead, a second booking — and the outbox writes
+    its idempotency ledger only after `perform` returns, so nothing downstream
+    can de-duplicate it. Failing the run is the cheap outcome; a duplicated
+    record in a real contractor's ServiceTitan is not.
+    """
+
+    @respx.mock
+    def test_a_post_is_not_resent_after_a_read_timeout(self, client):
+        route = respx.post("/jpm/v2/tenant/12345/jobs").mock(
+            side_effect=[
+                httpx.ReadTimeout("response never arrived"),
+                httpx.Response(200, json={"id": 2}),
+            ]
+        )
+        with patch("st_cli.client.time.sleep"):
+            with pytest.raises(TransportError):
+                client.post("jpm", "jobs", json_body={"summary": "x"})
+        assert route.call_count == 1
+
+    @respx.mock
+    def test_a_post_is_not_resent_after_a_protocol_error(self, client):
+        route = respx.post("/jpm/v2/tenant/12345/jobs").mock(
+            side_effect=[
+                httpx.RemoteProtocolError("server disconnected mid-response"),
+                httpx.Response(200, json={"id": 2}),
+            ]
+        )
+        with patch("st_cli.client.time.sleep"):
+            with pytest.raises(TransportError):
+                client.post("jpm", "jobs", json_body={"summary": "x"})
+        assert route.call_count == 1
+
+    @respx.mock
+    def test_the_message_says_the_write_was_deliberately_not_retried(self, client):
+        respx.post("/jpm/v2/tenant/12345/jobs").mock(side_effect=httpx.ReadTimeout("gone"))
+        with pytest.raises(TransportError) as excinfo:
+            client.post("jpm", "jobs", json_body={})
+        assert "not retried" in str(excinfo.value)
+
+    @respx.mock
+    def test_a_put_is_not_resent_either(self, client):
+        route = respx.put("/jpm/v2/tenant/12345/jobs/7").mock(
+            side_effect=[httpx.ReadTimeout("gone"), httpx.Response(200, json={})]
+        )
+        with patch("st_cli.client.time.sleep"):
+            with pytest.raises(TransportError):
+                client.put("jpm", "jobs/7", json_body={})
+        assert route.call_count == 1
+
+    @respx.mock
+    def test_a_connect_failure_proves_the_write_never_left_so_it_is_retried(self, client):
+        # Nothing was sent, so there is nothing to duplicate — and a DNS blip
+        # must not fail a booking.
+        route = respx.post("/jpm/v2/tenant/12345/jobs").mock(
+            side_effect=[
+                httpx.ConnectError("no route to host"),
+                httpx.Response(200, json={"id": 2}),
+            ]
+        )
+        with patch("st_cli.client.time.sleep"):
+            assert client.post("jpm", "jobs", json_body={"summary": "x"}) == {"id": 2}
+        assert route.call_count == 2
+
+    @respx.mock
+    def test_a_read_is_still_retried_freely(self, client):
+        # A GET has no effect to duplicate; this is the behaviour that keeps a
+        # network blip from discarding three already-fetched tabs.
+        route = respx.get("/crm/v2/tenant/12345/customers").mock(
+            side_effect=[httpx.ReadTimeout("timed out"), httpx.Response(200, json={"data": []})]
+        )
+        with patch("st_cli.client.time.sleep"):
+            assert client.get("crm", "customers") == {"data": []}
+        assert route.call_count == 2

@@ -536,6 +536,46 @@ class TestCustomerContactColumns:
         assert row["customer_phone"] == "555-1111"
         assert row["customer_email"] == "jane@flat.test"
 
+    def test_the_documented_phone_number_spelling_is_read_too(self) -> None:
+        """ServiceTitan's documented `CustomerPhoneSettings` is {phoneNumber, doNotText}.
+
+        Which spelling a live tenant actually returns is UNVERIFIED
+        (KNOWN_UNVERIFIED.md), and every other fixture here says `phone` — the
+        exact arrangement that hid `job_number` for the life of that feature. So
+        both are read, and both are tested.
+        """
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane Doe",
+                "phoneSettings": [{"phoneNumber": "555-4444", "doNotText": False}],
+                "emailSettings": [{"emailAddress": "jane@documented.test"}],
+            }
+        )
+        assert row["customer_phone"] == "555-4444"
+        assert row["customer_email"] == "jane@documented.test"
+
+    def test_a_bare_number_key_in_the_settings_entry_is_read(self) -> None:
+        row = _rows_for_customer(
+            {"id": 10, "name": "Jane", "phoneSettings": [{"number": "555-5555"}]}
+        )
+        assert row["customer_phone"] == "555-5555"
+
+    def test_the_phone_spelling_still_wins_when_both_are_present(self) -> None:
+        # Widen-only: adding spellings must not change what an existing tenant sees.
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "phoneSettings": [{"phone": "555-2222", "phoneNumber": "555-4444"}],
+            }
+        )
+        assert row["customer_phone"] == "555-2222"
+
+    def test_the_scalar_fallback_also_covers_the_alternative_spellings(self) -> None:
+        row = _rows_for_customer({"id": 10, "name": "Jane", "phoneNumber": "555-6666"})
+        assert row["customer_phone"] == "555-6666"
+
     def test_no_customer_at_all_is_still_none(self) -> None:
         result = build_job_rows(
             _cache({"id": 1, "jobNumber": "J-1", "customerId": 99}),

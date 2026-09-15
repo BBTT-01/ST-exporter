@@ -228,6 +228,41 @@ class TestColumnGuard:
         # Refused on the FIRST page — never paged on into a throttled endpoint.
         assert client.post.call_count == 1
 
+    def test_a_data_page_with_no_fields_is_refused_not_deferred_again(self) -> None:
+        """The data page is the BACKSTOP. It must never be a second deferral.
+
+        Metadata with no `fields` defers to this page. If this page declares
+        none either, every row zips to `{}`, `build_job_cost_grid` drops them
+        all, and `reporting.jobCosts` is written with zero rows, a fresh `_meta`
+        row and no recorded failure — the silent-blank-money outcome the guard
+        exists for, reached THROUGH the guard.
+        """
+        client = MagicMock()
+        client.post.return_value = {"data": [["J-7", 500, 900]], "hasMore": False}
+        with pytest.raises(ReportColumnsMismatchError) as excinfo:
+            fetch_report_rows(client, self.ref, parameters=[], required_columns=self.required)
+        message = str(excinfo.value)
+        assert "declared no fields" in message
+        assert "TotalCosts" in message
+        assert client.post.call_count == 1
+
+    def test_a_differently_spelled_fields_key_is_refused_too(self) -> None:
+        client = MagicMock()
+        client.post.return_value = {
+            "columns": [{"name": n} for n in self.required],
+            "data": [["J-7", 500, 900]],
+            "hasMore": False,
+        }
+        with pytest.raises(ReportColumnsMismatchError):
+            fetch_report_rows(client, self.ref, parameters=[], required_columns=self.required)
+
+    def test_a_caller_that_requires_nothing_is_still_free_to_read_anything(self) -> None:
+        # The CLI's generic report reader passes no `required_columns`; it is
+        # not building a fixed-column tab, so an unnamed shape is its business.
+        client = MagicMock()
+        client.post.return_value = {"data": [["J-7"]], "hasMore": False}
+        assert fetch_report_rows(client, self.ref, parameters=[]) == [{}]
+
     def test_the_right_report_passes_straight_through(self) -> None:
         client = MagicMock()
         client.post.return_value = {

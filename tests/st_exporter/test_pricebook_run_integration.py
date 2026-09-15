@@ -537,3 +537,150 @@ def test_uploads_already_made_are_flushed_even_when_the_pass_dies(
     # The first upload really happened, so it must be remembered.
     assert len(raw_cache_store.tabs["_image_ledger"]) == 2
     assert summary.images is not None and summary.images.stopped is not None
+
+
+# --- the side lane can never precede `_meta` ---------------------------------
+
+
+class _FlushRefusingStore(InMemorySheetsStore):
+    """A raw-cache Sheet that fails on the ledger WRITE, not the read.
+
+    A Sheets 429 on `replace_grid("_image_ledger")` is routine, and it happens
+    inside `ImageLedger.flush()` — which runs in a `finally`, so it replaces
+    whatever the body was doing and walks straight past the lane's `except`.
+    """
+
+    def replace_grid(self, tab_name: str, grid) -> None:
+        if tab_name == "_image_ledger":
+            raise RuntimeError("Sheets 429: quota exceeded on the raw-cache sheet")
+        return super().replace_grid(tab_name, grid)
+
+
+class _OrderRecordingStore(InMemorySheetsStore):
+    """Records whether `_meta` was already written when the image lane started."""
+
+    def __init__(self, export_store: InMemorySheetsStore) -> None:
+        super().__init__()
+        self._export_store = export_store
+        self.meta_written_when_the_image_lane_started: bool | None = None
+
+    def read_grid(self, tab_name: str):
+        if tab_name == "_image_ledger" and self.meta_written_when_the_image_lane_started is None:
+            self.meta_written_when_the_image_lane_started = "_meta" in self._export_store.tabs
+        return super().read_grid(tab_name)
+
+
+def _register_images(st_settings) -> None:
+    respx.get(EQUIPMENT_IMAGE_URL).mock(return_value=httpx.Response(200, content=PNG))
+    respx.get(f"{st_settings.api_base}/pricebook/v2/tenant/12345/images").mock(
+        return_value=httpx.Response(200, content=PNG)
+    )
+    respx.post(TQ_UPLOAD).mock(
+        return_value=httpx.Response(
+            200, json={"asset_key": "k", "storage_path": "p", "status": "stored"}
+        )
+    )
+
+
+@respx.mock
+def test_a_failing_ledger_flush_still_leaves_every_tab_described_by_meta(
+    st_settings, exporter_settings
+) -> None:
+    """The flush is in a `finally`; an exception there must not end the run.
+
+    Guarding the lane's body alone was not enough: a `finally` that raises
+    replaces the in-flight state and escapes the `except` above it, which left
+    four fresh pricebook tabs with an absent or stale `_meta` and skipped the
+    outbox drain.
+    """
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    _register_images(st_settings)
+    export_store, raw_cache_store = InMemorySheetsStore(), _FlushRefusingStore()
+
+    client = _image_client()
+    try:
+        summary = _run_with_images(
+            st_settings, exporter_settings, export_store, raw_cache_store, client
+        )
+    finally:
+        client.close()
+
+    meta = parse_meta_grid(export_store.tabs["_meta"])
+    for tab in PRICEBOOK_TABS:
+        assert meta[tab].last_run_at == FIXED_NOW.isoformat()
+    # Named, never silent: losing the ledger costs re-uploaded bytes next run.
+    assert summary.images is not None
+    assert summary.images.stopped is not None
+    assert "flush" in summary.images.stopped
+
+
+@respx.mock
+def test_the_image_lane_runs_after_meta_is_written(st_settings, exporter_settings) -> None:
+    """Ordering, not handling, is what makes "fresh tabs, stale `_meta`" impossible.
+
+    Any handling is a promise about the failures we thought of; running the side
+    lane after `_meta` means a hang, a timeout-minutes kill or an unimagined
+    exception cannot get between a written tab and the row describing it.
+    """
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    _register_images(st_settings)
+    export_store = InMemorySheetsStore()
+    raw_cache_store = _OrderRecordingStore(export_store)
+
+    client = _image_client()
+    try:
+        summary = _run_with_images(
+            st_settings, exporter_settings, export_store, raw_cache_store, client
+        )
+    finally:
+        client.close()
+
+    assert summary.images is not None and summary.images.uploaded == 1
+    assert raw_cache_store.meta_written_when_the_image_lane_started is True
+
+
+@respx.mock
+def test_a_failed_item_tab_stops_the_image_pass_pruning_the_ledger(
+    st_settings, exporter_settings
+) -> None:
+    """A failed tab means its items never reached `item_records`.
+
+    `ImageUploadSummary.complete` cannot see that — it only knows about the
+    records it was handed — so `ledger.keep(seen_keys)` would drop every
+    equipment image key as "gone" and re-send identical bytes next run,
+    violating `ImageLedger.keep`'s own precondition.
+    """
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    _register_images(st_settings)
+    export_store, raw_cache_store = InMemorySheetsStore(), InMemorySheetsStore()
+
+    client = _image_client()
+    try:
+        first = _run_with_images(
+            st_settings, exporter_settings, export_store, raw_cache_store, client
+        )
+        assert first.images is not None and first.images.uploaded == 1
+        ledger_after_first = list(raw_cache_store.tabs["_image_ledger"])
+
+        respx.get(f"{st_settings.api_base}/pricebook/v2/tenant/12345/equipment").mock(
+            return_value=httpx.Response(500, text="unwell")
+        )
+        second = _run_with_images(
+            st_settings, exporter_settings, export_store, raw_cache_store, client
+        )
+        assert "pricebook.equipment" in second.pricebook_failures
+        # The ledger is untouched: "not looked at" is not "gone".
+        assert raw_cache_store.tabs["_image_ledger"] == ledger_after_first
+
+        tenant_pricebook.register(st_settings.api_base)
+        third = _run_with_images(
+            st_settings, exporter_settings, export_store, raw_cache_store, client
+        )
+        assert third.images is not None
+        assert third.images.uploaded == 0
+        assert third.images.already_uploaded == 1
+    finally:
+        client.close()

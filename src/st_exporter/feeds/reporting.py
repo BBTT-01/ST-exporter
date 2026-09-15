@@ -171,7 +171,8 @@ def field_names(metadata: dict[str, Any]) -> list[str]:
 
     Empty when the document carries no ``fields`` at all — which is treated as
     "could not check here", not as "no columns": ``fetch_report_rows`` checks
-    the first data page's own ``fields`` regardless, so the guard still bites.
+    the first data page's own ``fields`` regardless, and RAISES when that page
+    declares none either, so the guard always bites somewhere.
     """
     fields = metadata.get("fields")
     if not isinstance(fields, list):
@@ -255,6 +256,23 @@ def fetch_report_rows(
             # Checked on the FIRST page, before a single row is kept: the
             # metadata GET and the data POST can disagree, and it is the data
             # response's own columns that decide what lands in the tab.
+            #
+            # The data page is the BACKSTOP and must never be a second deferral.
+            # `field_names` treats metadata with no `fields` as "could not check
+            # here"; if the data page ALSO declares none, there is nowhere left
+            # to check, every row would zip to `{}`, and the tab would be written
+            # with zero rows, a fresh `_meta` row and no recorded failure — the
+            # exact silent-blank-money outcome this guard exists to prevent.
+            if required_columns and not names:
+                raise ReportColumnsMismatchError(
+                    f"the report named {ref.name!r} (category {ref.category_id}/report "
+                    f"{ref.report_id}) returned a data page that declared no fields, so "
+                    "the column(s) this tab is built from "
+                    f"({', '.join(required_columns)}) cannot be confirmed. Refusing to "
+                    "write the tab: with no field names every row zips to nothing and "
+                    "the tab would be written empty, which reads as 'this contractor "
+                    "has no costs' rather than as an error."
+                )
             require_columns(ref, names, required_columns, source="first data page")
         for data_row in envelope.get("data") or []:
             rows.append(dict(zip(names, data_row)))
