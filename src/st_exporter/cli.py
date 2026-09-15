@@ -108,7 +108,7 @@ def run_once(
 
     if summary is not None and summary.scope_revoked:
         # A permission this tenant HAD and no longer has. `scopes.py` has already
-        # put a red `::error` annotation on the run naming the feed and the
+        # put a red `::error` annotation on the run naming the tab and the
         # permission; this is what turns the run itself red. That matters more
         # than it looks: a red run is the one thing a contractor sees without
         # opening anything, and it is the entire reason the feed jobs no longer
@@ -116,10 +116,11 @@ def run_once(
         # running is the failure mode being eliminated, so the feed that WAS
         # running and stopped must never end green.
         #
-        # Not `scope_not_granted`: a product that was never bought is not a
-        # failure, it is the ordinary state of every feed job a contractor's
-        # ServiceTitan app does not cover. It is named in the summary line above
-        # and nowhere else.
+        # Not `scope_not_granted`: an entity that was never granted is not a
+        # failure, it is the ordinary state of every tab a contractor's
+        # ServiceTitan app does not cover — `pricebook.materials` on every
+        # TrueQuote-only tenant, every run, forever. It is named in the summary
+        # line above and nowhere else.
         run_failed = True
 
     if run_failed:
@@ -219,15 +220,22 @@ def _summary_line(summary: ExportSummary | None, outcomes: list[LaneOutcome]) ->
         if summary.scope_not_granted:
             # An absent tab is the contract's way of saying "not bought", and an
             # absence is not something a reader can notice. So the run says it
-            # out loud, every time, in its own output: this feed was refused,
-            # this tenant never had the permission, nothing is wrong.
-            message += " not_granted=" + ",".join(sorted(summary.scope_not_granted))
+            # out loud, every time, in its own output: this TAB was refused, this
+            # tenant never had that entity's permission, nothing is wrong. Per
+            # tab, because that is how ServiceTitan grants — a TrueQuote-only
+            # tenant reads `not_granted=pricebook_materials` beside three written
+            # pricebook tabs, which is the whole truth in one word.
+            message += " not_granted=" + ",".join(
+                _tab_key(tab) for tab in sorted(summary.scope_not_granted)
+            )
         if summary.scope_revoked:
             # Different fact, different word: this one WORKED before. It also
             # carries a red annotation and a non-zero exit (see `run_once`); the
             # summary line names it too so a support engineer reading one line of
-            # output learns which feed went stale and when to expect it back.
-            message += " scope_revoked=" + ",".join(sorted(summary.scope_revoked))
+            # output learns which tab went stale and when to expect it back.
+            message += " scope_revoked=" + ",".join(
+                _tab_key(tab) for tab in sorted(summary.scope_revoked)
+            )
         if summary.financial_failures:
             # Named in the run's output rather than only in the log: a missing
             # `reporting.jobCosts` tab is the difference between Profit Wizard

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import pytest
+
 from st_exporter.meta import (
     META_COLUMNS,
     CursorBundle,
     MetaRow,
+    MetaRowSet,
     build_meta_grid,
     parse_meta_grid,
 )
@@ -146,3 +149,48 @@ def test_parse_meta_grid_tolerates_non_numeric_row_count() -> None:
 def test_parse_meta_grid_row_count_blank_cell_is_zero() -> None:
     grid = [list(META_COLUMNS), ["jobs", "t1", "{}", "", "0.1.0"]]
     assert parse_meta_grid(grid)["jobs"].row_count == 0
+
+
+class TestOneRowPerTab:
+    """`_meta` is parsed last-wins, so a duplicated tab does not read downstream
+    as an error — it reads as the WRONG `last_run_at`, on a tab that was just
+    refreshed, quietly, forever. `docs/export-contract.md` tells consumers to
+    trust exactly that cell for freshness."""
+
+    def test_a_fresh_row_wins_over_a_carried_one_whatever_the_order(self) -> None:
+        old = MetaRow(feed="pricebook.categories", last_run_at="yesterday", row_count=7)
+        fresh = MetaRow(feed="pricebook.categories", last_run_at="today", row_count=3)
+
+        carry_first = MetaRowSet()
+        carry_first.carry(old)
+        carry_first.add(fresh)
+
+        add_first = MetaRowSet()
+        add_first.add(fresh)
+        add_first.carry(old)
+
+        assert list(carry_first) == [fresh]
+        assert list(add_first) == [fresh]
+
+    def test_carrying_the_same_row_repeatedly_adds_one_row(self) -> None:
+        rows = MetaRowSet()
+        for _ in range(4):
+            rows.carry(MetaRow(feed="jobs", last_run_at="yesterday"))
+        assert len(rows) == 1
+
+    def test_membership_is_by_tab_name(self) -> None:
+        rows = MetaRowSet()
+        rows.add(MetaRow(feed="jobs", last_run_at="today"))
+        assert "jobs" in rows
+        assert "technicians" not in rows
+
+    def test_build_meta_grid_refuses_two_rows_for_one_tab(self) -> None:
+        """The assertion at the boundary. `MetaRowSet` already makes this
+        unrepresentable for a real run; this is what a future caller that
+        hand-rolls a list gets instead of a stale timestamp."""
+        rows = [
+            MetaRow(feed="pricebook.services", last_run_at="today"),
+            MetaRow(feed="pricebook.services", last_run_at="yesterday"),
+        ]
+        with pytest.raises(ValueError, match="pricebook.services"):
+            build_meta_grid(rows)

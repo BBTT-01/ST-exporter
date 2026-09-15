@@ -1,4 +1,4 @@
-"""A 403 per feed: never bought (quiet) or revoked (loud), decided from `_meta`.
+"""A 403 per TAB: never granted (quiet) or revoked (loud), decided from `_meta`.
 
 The caller workflow no longer carries a repository variable per feed. Every feed
 job runs on its schedule and ServiceTitan's scopes decide what exports, so the
@@ -10,6 +10,17 @@ exporter has to answer the one question the variables were defending against:
 tab. These tests hold that line from both sides — the quiet skip must stay quiet
 and tab-free, the revocation must stay loud and must never lose the evidence that
 made it decidable, and NOTHING but a 403 may take either path.
+
+**And the unit is the TAB.** ServiceTitan grants per entity: `Pricebook ->
+Materials` is its own tick-box, and the team's runbook deliberately omits it from
+the TrueQuote block because Materials only arrives with Profit Wizard. So "one tab
+403s while its siblings answer 200" is not an edge case to be tolerated — it is
+the ordinary, every-cycle state of a TrueQuote-only tenant, and of every Profit
+Wizard tenant that missed the Reporting permission. A per-FEED verdict cost those
+tenants tabs they had paid for, skipped their images entirely, duplicated their
+`_meta` rows and reddened every run forever. Half the tests below 403 the LAST tab
+of a multi-tab feed, precisely because only 403ing the first one is what let that
+ship.
 """
 
 from __future__ import annotations
@@ -23,9 +34,10 @@ import pytest
 import respx
 
 from st_cli.exceptions import APIError, RateLimitError, STCLIError, TransportError
-from st_exporter.meta import MetaRow, build_meta_grid, parse_meta_grid
+from st_exporter.meta import MetaRow, MetaRowSet, build_meta_grid, parse_meta_grid
 from st_exporter.run import (
     EXPORT_FEEDS,
+    EXPORT_TABS,
     FINANCIAL_FEED_NAMES,
     OUTBOX_FEED,
     PRICEBOOK_FEED_NAMES,
@@ -34,6 +46,7 @@ from st_exporter.run import (
 from st_exporter.scopes import (
     NOT_GRANTED,
     REVOKED,
+    TAB_PERMISSIONS,
     ScopeLedger,
     feed_ever_ran,
     is_permission_denied,
@@ -62,22 +75,51 @@ def _status(api_base: str, path: str, status: int) -> None:
     respx.get(f"{api_base.rstrip('/')}/{path}").mock(return_value=httpx.Response(status, text="no"))
 
 
-#: The first endpoint each feed calls. Registered AFTER the happy-path fixtures:
-#: respx keys routes by pattern, so re-registering one replaces it.
-FIRST_CALL = {
+#: The request that earns each TAB its 403 — the first call that tab makes which
+#: no sibling tab of the same feed also makes. Registered AFTER the happy-path
+#: fixtures: respx keys routes by pattern, so re-registering one replaces it.
+#:
+#: `payroll.timesheets` is keyed on one job's timesheet URL rather than the job
+#: list it is built from, because the job list is JPM and the permission being
+#: modelled is Payroll. `reporting.jobCosts` is keyed on `report-categories`,
+#: which is the first thing the Reporting section gates.
+TAB_FIRST_CALL = {
     "jobs": f"crm/v2/tenant/{TENANT_ID}/export/customers",
     "technicians": f"settings/v2/tenant/{TENANT_ID}/technicians",
-    "pricebook": f"pricebook/v2/tenant/{TENANT_ID}/services",
-    "financial": f"accounting/v2/tenant/{TENANT_ID}/invoices",
+    "pricebook.services": f"pricebook/v2/tenant/{TENANT_ID}/services",
+    "pricebook.equipment": f"pricebook/v2/tenant/{TENANT_ID}/equipment",
+    "pricebook.materials": f"pricebook/v2/tenant/{TENANT_ID}/materials",
+    "pricebook.categories": f"pricebook/v2/tenant/{TENANT_ID}/categories",
+    "accounting.invoices": f"accounting/v2/tenant/{TENANT_ID}/invoices",
+    "payroll.timesheets": f"payroll/v2/tenant/{TENANT_ID}/jobs/7/timesheets",
+    "settings.businessUnits": f"settings/v2/tenant/{TENANT_ID}/business-units",
+    "reporting.jobCosts": f"reporting/v2/tenant/{TENANT_ID}/report-categories",
 }
 
-#: Every tab a feed owns — the unit a ServiceTitan permission is granted over.
+#: Which feed has to be selected for a tab to be attempted at all.
+TAB_FEED = {
+    "jobs": "jobs",
+    "technicians": "technicians",
+    **{tab: "pricebook" for tab in PRICEBOOK_FEED_NAMES},
+    **{tab: "financial" for tab in FINANCIAL_FEED_NAMES},
+}
+
+#: Every tab a feed writes.
 FEED_TABS = {
     "jobs": ("jobs",),
     "technicians": ("technicians",),
     "pricebook": PRICEBOOK_FEED_NAMES,
     "financial": FINANCIAL_FEED_NAMES,
 }
+
+#: The tab each multi-tab feed attempts LAST. 403ing the first tab of a feed is
+#: the scenario that hid the per-feed bug for a whole review round: a first-tab
+#: 403 short-circuited every sibling, so "the siblings were lost" and "the
+#: siblings were never tried" looked identical. These are the ones that tell them
+#: apart.
+LAST_TAB = {"pricebook": PRICEBOOK_FEED_NAMES[-1], "financial": FINANCIAL_FEED_NAMES[-1]}
+
+MULTI_TAB_FEEDS = sorted(LAST_TAB)
 
 
 def _register_tenant(api_base: str) -> None:
@@ -110,15 +152,21 @@ def _seeded_store(*feeds: str) -> InMemorySheetsStore:
     return store
 
 
-def _run(st_settings, exporter_settings, export_store, feed: str):
+def _run(st_settings, exporter_settings, export_store, *feeds: str):
     with _frozen_now():
         return run_export(
             st_settings,
             exporter_settings,
-            feeds=frozenset({feed}),
+            feeds=frozenset(feeds),
             export_store=export_store,
             raw_cache_store=InMemorySheetsStore(),
         )
+
+
+def _meta_feeds(store: InMemorySheetsStore) -> list[str]:
+    """Every `feed` cell in the written `_meta` grid, duplicates included."""
+    header, *data = store.tabs["_meta"]
+    return [row[0] for row in data if row and row[0]]
 
 
 # ---------------------------------------------------------------------------
@@ -167,57 +215,122 @@ class TestEvidenceOfAPastRun:
         rows = {"jobs": MetaRow(feed="jobs", last_run_at="   ")}
         assert not feed_ever_ran(rows, ("jobs",))
 
-    def test_any_tab_of_the_feed_counts(self) -> None:
-        """ServiceTitan grants `Pricebook`, not `pricebook.equipment`. So one tab
-        having worked is proof the whole feed's permission was once held."""
+    def test_a_sibling_tabs_row_is_not_evidence_for_this_one(self) -> None:
+        """The correction. ServiceTitan grants `Pricebook -> Materials`, NOT
+        `Pricebook`: the runbook's TrueQuote block ticks Services, Equipment and
+        Categories and deliberately leaves Materials out. So a written
+        `pricebook.categories` proves nothing whatever about Materials, and
+        reading it as proof is what turned an ordinary TrueQuote-only tenant into
+        a red run every hour."""
         rows = {"pricebook.categories": MetaRow(feed="pricebook.categories", last_run_at=EARLIER)}
-        assert feed_ever_ran(rows, PRICEBOOK_FEED_NAMES)
+        assert not feed_ever_ran(rows, ("pricebook.materials",))
+        assert feed_ever_ran(rows, ("pricebook.categories",))
 
 
 class TestTheLedger:
-    def _ledger(self, meta_rows=None):
-        new: list[MetaRow] = []
-        return ScopeLedger(meta_rows=meta_rows or {}, new_meta_rows=new), new
+    def _ledger(self, meta_rows=None, tab_exists=None):
+        new = MetaRowSet()
+        return (
+            ScopeLedger(meta_rows=meta_rows or {}, new_meta_rows=new, tab_exists=tab_exists),
+            new,
+        )
 
     def test_a_first_ever_403_is_not_granted(self) -> None:
         ledger, _ = self._ledger()
-        assert ledger.deny("pricebook", PRICEBOOK_FEED_NAMES, APIError(403, "x")) == NOT_GRANTED
-        assert "pricebook" in ledger.not_granted
+        assert ledger.deny("pricebook.materials", APIError(403, "x")) == NOT_GRANTED
+        assert "pricebook.materials" in ledger.not_granted
         assert not ledger.revoked
 
     def test_a_403_after_a_good_run_is_revoked(self) -> None:
         rows = {"jobs": MetaRow(feed="jobs", last_run_at=EARLIER)}
         ledger, _ = self._ledger(rows)
-        assert ledger.deny("jobs", ("jobs",), APIError(403, "x")) == REVOKED
+        assert ledger.deny("jobs", APIError(403, "x")) == REVOKED
         assert "jobs" in ledger.revoked
         assert not ledger.not_granted
 
+    def test_one_tabs_verdict_does_not_decide_its_siblings(self) -> None:
+        """`pricebook.categories` has run before; `pricebook.materials` never has.
+        Both are refused in the same run, and they get different verdicts — which
+        is the whole point of classifying per tab."""
+        rows = {"pricebook.categories": MetaRow(feed="pricebook.categories", last_run_at=EARLIER)}
+        ledger, _ = self._ledger(rows)
+        assert ledger.deny("pricebook.materials", APIError(403, "x")) == NOT_GRANTED
+        assert ledger.deny("pricebook.categories", APIError(403, "x")) == REVOKED
+        assert set(ledger.not_granted) == {"pricebook.materials"}
+        assert set(ledger.revoked) == {"pricebook.categories"}
+
     def test_anything_but_a_403_is_handed_straight_back(self) -> None:
         ledger, new = self._ledger({"jobs": MetaRow(feed="jobs", last_run_at=EARLIER)})
-        assert ledger.deny("jobs", ("jobs",), RateLimitError()) is None
+        assert ledger.deny("jobs", RateLimitError()) is None
         assert not ledger.denied("jobs")
         # And it did NOT carry anything forward: the caller still owns that row.
-        assert new == []
+        assert list(new) == []
 
     def test_the_previous_meta_row_is_carried_forward_when_revoked(self) -> None:
         row = MetaRow(feed="jobs", last_run_at=EARLIER, row_count=9)
         ledger, new = self._ledger({"jobs": row})
-        ledger.deny("jobs", ("jobs",), APIError(403, "x"))
-        assert new == [row]
+        ledger.deny("jobs", APIError(403, "x"))
+        assert list(new) == [row]
 
     def test_carrying_forward_is_idempotent(self) -> None:
-        """Four pricebook tabs each earn their own 403; the grid must not grow
-        four copies of one row."""
+        """A retry loop must not grow four copies of one row."""
         row = MetaRow(feed="pricebook.services", last_run_at=EARLIER)
         ledger, new = self._ledger({"pricebook.services": row})
         for _ in range(4):
-            ledger.deny("pricebook", PRICEBOOK_FEED_NAMES, APIError(403, "x"))
-        assert new == [row]
+            ledger.deny("pricebook.services", APIError(403, "x"))
+        assert list(new) == [row]
 
-    def test_a_feed_with_no_previous_row_carries_nothing(self) -> None:
+    def test_it_never_carries_over_a_row_this_run_already_wrote(self) -> None:
+        """The `_meta` corruption, at its source. A tab that succeeded holds a
+        FRESH row; nothing a sibling's 403 does may put yesterday's row back."""
+        old = MetaRow(feed="pricebook.categories", last_run_at=EARLIER, row_count=7)
+        fresh = MetaRow(feed="pricebook.categories", last_run_at="2026-09-14", row_count=3)
+        ledger, new = self._ledger({"pricebook.categories": old})
+        new.add(fresh)
+        ledger.carry_forward("pricebook.categories")
+        assert list(new) == [fresh]
+
+    def test_a_tab_with_no_previous_row_carries_nothing(self) -> None:
         ledger, new = self._ledger()
-        ledger.deny("pricebook", PRICEBOOK_FEED_NAMES, APIError(403, "x"))
-        assert new == []
+        ledger.deny("pricebook.materials", APIError(403, "x"))
+        assert list(new) == []
+
+    def test_an_existing_tab_is_evidence_when_meta_says_nothing(self) -> None:
+        """Finding 3. `read_grid` answers `[]` for a tab that is not there, so a
+        `_meta` tab somebody deleted or renamed would silently turn every later
+        403 into "never bought" — the quiet, wrong direction. An export tab that
+        EXISTS is evidence a run once wrote it, whatever state `_meta` is in."""
+        ledger, _ = self._ledger(tab_exists=lambda tab: tab == "pricebook.services")
+        assert ledger.deny("pricebook.services", APIError(403, "x")) == REVOKED
+        assert ledger.deny("pricebook.materials", APIError(403, "x")) == NOT_GRANTED
+
+
+class TestThePermissionStrings:
+    """An annotation that names the wrong box sends a contractor to tick things
+    they already have, and leaves the one they are missing unticked."""
+
+    def test_every_tab_the_exporter_writes_declares_one(self) -> None:
+        assert set(TAB_PERMISSIONS) == set(EXPORT_TABS)
+
+    def test_the_jobs_permission_names_settings_business_units(self) -> None:
+        """Finding 2. A jobs-feed 403 is just as likely to come from the two
+        REFERENCE lookups (`settings/business-units`, `jpm/job-types`) as from the
+        five exports, and the old string named neither."""
+        assert "Business Units" in TAB_PERMISSIONS["jobs"]
+        assert "Job Types" in TAB_PERMISSIONS["jobs"]
+
+    def test_the_technicians_permission_names_only_what_it_calls(self) -> None:
+        """`fetch_technicians` calls `settings/technicians` and nothing else. The
+        old string also named Business Units, which this feed never reads."""
+        assert TAB_PERMISSIONS["technicians"] == "Settings -> Technicians"
+
+    def test_each_pricebook_tab_names_its_own_entity(self) -> None:
+        assert TAB_PERMISSIONS["pricebook.materials"] == "Pricebook -> Materials"
+        assert TAB_PERMISSIONS["pricebook.services"] == "Pricebook -> Services"
+        assert "Materials" not in TAB_PERMISSIONS["pricebook.services"]
+
+    def test_the_job_costs_tab_names_reporting_and_nothing_else(self) -> None:
+        assert TAB_PERMISSIONS["reporting.jobCosts"].startswith("Reporting ->")
 
 
 # ---------------------------------------------------------------------------
@@ -225,110 +338,324 @@ class TestTheLedger:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("feed", sorted(EXPORT_FEEDS))
-class TestAFeedThatWasNeverGranted:
-    """The ordinary state of a feed belonging to a product this contractor did
-    not buy, on a connector that runs all four feed jobs for everybody."""
+@pytest.mark.parametrize("tab", sorted(EXPORT_TABS))
+class TestATabThatWasNeverGranted:
+    """The ordinary state of a tab belonging to an entity this contractor's app
+    does not cover, on a connector that runs all four feed jobs for everybody."""
 
     @respx.mock
-    def test_it_writes_no_tab_and_does_not_fail(self, feed, st_settings, exporter_settings) -> None:
+    def test_it_writes_no_tab_and_does_not_fail(self, tab, st_settings, exporter_settings) -> None:
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _forbidden(st_settings.api_base, FIRST_CALL[feed])
+        _forbidden(st_settings.api_base, TAB_FIRST_CALL[tab])
         store = InMemorySheetsStore()
 
-        summary = _run(st_settings, exporter_settings, store, feed)
+        summary = _run(st_settings, exporter_settings, store, TAB_FEED[tab])
 
-        assert feed in summary.scope_not_granted
+        assert tab in summary.scope_not_granted
         assert not summary.scope_revoked
-        for tab in FEED_TABS[feed]:
-            assert tab not in store.tabs, "an absent tab is how the contract says 'not bought'"
+        assert tab not in store.tabs, "an absent tab is how the contract says 'not bought'"
+
+    @respx.mock
+    def test_it_costs_its_siblings_nothing(self, tab, st_settings, exporter_settings) -> None:
+        """The regression, stated once. A denied Materials must not cost
+        Categories: they are different tick-boxes, and the tenant paid for one."""
+        mock_auth_token(st_settings.auth_url)
+        _register_tenant(st_settings.api_base)
+        _forbidden(st_settings.api_base, TAB_FIRST_CALL[tab])
+        store = InMemorySheetsStore()
+
+        _run(st_settings, exporter_settings, store, TAB_FEED[tab])
+
+        siblings = [sibling for sibling in FEED_TABS[TAB_FEED[tab]] if sibling != tab]
+        for sibling in siblings:
+            assert sibling in store.tabs, f"{sibling} was granted and must still be written"
+            assert parse_meta_grid(store.tabs["_meta"])[sibling].last_run_at == (
+                FIXED_NOW.isoformat()
+            )
 
     @respx.mock
     def test_it_names_the_permission_in_the_log_and_stays_at_info(
-        self, feed, st_settings, exporter_settings, caplog
+        self, tab, st_settings, exporter_settings, caplog
     ) -> None:
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _forbidden(st_settings.api_base, FIRST_CALL[feed])
+        _forbidden(st_settings.api_base, TAB_FIRST_CALL[tab])
         with caplog.at_level(logging.INFO, logger="st_exporter"):
-            _run(st_settings, exporter_settings, InMemorySheetsStore(), feed)
+            _run(st_settings, exporter_settings, InMemorySheetsStore(), TAB_FEED[tab])
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert any("Skipping quietly" in r.getMessage() for r in caplog.records)
+        skipped = [r.getMessage() for r in caplog.records if "Skipping quietly" in r.getMessage()]
+        assert skipped
+        assert TAB_PERMISSIONS[tab] in skipped[0]
 
     @respx.mock
     def test_it_annotates_nothing(
-        self, feed, st_settings, exporter_settings, monkeypatch, capsys
+        self, tab, st_settings, exporter_settings, monkeypatch, capsys
     ) -> None:
-        """Quiet means quiet. A `::warning` per feed per cycle, forever, on every
+        """Quiet means quiet. A `::warning` per tab per cycle, forever, on every
         connector whose contractor bought one product, is noise that trains
         everybody to ignore the channel the revocation needs."""
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _forbidden(st_settings.api_base, FIRST_CALL[feed])
-        _run(st_settings, exporter_settings, InMemorySheetsStore(), feed)
+        _forbidden(st_settings.api_base, TAB_FIRST_CALL[tab])
+        _run(st_settings, exporter_settings, InMemorySheetsStore(), TAB_FEED[tab])
         assert not [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("::")]
 
 
-@pytest.mark.parametrize("feed", sorted(EXPORT_FEEDS))
-class TestAFeedWhosePermissionWasRevoked:
+@pytest.mark.parametrize("tab", sorted(EXPORT_TABS))
+class TestATabWhosePermissionWasRevoked:
     """It worked before. `_meta` proves it, which is the whole reason that row is
-    carried forward rather than dropped when a feed does not run."""
+    carried forward rather than dropped when a tab does not run."""
 
     @respx.mock
     def test_it_is_loud_and_leaves_the_previous_tab_alone(
-        self, feed, st_settings, exporter_settings, monkeypatch, capsys
+        self, tab, st_settings, exporter_settings, monkeypatch, capsys
     ) -> None:
         monkeypatch.setenv("GITHUB_ACTIONS", "true")
         monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _forbidden(st_settings.api_base, FIRST_CALL[feed])
+        _forbidden(st_settings.api_base, TAB_FIRST_CALL[tab])
+        feed = TAB_FEED[tab]
         store = _seeded_store(feed)
 
         summary = _run(st_settings, exporter_settings, store, feed)
 
-        assert feed in summary.scope_revoked
+        assert tab in summary.scope_revoked
         assert not summary.scope_not_granted
         annotations = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("::")]
         assert annotations, "a green run is a run nobody opens"
         assert annotations[0].startswith("::error title=ServiceTitan permission revoked::")
-        assert feed in annotations[0]
-        for tab in FEED_TABS[feed]:
-            assert store.tabs[tab] == [["header"], ["yesterday"]]
+        assert tab in annotations[0]
+        assert store.tabs[tab] == [["header"], ["yesterday"]]
+        # ...and only that tab. Its siblings were granted and are refreshed.
+        for sibling in FEED_TABS[feed]:
+            if sibling != tab:
+                assert store.tabs[sibling] != [["header"], ["yesterday"]]
 
     @respx.mock
     def test_the_meta_row_is_carried_forward_unchanged(
-        self, feed, st_settings, exporter_settings
+        self, tab, st_settings, exporter_settings
     ) -> None:
         """Never delete the evidence. It is what makes the NEXT run's 403
         decidable — drop it once and a revocation reads as "never bought" from
         then on, forever."""
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _forbidden(st_settings.api_base, FIRST_CALL[feed])
+        _forbidden(st_settings.api_base, TAB_FIRST_CALL[tab])
+        feed = TAB_FEED[tab]
         store = _seeded_store(feed)
 
         _run(st_settings, exporter_settings, store, feed)
 
         meta = parse_meta_grid(store.tabs["_meta"])
-        for tab in FEED_TABS[feed]:
-            assert meta[tab].last_run_at == EARLIER, "last_run_at must still name the last GOOD run"
-            assert meta[tab].row_count == 7
+        assert meta[tab].last_run_at == EARLIER, "last_run_at must still name the last GOOD run"
+        assert meta[tab].row_count == 7
+        for sibling in FEED_TABS[feed]:
+            if sibling != tab:
+                assert meta[sibling].last_run_at == FIXED_NOW.isoformat()
 
     @respx.mock
-    def test_it_names_the_feed_and_the_permission_at_error(
-        self, feed, st_settings, exporter_settings, caplog
+    def test_it_names_the_tab_and_the_permission_at_error(
+        self, tab, st_settings, exporter_settings, caplog
     ) -> None:
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _forbidden(st_settings.api_base, FIRST_CALL[feed])
+        _forbidden(st_settings.api_base, TAB_FIRST_CALL[tab])
         with caplog.at_level(logging.ERROR, logger="st_exporter"):
-            _run(st_settings, exporter_settings, _seeded_store(feed), feed)
+            _run(st_settings, exporter_settings, _seeded_store(TAB_FEED[tab]), TAB_FEED[tab])
         errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
-        assert any("SCOPE REVOKED" in message and feed in message for message in errors)
+        assert any(
+            "SCOPE REVOKED" in message and tab in message and TAB_PERMISSIONS[tab] in message
+            for message in errors
+        )
+
+
+@pytest.mark.parametrize("feed", MULTI_TAB_FEEDS)
+class TestTheLastTabOfAFeed:
+    """Every through-the-run test used to 403 the FIRST call of a feed, which is
+    precisely why a per-feed verdict looked correct: a first-tab 403 skipped the
+    siblings, so nobody could see them being lost. These 403 the last tab, with
+    every sibling answering 200 before it."""
+
+    @respx.mock
+    def test_the_siblings_that_ran_first_are_all_written(
+        self, feed, st_settings, exporter_settings
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        _register_tenant(st_settings.api_base)
+        last = LAST_TAB[feed]
+        _forbidden(st_settings.api_base, TAB_FIRST_CALL[last])
+        store = InMemorySheetsStore()
+
+        summary = _run(st_settings, exporter_settings, store, feed)
+
+        assert set(summary.scope_not_granted) == {last}
+        for sibling in FEED_TABS[feed]:
+            assert (sibling in store.tabs) is (sibling != last)
+
+    @respx.mock
+    def test_meta_holds_exactly_one_row_per_tab(self, feed, st_settings, exporter_settings) -> None:
+        """The `_meta` corruption, end to end. A success appended a fresh row and
+        the later 403 carried the OLD row forward for every tab of the feed — so
+        a tab holding run-3 data answered with run-1's `last_run_at` forever, and
+        `docs/export-contract.md` tells consumers to read exactly that cell."""
+        mock_auth_token(st_settings.auth_url)
+        _register_tenant(st_settings.api_base)
+        last = LAST_TAB[feed]
+        _forbidden(st_settings.api_base, TAB_FIRST_CALL[last])
+        store = _seeded_store(feed)
+
+        _run(st_settings, exporter_settings, store, feed)
+
+        written = _meta_feeds(store)
+        assert len(written) == len(set(written)), f"duplicate _meta rows: {written}"
+        meta = parse_meta_grid(store.tabs["_meta"])
+        for tab in FEED_TABS[feed]:
+            expected = EARLIER if tab == last else FIXED_NOW.isoformat()
+            assert meta[tab].last_run_at == expected
+
+    @respx.mock
+    def test_a_never_granted_last_tab_keeps_the_run_green_every_cycle(
+        self, feed, st_settings, exporter_settings
+    ) -> None:
+        """Run 2, run 3, run N. The tab was never granted on run 1 and is still
+        not granted now; nothing about its siblings having run may promote it to
+        a revocation, because a revocation reds the run forever."""
+        last = LAST_TAB[feed]
+        store = InMemorySheetsStore()
+        for _ in range(3):
+            with respx.mock:
+                mock_auth_token(st_settings.auth_url)
+                _register_tenant(st_settings.api_base)
+                _forbidden(st_settings.api_base, TAB_FIRST_CALL[last])
+                summary = _run(st_settings, exporter_settings, store, feed)
+            assert summary.scope_revoked == {}
+            assert set(summary.scope_not_granted) == {last}
+
+
+class TestTheTwoTenantsThisBroke:
+    """The reviewer's two executed repros, as tests."""
+
+    @respx.mock
+    def test_a_truequote_only_tenant_gets_services_equipment_and_categories(
+        self, st_settings, exporter_settings, monkeypatch, capsys
+    ) -> None:
+        """The runbook's TrueQuote block grants Pricebook Services, Equipment,
+        Categories and Images, and deliberately NOT Materials — Materials arrives
+        only when the contractor also buys Profit Wizard. So `materials` 403s on
+        every run of every TrueQuote-only tenant, forever, and that is normal."""
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+        mock_auth_token(st_settings.auth_url)
+        _register_tenant(st_settings.api_base)
+        _forbidden(st_settings.api_base, TAB_FIRST_CALL["pricebook.materials"])
+        store = InMemorySheetsStore()
+
+        summary = _run(st_settings, exporter_settings, store, "pricebook")
+
+        assert set(store.tabs) == {
+            "_meta",
+            "pricebook.services",
+            "pricebook.equipment",
+            "pricebook.categories",
+        }
+        assert set(summary.pricebook_row_counts or {}) == {
+            "pricebook.services",
+            "pricebook.equipment",
+            "pricebook.categories",
+        }
+        assert set(summary.scope_not_granted) == {"pricebook.materials"}
+        assert not summary.scope_revoked and not summary.pricebook_failures
+        assert not [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("::")]
+        written = _meta_feeds(store)
+        assert sorted(written) == [
+            "pricebook.categories",
+            "pricebook.equipment",
+            "pricebook.services",
+        ]
+        assert len(written) == len(set(written))
+
+    @respx.mock
+    def test_a_truequote_only_tenant_still_gets_its_images(
+        self, st_settings, exporter_settings
+    ) -> None:
+        """The worst of it. Gating the image pass on a feed-level denial meant
+        such a tenant never received a single image, ever — while paying for the
+        product whose whole point is pictures of doors."""
+        mock_auth_token(st_settings.auth_url)
+        _register_tenant(st_settings.api_base)
+        _forbidden(st_settings.api_base, TAB_FIRST_CALL["pricebook.materials"])
+
+        with _frozen_now(), patch("st_exporter.run._upload_pricebook_images") as upload:
+            run_export(
+                st_settings,
+                exporter_settings,
+                feeds=frozenset({"pricebook"}),
+                export_store=InMemorySheetsStore(),
+                raw_cache_store=InMemorySheetsStore(),
+                image_client=object(),  # type: ignore[arg-type]
+            )
+
+        upload.assert_called_once()
+        assert upload.call_args.kwargs["catalogue_complete"] is False
+        assert upload.call_args.args[2], "the services and equipment items it DID read"
+
+    @respx.mock
+    def test_a_profit_wizard_tenant_without_reporting_writes_its_other_three_tabs(
+        self, st_settings, exporter_settings, monkeypatch, capsys
+    ) -> None:
+        """Reporting is its own section in the ServiceTitan portal and the
+        runbook's own author could not name the box, so a Profit Wizard tenant
+        missing it is entirely ordinary. Invoices, timesheets and business units
+        must still export, and the run must stay green."""
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+        mock_auth_token(st_settings.auth_url)
+        _register_tenant(st_settings.api_base)
+        _forbidden(st_settings.api_base, TAB_FIRST_CALL["reporting.jobCosts"])
+        store = InMemorySheetsStore()
+
+        summary = _run(st_settings, exporter_settings, store, "financial")
+
+        assert set(summary.financial_row_counts or {}) == {
+            "accounting.invoices",
+            "payroll.timesheets",
+            "settings.businessUnits",
+        }
+        assert set(summary.scope_not_granted) == {"reporting.jobCosts"}
+        assert not summary.scope_revoked and not summary.financial_failures
+        assert "reporting.jobCosts" not in store.tabs
+        assert not [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("::")]
+
+
+class TestTheSummaryLine:
+    """One line is all a support engineer reads. It has to name the TAB — the
+    old line said `not_granted=pricebook` while two pricebook tabs had just been
+    written in the same run, which is not merely vague, it is false."""
+
+    def test_it_names_the_refused_tab_not_the_feed(self) -> None:
+        from st_exporter.cli import _summary_line
+        from st_exporter.run import ExportSummary
+
+        line = _summary_line(
+            ExportSummary(
+                jobs_row_count=0,
+                technicians_row_count=0,
+                skipped_no_job=0,
+                dry_run=False,
+                pricebook_row_counts={"pricebook.services": 2, "pricebook.equipment": 1},
+                scope_not_granted={"pricebook.materials": "Pricebook -> Materials"},
+                scope_revoked={"reporting.jobCosts": "HTTP 403"},
+            ),
+            [],
+        )
+
+        assert "not_granted=pricebook_materials" in line
+        assert "scope_revoked=reporting_jobCosts" in line
+        assert "pricebook_services=2" in line
 
 
 class TestOnlyThisFeed:
@@ -337,11 +664,12 @@ class TestOnlyThisFeed:
         self, st_settings, exporter_settings
     ) -> None:
         """A run that skips `pricebook` must not drop `jobs`' row on the way past
-        — the carry-forward for unselected feeds and the one for denied feeds are
+        — the carry-forward for unselected feeds and the one for denied tabs are
         different code paths and both write the same grid."""
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _forbidden(st_settings.api_base, FIRST_CALL["pricebook"])
+        for tab in PRICEBOOK_FEED_NAMES:
+            _forbidden(st_settings.api_base, TAB_FIRST_CALL[tab])
         store = _seeded_store("jobs")
 
         _run(st_settings, exporter_settings, store, "pricebook")
@@ -352,17 +680,23 @@ class TestOnlyThisFeed:
 
     @respx.mock
     def test_one_denied_feed_does_not_deny_another(self, st_settings, exporter_settings) -> None:
-        """`financial` refused, `pricebook` granted: the pricebook tabs are
-        written normally in the same Sheet."""
+        """`financial` refused outright, `pricebook` granted — **in one run that
+        selects both**. Running only `pricebook` never fetched a financial route
+        at all, so the old version of this test asserted nothing."""
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _forbidden(st_settings.api_base, FIRST_CALL["financial"])
+        for tab in FINANCIAL_FEED_NAMES:
+            _forbidden(st_settings.api_base, TAB_FIRST_CALL[tab])
         store = InMemorySheetsStore()
 
-        summary = _run(st_settings, exporter_settings, store, "pricebook")
+        summary = _run(st_settings, exporter_settings, store, "pricebook", "financial")
 
-        assert not summary.scope_not_granted and not summary.scope_revoked
-        assert "pricebook.services" in store.tabs
+        assert set(summary.scope_not_granted) == set(FINANCIAL_FEED_NAMES)
+        assert not summary.scope_revoked
+        for tab in PRICEBOOK_FEED_NAMES:
+            assert tab in store.tabs
+        for tab in FINANCIAL_FEED_NAMES:
+            assert tab not in store.tabs
 
 
 class TestNotEveryFailureIsAPurchase:
@@ -376,7 +710,7 @@ class TestNotEveryFailureIsAPurchase:
     ) -> None:
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _status(st_settings.api_base, FIRST_CALL["pricebook"], status)
+        _status(st_settings.api_base, TAB_FIRST_CALL["pricebook.services"], status)
         store = InMemorySheetsStore()
 
         summary = _run(st_settings, exporter_settings, store, "pricebook")
@@ -394,7 +728,7 @@ class TestNotEveryFailureIsAPurchase:
         It is a sibling branch's problem, and it must still be loud here."""
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _status(st_settings.api_base, FIRST_CALL["jobs"], 400)
+        _status(st_settings.api_base, TAB_FIRST_CALL["jobs"], 400)
         with pytest.raises(APIError) as exc:
             _run(st_settings, exporter_settings, InMemorySheetsStore(), "jobs")
         assert exc.value.status_code == 400
@@ -405,14 +739,14 @@ class TestNotEveryFailureIsAPurchase:
         has already retried once with a fresh token by the time we see one."""
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _status(st_settings.api_base, FIRST_CALL["jobs"], 401)
+        _status(st_settings.api_base, TAB_FIRST_CALL["jobs"], 401)
         with pytest.raises(APIError) as exc:
             _run(st_settings, exporter_settings, InMemorySheetsStore(), "jobs")
         assert exc.value.status_code == 401
 
 
 class TestAFirstEverRun:
-    """`_meta` is empty for EVERY feed on run one, so "no row" cannot mean
+    """`_meta` is empty for EVERY tab on run one, so "no row" cannot mean
     "revoked" — and it does not. Nothing is declared revoked on a brand-new
     connector, and nothing is declared bought that was not."""
 
@@ -422,22 +756,23 @@ class TestAFirstEverRun:
     ) -> None:
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _forbidden(st_settings.api_base, FIRST_CALL["pricebook"])
+        for tab in PRICEBOOK_FEED_NAMES:
+            _forbidden(st_settings.api_base, TAB_FIRST_CALL[tab])
         store = InMemorySheetsStore()
         assert store.read_grid("_meta") == []
 
         summary = _run(st_settings, exporter_settings, store, "pricebook")
 
         assert summary.scope_revoked == {}
-        assert "pricebook" in summary.scope_not_granted
+        assert set(summary.scope_not_granted) == set(PRICEBOOK_FEED_NAMES)
 
     @respx.mock
     def test_the_feed_they_did_buy_still_runs_and_writes_its_meta_row(
         self, st_settings, exporter_settings
     ) -> None:
         """The other half of run one for a single-product contractor: the granted
-        feed works, and the row it writes is what makes a LATER 403 on that feed
-        decidable as a revocation."""
+        tabs work, and the rows they write are what make a LATER 403 on those
+        tabs decidable as a revocation."""
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
         store = InMemorySheetsStore()
@@ -463,24 +798,26 @@ class TestAFirstEverRun:
         with respx.mock:
             mock_auth_token(st_settings.auth_url)
             _register_tenant(st_settings.api_base)
-            _forbidden(st_settings.api_base, FIRST_CALL["pricebook"])
+            _forbidden(st_settings.api_base, TAB_FIRST_CALL["pricebook.categories"])
             second = _run(st_settings, exporter_settings, store, "pricebook")
 
-        assert "pricebook" in second.scope_revoked
+        assert set(second.scope_revoked) == {"pricebook.categories"}
         assert not second.scope_not_granted
 
 
 class TestTheImagePass:
     @respx.mock
-    def test_a_denied_pricebook_feed_never_reaches_the_image_ledger(
+    def test_a_wholly_refused_catalogue_never_prunes_the_ledger(
         self, st_settings, exporter_settings
     ) -> None:
-        """A refused catalogue fetched no items. Handing that empty list to the
-        image pass would let `ImageLedger.keep` prune every asset the tenant has
-        ever had uploaded — "not looked at" read as "gone"."""
+        """A refused catalogue fetched no items. Pruning against that empty list
+        would let `ImageLedger.keep` drop every asset the tenant has ever had
+        uploaded — "not looked at" read as "gone". `catalogue_complete` is what
+        vetoes it, and it is False here because no item tab produced a grid."""
         mock_auth_token(st_settings.auth_url)
         _register_tenant(st_settings.api_base)
-        _forbidden(st_settings.api_base, FIRST_CALL["pricebook"])
+        for tab in PRICEBOOK_FEED_NAMES:
+            _forbidden(st_settings.api_base, TAB_FIRST_CALL[tab])
 
         with _frozen_now(), patch("st_exporter.run._upload_pricebook_images") as upload:
             summary = run_export(
@@ -492,9 +829,47 @@ class TestTheImagePass:
                 image_client=object(),  # type: ignore[arg-type]
             )
 
-        upload.assert_not_called()
-        assert summary.images is None
-        assert "pricebook" in summary.scope_not_granted
+        assert upload.call_args.kwargs["catalogue_complete"] is False
+        assert upload.call_args.args[2] == []
+        assert set(summary.scope_not_granted) == set(PRICEBOOK_FEED_NAMES)
+
+    @respx.mock
+    def test_a_fully_granted_catalogue_is_complete(self, st_settings, exporter_settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        _register_tenant(st_settings.api_base)
+
+        with _frozen_now(), patch("st_exporter.run._upload_pricebook_images") as upload:
+            run_export(
+                st_settings,
+                exporter_settings,
+                feeds=frozenset({"pricebook"}),
+                export_store=InMemorySheetsStore(),
+                raw_cache_store=InMemorySheetsStore(),
+                image_client=object(),  # type: ignore[arg-type]
+            )
+
+        assert upload.call_args.kwargs["catalogue_complete"] is True
+
+    @respx.mock
+    def test_a_refused_categories_tab_does_not_make_the_catalogue_incomplete(
+        self, st_settings, exporter_settings
+    ) -> None:
+        """Categories carry no images, so losing that tab cannot orphan a key."""
+        mock_auth_token(st_settings.auth_url)
+        _register_tenant(st_settings.api_base)
+        _forbidden(st_settings.api_base, TAB_FIRST_CALL["pricebook.categories"])
+
+        with _frozen_now(), patch("st_exporter.run._upload_pricebook_images") as upload:
+            run_export(
+                st_settings,
+                exporter_settings,
+                feeds=frozenset({"pricebook"}),
+                export_store=InMemorySheetsStore(),
+                raw_cache_store=InMemorySheetsStore(),
+                image_client=object(),  # type: ignore[arg-type]
+            )
+
+        assert upload.call_args.kwargs["catalogue_complete"] is True
 
 
 class TestTheDrainIsNotAFeed:
@@ -506,7 +881,5 @@ class TestTheDrainIsNotAFeed:
         assert OUTBOX_FEED not in EXPORT_FEEDS
 
     def test_no_scope_permission_is_declared_for_the_drain(self) -> None:
-        from st_exporter.scopes import FEED_PERMISSIONS
-
-        assert OUTBOX_FEED not in FEED_PERMISSIONS
-        assert set(FEED_PERMISSIONS) == set(EXPORT_FEEDS)
+        assert OUTBOX_FEED not in TAB_PERMISSIONS
+        assert set(TAB_PERMISSIONS) == set(EXPORT_TABS)

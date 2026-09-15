@@ -567,21 +567,23 @@ class TestScopeOutcomesInTheRunsOwnOutput:
             main()
         return exc_info.value.code
 
-    def test_a_never_granted_feed_is_named_and_the_run_stays_green(
+    def test_a_never_granted_tab_is_named_and_the_run_stays_green(
         self, monkeypatch, capsys
     ) -> None:
         """An absent tab is how the contract says "not bought", and an absence is
         not something a reader notices. So it is stated — but it is not a
-        failure: it is the ordinary state of a feed job belonging to a product
-        this contractor's ServiceTitan app does not cover."""
+        failure: it is the ordinary state of a tab belonging to an entity this
+        contractor's ServiceTitan app does not cover. `pricebook.materials` on a
+        TrueQuote-only tenant is exactly that, on every run, forever."""
         code = self._run(
-            monkeypatch, _summary(scope_not_granted={"pricebook": "Pricebook -> Services"})
+            monkeypatch,
+            _summary(scope_not_granted={"pricebook.materials": "Pricebook -> Materials"}),
         )
         assert code == 0
-        assert "not_granted=pricebook" in capsys.readouterr().out
+        assert "not_granted=pricebook_materials" in capsys.readouterr().out
 
-    def test_a_revoked_feed_turns_the_run_red(self, monkeypatch, capsys) -> None:
-        """This one worked before. A feed that stops exporting must never end
+    def test_a_revoked_tab_turns_the_run_red(self, monkeypatch, capsys) -> None:
+        """This one worked before. A tab that stops exporting must never end
         green — that silence is the whole failure mode the per-feed repository
         variables were deleted for."""
         code = self._run(monkeypatch, _summary(scope_revoked={"jobs": "HTTP 403: nope"}))
@@ -591,11 +593,14 @@ class TestScopeOutcomesInTheRunsOwnOutput:
     def test_the_two_are_never_confused_in_the_line(self, monkeypatch, capsys) -> None:
         code = self._run(
             monkeypatch,
-            _summary(scope_not_granted={"financial": "Accounting"}, scope_revoked={"jobs": "403"}),
+            _summary(
+                scope_not_granted={"reporting.jobCosts": "Reporting"},
+                scope_revoked={"jobs": "403"},
+            ),
         )
         assert code != 0
         out = capsys.readouterr().out
-        assert "not_granted=financial" in out
+        assert "not_granted=reporting_jobCosts" in out
         assert "scope_revoked=jobs" in out
 
     def test_an_ordinary_run_says_neither(self, monkeypatch, capsys) -> None:

@@ -252,21 +252,48 @@ The defence of the variables was that a 403 cannot tell "never bought" from
 "permission revoked". **`_meta` answers that**, because it already records the
 last successful run of every tab (`src/st_exporter/scopes.py`):
 
+**The unit is the output TAB, not the feed.** ServiceTitan grants per *entity*:
+`permissions.md`, the team's own tick-box runbook, gives a TrueQuote contractor
+Pricebook Services, Equipment, Categories and Images and deliberately **not**
+Materials (that arrives with Profit Wizard), and Reporting is a section of its
+own. So "one tab of a feed is refused while its siblings answer 200" is not an
+edge case — it is the ordinary, every-cycle state of a TrueQuote-only tenant and
+of a Profit Wizard tenant without Reporting. A 403 therefore rules out exactly the
+tab that earned it; the feed's remaining tabs are still attempted, and each is
+judged on the evidence for itself.
+
 | What the exporter sees | What it means | What it does |
 |---|---|---|
-| 403, and no `_meta` row has ever named a run of this feed | the scope was never granted | skip **quietly**: no tab is written, `not_granted=<feed>` in the run's summary line, run stays green |
-| 403, and a `_meta` row names a past run | the permission was **revoked** | `::error` annotation naming the feed and the permission, tabs keep their last good contents, `scope_revoked=<feed>` in the summary, **run exits non-zero** |
+| 403, and nothing has ever evidenced a run of this TAB | the entity was never granted | skip **quietly**: that tab is not written, its siblings are, `not_granted=<tab>` in the run's summary line, run stays green |
+| 403, and a `_meta` row names a past run of this TAB (or the tab still exists) | the permission was **revoked** | `::error` annotation naming the tab and the permission, that tab keeps its last good contents, `scope_revoked=<tab>` in the summary, **run exits non-zero** |
 
-Either way the feed's previous `_meta` rows are carried forward unchanged, exactly
+Either way that tab's previous `_meta` row is carried forward unchanged, exactly
 as `_TabGuard` does for a failed tab — that evidence is what makes the *next*
-403 decidable, so it is never deleted.
+403 decidable, so it is never deleted. It is never carried over a row this run
+wrote fresh: `_meta` holds exactly one row per tab by construction
+(`meta.MetaRowSet`), and `build_meta_grid` refuses a grid that would hold two,
+because `_meta` is parsed last-wins and a duplicate reads not as an error but as
+the wrong `last_run_at` — the very cell `docs/export-contract.md` tells consumers
+to trust for freshness.
+
+The permission strings the annotation names are per tab and match what the code
+actually calls: the `jobs` string now names **Settings → Business Units** and
+**JPM → Job Types**, because a jobs-feed 403 is as likely to come from those two
+reference lookups as from the five exports; `technicians` names Settings →
+Technicians and nothing else, because `fetch_technicians` calls nothing else.
+
+The pricebook **image pass** keys on `catalogue_complete` — "did every item tab
+produce a grid" — and not on any permission verdict. A TrueQuote-only tenant is
+refused Materials on every run and must still receive its services and equipment
+images; the only thing a missing item tab may veto is the ledger *prune*, and
+`catalogue_complete` carries exactly that.
 
 **Only HTTP 403 takes this path.** A 400 (`KNOWN_UNVERIFIED.md` records one on
 `active=Any`), a 401, a 404, a 429 or a transport error behaves exactly as before:
 the per-tab guard fails that tab loudly, or the exception ends the run. Treating
 any of them as "not bought" would turn an outage into a silent skip.
 
-On a **first-ever run** no feed has a `_meta` row, so nothing is declared revoked
+On a **first-ever run** no tab has a `_meta` row and no tab exists, so nothing is declared revoked
 and a 403 is "never granted" — which is what it is. `PRICEBOOK_CATEGORY_IDS`
 stays: it narrows *what* the pricebook feed exports and never decides *whether* it
 runs.

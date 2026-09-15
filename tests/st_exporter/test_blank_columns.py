@@ -22,7 +22,7 @@ from st_exporter.blank_columns import (
     check_blank_columns,
 )
 from st_exporter.format import JOB_COLUMNS, TECHNICIAN_COLUMNS, format_job_row
-from st_exporter.meta import MetaRow
+from st_exporter.meta import MetaRowSet
 from st_exporter.run import _run_technicians_feed, _TabGuard, run_export
 from st_exporter.sheets import InMemorySheetsStore
 from tests.st_exporter.conftest import mock_auth_token
@@ -130,7 +130,7 @@ class TestHookedIntoTheFeeds:
     def test_tab_guard_warns_and_still_writes_the_tab(self, caplog) -> None:
         """Pricebook and financial both run through `_TabGuard.attempt`."""
         grid = [["st_id", "code"]] + [[str(i), ""] for i in range(ABOVE)]
-        new_meta_rows: list[MetaRow] = []
+        new_meta_rows = MetaRowSet()
         guard = _TabGuard(
             label="pricebook",
             contract_version="pricebook.v1",
@@ -154,7 +154,7 @@ class TestHookedIntoTheFeeds:
             {"id": i, "name": f"Tech {i}", "email": None, "active": True} for i in range(ABOVE)
         ]
         store = InMemorySheetsStore()
-        new_meta_rows: list[MetaRow] = []
+        new_meta_rows = MetaRowSet()
         with patch("st_exporter.run.fetch_technicians", return_value=technicians):
             row_count = _run_technicians_feed(
                 Mock(),

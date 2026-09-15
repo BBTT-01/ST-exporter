@@ -43,12 +43,20 @@
 # The exporter tells the two 403s apart from `_meta`, which records the last
 # successful run of every tab (`src/st_exporter/scopes.py`):
 #
-#   * A feed with NO `_meta` row ever has never worked, so the scope was never
-#     granted: it is skipped quietly, writes no tab, and does not fail the run.
-#     An absent tab means "not bought".
-#   * A feed whose `_meta` row names a past run HAS worked, so a 403 now means
-#     the permission was REVOKED: the run is annotated `::error`, the feed's
-#     tabs keep their last good contents, and the run goes red.
+#   * A TAB with NO `_meta` row ever, and no such tab in the Sheet, has never
+#     been written, so the entity was never granted: it is skipped quietly,
+#     writes no tab, and does not fail the run. An absent tab means "not bought".
+#   * A TAB whose `_meta` row names a past run HAS worked, so a 403 now means
+#     the permission was REVOKED: the run is annotated `::error`, that tab keeps
+#     its last good contents, and the run goes red.
+#
+# Per TAB, not per feed, because ServiceTitan grants per entity. A contractor who
+# bought TrueQuote but not Profit Wizard has Pricebook Services, Equipment and
+# Categories ticked and NOT Materials, so `pricebook.materials` is refused on
+# every run of every such tenant, forever, while the other three tabs export
+# normally and the run stays green. Likewise a Profit Wizard tenant missing the
+# Reporting box exports invoices, timesheets and business units and no
+# `reporting.jobCosts`. One refused tab never costs its siblings.
 #
 # So a reviews-only contractor still exports nothing they did not buy — no
 # pricebook, no invoices, no timesheets, no payroll — but that is enforced by

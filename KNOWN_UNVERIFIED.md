@@ -356,13 +356,14 @@ filter. `_find` deliberately lists all campaigns and matches locally instead, be
 a filter ServiceTitan silently ignored would return page one of every campaign and
 could match the wrong row.
 
-## Which feeds a tenant is allowed to read — decided by a 403, and unverified
+## Which tabs a tenant is allowed to read — decided by a 403, and unverified
 
 The caller workflow no longer carries a repository variable per feed. Every feed
 job runs for every contractor and ServiceTitan's scopes decide what exports: a
-feed the tenant's app was never granted answers **403** and is skipped quietly
-(no tab written, run stays green), while a feed that HAS run successfully before
-— proved by its `_meta` row — is treated as a **revoked** permission and turns
+**tab** the tenant's app was never granted answers **403** and is skipped quietly
+(that tab is not written, its siblings still are, run stays green), while a tab
+that HAS been written successfully before — proved by its `_meta` row, or failing
+that by the tab still existing — is treated as a **revoked** permission and turns
 the run red. `src/st_exporter/scopes.py`.
 
 Unverified, and worth knowing before trusting the quiet half:
@@ -377,11 +378,25 @@ Unverified, and worth knowing before trusting the quiet half:
   ServiceTitan ever returned one under load, a feed that had run before would be
   announced as revoked for that cycle. It would recover by itself on the next
   run, and its tabs and `_meta` row are untouched meanwhile.
-- **Whether a partially-granted module is possible** — e.g. Pricebook Services
-  readable and Pricebook Equipment not. The exporter decides at FEED level, so
-  the first 403 rules out the whole feed's remaining tabs for that run. If a
-  tenant can really hold half a module, a granted tab would stop being refreshed
-  with the others. No tenant has shown this.
+- ~~**Whether a partially-granted module is possible**~~ — **not unverified: it
+  is prescribed.** `permissions.md`, the team's own tick-box runbook, grants per
+  ENTITY, not per module. Its TrueQuote block ticks Pricebook Services, Equipment,
+  Categories and Images and deliberately omits **Materials**, which arrives only
+  when the contractor also buys Profit Wizard; and Reporting is a section of its
+  own that the runbook's author could not even name the box for. So a half-granted
+  "module" is the ORDINARY state of a TrueQuote-only tenant and of a Profit Wizard
+  tenant without Reporting, on every run, forever. The exporter therefore decides
+  at TAB level: a 403 rules out exactly the tab that earned it, the feed's other
+  tabs are still attempted, and each is judged on the evidence for itself. What
+  remains genuinely unverified is only which *portal* box name maps to each tab —
+  the strings in `scopes.TAB_PERMISSIONS` are derived from the runbook and from the
+  code's own call sites, not from the portal UI.
+- **Whether a tab can exist with no `_meta` row.** It should not, but the
+  evidence read is a Sheet somebody can edit: `read_grid` answers `[]` for a tab
+  that is not there, so a deleted or renamed `_meta` tab would otherwise turn every
+  later 403 into "never bought" — quiet, and the wrong direction. The ledger
+  therefore accepts an EXISTING export tab as second-line evidence of a past run.
+  Untested against a real Sheet whose `_meta` a contractor has renamed.
 - **A 400 is deliberately NOT treated as "not bought"** — `active=Any` below is
   exactly that case, and a sibling branch handles it. Only 403 is an
   authorization answer here.

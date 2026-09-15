@@ -104,11 +104,20 @@ These are part of the contract, not implementation detail:
 - A row with a blank key column is dropped by the exporter, not written — so
   `_meta.row_count` means what a reconciler thinks it means.
 - **An absent TAB means absent, not empty.** The same rule one level up. Every
-  feed job runs on every connector's schedule, and a feed the tenant's
-  ServiceTitan app was never granted is refused with a 403 and writes no tab at
+  feed job runs on every connector's schedule, and a tab the tenant's
+  ServiceTitan app was never granted is refused with a 403 and is not written at
   all: a contractor who did not buy TrueQuote has no `pricebook.*` tabs and no
   `pricebook` rows in `_meta`. Do not read that as "a catalogue with nothing in
   it" — a tab that exists always carries at least its header.
+- **Absence is per TAB, not per feed.** ServiceTitan grants per entity, so a
+  contractor who bought TrueQuote but not Profit Wizard has
+  `pricebook.services`, `pricebook.equipment` and `pricebook.categories` and no
+  `pricebook.materials` at all, on every run, forever — and a Profit Wizard
+  tenant without the Reporting permission has three `financial` tabs and no
+  `reporting.jobCosts`. That is a supported, ordinary shape, not a broken export.
+  Read each tab's own `_meta` row; never infer one tab's state from a sibling's.
+- **`_meta` holds exactly one row per tab.** If you ever see two rows naming the
+  same tab, the Sheet has been hand-edited: the exporter cannot write one.
 - **A tab that stops being refreshed still says when it was last current.** If a
   permission is revoked, the tab keeps its last good contents and its `_meta` row
   is carried forward untouched, so `last_run_at` names the last genuinely fresh
