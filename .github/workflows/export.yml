@@ -197,8 +197,10 @@ jobs:
       # it, so they cannot disagree with each other — only with the code, which is
       # exactly what the guard below is for.
       #
-      # It is a literal and it STAYS one. Both candidate contexts have now been
-      # measured on a real customer run (Pioneer, run 34392888158, 2026-09-09):
+      # It is still a literal, and it is still a literal ON EVIDENCE. Both
+      # candidates tried so far were properties of the `github` context, and both
+      # were measured on a real customer run (Pioneer, run 34392888158,
+      # 2026-09-09):
       #
       #   github.job_workflow_ref = <EMPTY>
       #   github.workflow_ref     = BBTT-01/tr-pioneer-overhead-door/
@@ -209,6 +211,33 @@ jobs:
       # `job_workflow_ref` is documented to name the reusable workflow itself, but
       # is simply empty here, so deriving from it yields an empty ref. Neither is
       # usable. Do not try a third time without re-measuring first.
+      #
+      # THE THIRD CANDIDATE IS NOT IN THE `github` CONTEXT AT ALL. It is the
+      # `job` context — `job.workflow_sha`, `job.workflow_repository`,
+      # `job.workflow_ref`, `job.workflow_file_path` — which GitHub documents
+      # for precisely this job: a reusable workflow checking out its OWN source
+      # rather than the caller's. `github.*` is always the caller's; that is why
+      # both earlier attempts failed, and it is why neither of them was ever
+      # going to work. This one is a different mechanism, not a third guess at
+      # the same one.
+      #
+      # IT IS NOT WIRED UP YET, DELIBERATELY. An unmeasured ref is how v0.2.1
+      # shipped: an empty `ref:` does not fail, it silently checks out the
+      # default branch and runs the wrong exporter successfully, against a live
+      # tenant. So the verify step below MEASURES it and WARNS on disagreement
+      # instead, on real customer runs, without anything depending on it. When
+      # it has agreed on a run or two, `ref:` becomes `${{ job.workflow_sha }}`,
+      # EXPORTER_TAG is deleted, and the note below stops applying.
+      #
+      # WHAT THE LITERAL COSTS WHILE IT STAYS, which is the reason this is worth
+      # finishing: the cost is not paid here, it is paid by
+      # `.github/workflows/release.yml`. Because the literal lives in a file
+      # under `.github/workflows/`, every release bump rewrites a workflow file,
+      # and GITHUB_TOKEN may not push one — and there is no `permissions:` entry
+      # that changes that. So the release cannot publish itself without a stored
+      # credential that can rewrite THIS file, the one every contractor runs
+      # against their own tenant. Release run 35024004355 is where that
+      # surfaced. Removing this literal removes that credential entirely.
       #
       # `scripts/release.sh <version>` bumps this and pyproject.toml together.
       # Do not hand-edit one of them.
@@ -236,7 +265,46 @@ jobs:
       # It is also the version stamped into the Export Store's `_meta` tab, so the
       # Sheet itself records which exporter wrote it.
       - name: Verify the checked-out exporter matches the pinned tag
+        env:
+          # THE MEASUREMENT, riding a step that already runs and already prints
+          # rather than taking a line of its own in every customer's run list —
+          # the last diagnostic was its own step and was removed for exactly
+          # that. NOTHING BELOW DEPENDS ON THESE VALUES; they are compared to
+          # what the literal already produced, and a disagreement warns.
+          #
+          # `actionlint` 1.7.7 does not know the `job` context has these (its
+          # model predates them) and will flag the four lines below. That is a
+          # stale linter, not a bad expression: they are documented properties.
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+          JOB_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
         run: |
+          # ---- measurement only: warns, never fails, nothing reads the result --
+          echo "job.workflow_sha        = '${JOB_WORKFLOW_SHA}'"
+          echo "job.workflow_repository = '${JOB_WORKFLOW_REPOSITORY}'"
+          echo "job.workflow_ref        = '${JOB_WORKFLOW_REF}'"
+          echo "job.workflow_file_path  = '${JOB_WORKFLOW_FILE_PATH}'"
+          resolved="$(git rev-parse "HEAD" 2>/dev/null || echo "")"
+          if [ -z "$JOB_WORKFLOW_SHA" ]; then
+            echo "::warning title=job.workflow_sha::empty on this run — EXPORTER_TAG" \
+                 "cannot be replaced by it. Record this in export.yml and stop trying."
+          elif [ "$JOB_WORKFLOW_SHA" = "$resolved" ]; then
+            # NB: do not write an Actions expression anywhere in this run block,
+            # not even inside a comment like this one. GitHub substitutes them
+            # before bash sees the script, so a half-written one is a syntax
+            # error at runtime and a whole one prints its value when the message
+            # is about the expression itself.
+            echo "::notice title=job.workflow_sha::agrees with the commit ${EXPORTER_TAG}" \
+                 "resolves to ($resolved). Once this has held for a run or two, the" \
+                 "checkout 'ref:' can become the job.workflow_sha expression and" \
+                 "EXPORTER_TAG can be deleted — which also removes the release" \
+                 "workflow's need for a stored push credential."
+          else
+            echo "::warning title=job.workflow_sha::is '$JOB_WORKFLOW_SHA' but ${EXPORTER_TAG}" \
+                 "resolves to '$resolved'. They must agree before anything depends on it."
+          fi
+          # ---- the actual guard, unchanged -------------------------------------
           # Derived from the single literal, not typed a second time.
           EXPECTED_EXPORTER_VERSION="${EXPORTER_TAG#exporter-v}"
           if [ "$EXPECTED_EXPORTER_VERSION" = "$EXPORTER_TAG" ]; then

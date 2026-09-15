@@ -113,6 +113,48 @@
 #     and reaches no issues, packages, deployments, Actions API or OIDC identity.
 #
 # ===========================================================================
+# THE PUSH NEEDS A CREDENTIAL THIS WORKFLOW IS NOT AUTOMATICALLY GIVEN
+# ===========================================================================
+#
+# The bump rewrites `EXPORTER_TAG:` in `.github/workflows/export.yml`, and
+# GitHub refuses any ref update from a GitHub App — which GITHUB_TOKEN is —
+# whose commits touch `.github/workflows/**` without the *Workflows*
+# permission. That permission CANNOT be granted from the `permissions:` key
+# above; it is not one of the scopes that key exposes, and `actionlint`
+# rejects one written there. So `contents: write` is the most this job can be
+# given and it is not enough. Release run 35024004355 built the bump, ran the
+# suite, made the commit and cut the tag, and was rejected at the final push.
+# The atomic push did its job — both refs were refused together, so nothing
+# landed and no orphan tag survived.
+#
+# `RELEASE_PUSH_TOKEN` is the seam for a credential that CAN do it. It is
+# optional and unset by default, and while it is unset this workflow refuses
+# EARLY and explains itself instead of dying at its last line. Setting it is a
+# deliberate security decision, because whatever is put in it can rewrite the
+# reusable workflow every contractor runs against their own ServiceTitan
+# tenant. The options, narrowest first:
+#
+#   * A GitHub App owned by the org, installed on THIS REPOSITORY ONLY, with
+#     Contents: write + Workflows: write, minted per run via
+#     `actions/create-github-app-token`. Short-lived (1h), repository-scoped,
+#     tied to no human, revocable by uninstalling it. Recommended.
+#   * A deploy key with write access, pushing over SSH. Repository-scoped, and
+#     not a GitHub App, so the workflow-file restriction does not apply to it.
+#     Long-lived, but it can reach nothing outside this repository.
+#   * A fine-grained PAT limited to this repository with Contents + Workflows
+#     write. Bound to a human account and expires; least preferred. A CLASSIC
+#     PAT with `workflow` scope is NOT an option — it carries `repo` across
+#     every repository that human can reach.
+#
+# The real fix is to need none of them, and it is already in flight. If
+# `EXPORTER_TAG` leaves `export.yml` — that file's verify step is now measuring
+# `job.workflow_sha`, the `job`-context property GitHub documents for a reusable
+# workflow checking out its own source — the release commit stops touching any
+# workflow file, GITHUB_TOKEN can push it, no credential is needed, and this
+# whole section goes away. Prefer waiting for that measurement over creating a
+# secret, unless a release is needed sooner than it lands.
+#
+# ===========================================================================
 # `scripts/release.sh` IS STILL THE SOURCE OF TRUTH
 # ===========================================================================
 #
@@ -327,7 +369,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      # The minimum that can push a commit and a tag, and nothing else.
+      # The minimum that can push a commit and a tag, and nothing else. It is
+      # ALSO not sufficient, and no value of this block can be — see the refusal
+      # step "Refuse if this push needs a credential GITHUB_TOKEN cannot have".
+      #
+      # GITHUB_TOKEN is a GitHub App installation token, and GitHub refuses any
+      # ref update from an App whose commits touch `.github/workflows/**` unless
+      # the App holds the *Workflows* permission. That permission is NOT one of
+      # the scopes this `permissions:` key can grant: the complete set is
+      # actions, artifact-metadata, attestations, checks, code-quality, contents,
+      # deployments, discussions, id-token, issues, packages, pages,
+      # pull-requests, security-events, statuses, vulnerability-alerts. There is
+      # no `workflows:` among them — `actionlint` rejects one outright — so
+      # "grant the job the permission it was missing" is not a fix that can be
+      # written. This is what killed release run 35024004355 at its last line.
       contents: write
     env:
       # The integration branch, as a constant. Repointing the release line is
@@ -387,6 +442,19 @@ jobs:
           # The push at the end uses this checkout's credentials. GitHub starts no
           # workflow run for a push made with GITHUB_TOKEN, which is loop guard (3).
           persist-credentials: true
+          # Unset by default, and everything up to the push works without it —
+          # the refusal step below is what stops a run before it spends a commit
+          # and a tag it cannot publish. When it IS set it must be able to write
+          # `.github/workflows/**`; see the header of this file for what to put
+          # in it and what that costs.
+          #
+          # Loop guard (3) weakens when this is set: a push made with anything
+          # other than GITHUB_TOKEN DOES start workflow runs. Guards (1) and (2)
+          # — the `[skip release]` marker and the bot-author check in `decide` —
+          # do not depend on the credential and still close the loop. The
+          # `decide` job's bot-author check is keyed on the committer this job
+          # configures, not on the token, so it holds either way.
+          token: ${{ secrets.RELEASE_PUSH_TOKEN || github.token }}
 
       - name: Refuse if this file's own branch constants disagree
         run: |
@@ -443,6 +511,51 @@ jobs:
             exit 1
           fi
           echo "$TAG is free"
+
+      # THE REFUSAL THAT RUN 35024004355 DID NOT HAVE.
+      #
+      # That run did everything right and then discovered at its LAST line that
+      # the token it had could never have published the result: GITHUB_TOKEN is
+      # a GitHub App token, and GitHub refuses any ref update from an App whose
+      # commits touch `.github/workflows/**` without the Workflows permission —
+      # which the `permissions:` key cannot grant (see the header of this file).
+      # Twenty minutes, a full test run, a commit and a tag, all discarded.
+      #
+      # This asks the question BEFORE anything is written, and it asks it by
+      # reading rather than by knowing: if `export.yml` already names the tag
+      # being cut, the bump will not modify a workflow file and GITHUB_TOKEN can
+      # push it. That is not a hypothetical branch — it is exactly the state the
+      # repository lands in if `EXPORTER_TAG` ever leaves `export.yml`, and on
+      # that day this step stops refusing on its own, with nothing to edit here.
+      #
+      # It is skipped for `dry_run`, which pushes nothing and so needs no
+      # credential: a rehearsal must still be able to run the whole sequence.
+      - name: Refuse if this push needs a credential GITHUB_TOKEN cannot have
+        if: ${{ !inputs.dry_run }}
+        env:
+          HAVE_PUSH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          current="$(sed -n 's/^ *EXPORTER_TAG: \(.*\)/\1/p' .github/workflows/export.yml | head -1)"
+          if [ "$current" = "$TAG" ]; then
+            echo "export.yml already names $TAG — this bump touches no workflow file."
+            exit 0
+          fi
+          if [ "$HAVE_PUSH_TOKEN" = "true" ]; then
+            echo "the bump will rewrite .github/workflows/export.yml ($current -> $TAG);" \
+                 "RELEASE_PUSH_TOKEN is set, so the push can carry it."
+            exit 0
+          fi
+          echo "::error::this release would rewrite EXPORTER_TAG in" \
+               ".github/workflows/export.yml ($current -> $TAG), and GITHUB_TOKEN may not" \
+               "push a commit that touches .github/workflows/. That is not a missing" \
+               "'permissions:' entry — no such scope exists for GITHUB_TOKEN. Set the" \
+               "RELEASE_PUSH_TOKEN secret to a credential that may write workflow files" \
+               "(a repo-scoped GitHub App token is the narrowest; see this file's header)," \
+               "or remove the EXPORTER_TAG literal from export.yml so releases stop" \
+               "touching workflows at all. Refusing now, before a commit or a tag is made," \
+               "because run 35024004355 discovered this at its final push instead."
+          exit 1
 
       # ------------------------------------------------------------------
       # THE BUMP — delegated, not reimplemented.
