@@ -448,3 +448,251 @@ def test_the_export_workflow_is_still_reusable_only(workflow_text: str) -> None:
     `export.yml` a trigger of its own, which would run it here against no secrets."""
     triggers = _triggers(dict(yaml.safe_load(workflow_text)))
     assert set(triggers) == {"workflow_call"}, triggers
+
+
+# ---------------------------------------------------------------------------
+# RELEASE — `.github/workflows/release.yml`.
+#
+# The release dance (bump three literals -> commit -> merge -> tag the MERGED
+# commit) has been got wrong four times: v0.2.1 tagged code the bump had not
+# reached, v0.2.7 failed twice, the caller file shipped pinned to a v0.3.0 that
+# never existed, and v0.2.9 went stale two merges later. The workflow performs
+# the whole sequence in one job, on every merge, so it can be neither
+# mis-ordered nor forgotten. These assertions cover the properties of that file
+# which, if they broke, would break silently.
+# ---------------------------------------------------------------------------
+
+RELEASE = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "release.yml"
+DRIFT = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "tag-drift.yml"
+
+
+@pytest.fixture(scope="module")
+def release() -> dict[Any, Any]:
+    parsed: Any = yaml.safe_load(RELEASE.read_text())
+    return dict(parsed)
+
+
+def _release_steps(release: dict[Any, Any]) -> list[dict[str, Any]]:
+    return list(release["jobs"]["release"]["steps"])
+
+
+def test_the_release_runs_on_every_merge_to_the_integration_branch(
+    release: dict[Any, Any],
+) -> None:
+    """Automatic, because "a human decides when to release" is precisely how
+    v0.2.9 went stale with two merged fixes nobody published."""
+    triggers = _triggers(release)
+    assert set(triggers) == {"push", "workflow_dispatch"}, triggers
+    assert triggers["push"]["branches"] == ["feat/servicetitan-hosted"], (
+        "releases are cut from the integration branch; `main` is not the release line"
+    )
+    assert "paths" not in triggers["push"], (
+        "what is worth releasing is decided against the newest TAG, not against one "
+        "push — a docs-only merge on top of an unreleased code merge must still publish "
+        "the code"
+    )
+
+
+def test_the_trigger_branch_and_the_branch_constant_are_the_same_branch(
+    release: dict[Any, Any],
+) -> None:
+    """`on: push: branches:` cannot be an expression, so the name is written
+    twice. The workflow refuses to run when the two disagree; this catches it a
+    merge earlier."""
+    branch = _triggers(release)["push"]["branches"][0]
+    assert release["jobs"]["release"]["env"]["INTEGRATION_BRANCH"] == branch
+    assert release["jobs"]["decide"]["steps"][-1]["env"]["INTEGRATION_BRANCH"] == branch
+    names = [step.get("name", "") for step in _release_steps(release)]
+    assert "Refuse if this file's own branch constants disagree" in names
+    # And the drift warning must be looking at the branch releases come from.
+    drift: Any = yaml.safe_load(DRIFT.read_text())
+    assert drift["jobs"]["drift"]["env"]["INTEGRATION_BRANCH"] == branch
+
+
+def test_the_manual_path_survives_the_automatic_one(release: dict[Any, Any]) -> None:
+    """An explicit version, a forced level, a release of something the rules would
+    skip, and a rehearsal — none of which the automatic path can express."""
+    inputs = _triggers(release)["workflow_dispatch"]["inputs"]
+    assert set(inputs["bump"]["options"]) == {"auto", "patch", "minor", "major"}
+    assert inputs["bump"]["default"] == "auto"
+    assert inputs["version"]["type"] == "string" and inputs["version"]["default"] == ""
+    assert inputs["force"]["type"] == "boolean"
+    assert inputs["dry_run"]["type"] == "boolean"
+
+
+def test_the_release_cannot_re_trigger_itself(release: dict[Any, Any]) -> None:
+    """The job pushes to the branch it triggers on. Two guards in this file, not
+    counting GitHub's own refusal to start runs for GITHUB_TOKEN pushes — which is
+    the platform's behaviour and would vanish the day the push moves to a PAT."""
+    decide = release["jobs"]["decide"]["steps"][-1]["run"]
+    assert "[skip release]" in decide and "[no release]" in decide
+    assert "github-actions" in decide and "chore: release" in decide
+    # The marker is read off the SUBJECT, not the whole message: scanning the body
+    # made the commit that introduced this workflow unreleasable, because its body
+    # explains the marker.
+    assert 'case "$subject" in' in decide and 'case "$body" in' not in decide
+    commit = next(
+        step["run"] for step in _release_steps(release) if step.get("name") == "Commit the bump"
+    )
+    assert "[skip release]" in commit, "the bump commit must mark itself un-releasable"
+    message = next(line for line in commit.splitlines() if line.strip().startswith("git commit"))
+    assert "[skip release]" in message
+    assert "[skip ci]" not in message, (
+        "skipping CI on the branch is a different, worse thing — GitHub starts no run at "
+        "all for it, and a run that never started is not a failed check"
+    )
+
+
+def test_a_merge_that_changes_nothing_a_tenant_runs_does_not_get_a_version(
+    release: dict[Any, Any],
+) -> None:
+    """Docs, CHANGELOG, tests, contracts and CI are not things a contractor's run
+    executes. `src/`, `pyproject.toml` and the reusable workflow are."""
+    decide = release["jobs"]["decide"]["steps"][-1]["run"]
+    for path in ("'^src/'", "'^pyproject\\.toml$'", "'^\\.github/workflows/export\\.yml$'"):
+        assert path in decide, path
+    assert 'if [ -z "$runnable" ]' in decide
+
+
+def test_the_release_is_serialised_and_never_cancelled(release: dict[Any, Any]) -> None:
+    """Two merges a minute apart must not compute the same next version and race
+    to push it; and a run cancelled between the commit and the atomic push would
+    be the one state this design refuses to leave behind."""
+    assert release["concurrency"]["group"] == "release-${{ github.repository }}"
+    assert release["concurrency"]["cancel-in-progress"] is False
+
+
+def test_the_release_token_starts_empty_and_only_the_pushing_job_can_write(
+    release: dict[Any, Any],
+) -> None:
+    """Minimum that can push a commit and a tag, and nothing else — no issues, no
+    packages, no deployments, no Actions API. The job that parses commit messages
+    and computes a version stays read-only."""
+    assert release["permissions"] == {}, "the workflow-level token must start empty"
+    assert release["jobs"]["decide"]["permissions"] == {"contents": "read"}
+    assert release["jobs"]["release"]["permissions"] == {"contents": "write"}
+
+
+def test_the_release_workflow_cannot_touch_a_tenant(release: dict[Any, Any]) -> None:
+    """`export.yml` is a reusable workflow running against live tenants, and
+    `workflow_call` here would let a connector repository cut a tag in this one."""
+    assert "workflow_call" not in _triggers(release)
+    assert "pull_request" not in _triggers(release), "a fork's PR must not reach a write token"
+    text = RELEASE.read_text()
+    assert "secrets." not in text, "the release workflow is handed no tenant credentials"
+    steps = [step.get("run", "") for job in release["jobs"].values() for step in job["steps"]]
+    assert not any(re.search(r"\bst-export\b", run) for run in steps)
+    assert "st-export-${{ github.repository }}" not in text, (
+        "the release workflow must not take either of the export workflow's locks"
+    )
+    used = [str(step.get("uses", "")) for job in release["jobs"].values() for step in job["steps"]]
+    assert not any("export.yml" in entry for entry in used), used
+
+
+def test_a_fork_cannot_publish_a_tag(release: dict[Any, Any]) -> None:
+    """A fork's own integration branch would fire the same push trigger."""
+    assert release["jobs"]["release"]["env"]["RELEASE_REPOSITORY"] == "BBTT-01/ST-exporter"
+    names = [step.get("name", "") for step in _release_steps(release)]
+    assert names[0] == "Refuse to release from anywhere but this repository", (
+        "the repository check must come before anything else runs"
+    )
+
+
+def test_the_release_workflow_calls_the_script_rather_than_reimplementing_it(
+    release: dict[Any, Any],
+) -> None:
+    """One definition of "bump the version". `scripts/release.sh` stays usable by
+    hand, and the sed logic that knows where the three literals live is not copied
+    into YAML, where it would drift from the script."""
+    steps = [step.get("run", "") for step in _release_steps(release)]
+    assert any("./scripts/release.sh" in run for run in steps), steps
+    assert not any('sed "s/^      EXPORTER_TAG' in run for run in steps), (
+        "the release workflow is rewriting a literal itself instead of calling the script"
+    )
+
+
+def test_the_release_refuses_the_ways_this_has_gone_wrong(release: dict[Any, Any]) -> None:
+    """Wrong repository, wrong branch, half-repointed constants, a tree that is
+    not what it expects, an existing tag. Each is a step that exits non-zero,
+    checked by name so that deleting one fails the suite rather than quietly
+    weakening the release."""
+    names = [step.get("name", "") for step in _release_steps(release)]
+    for fragment in (
+        "Refuse to release from anywhere but this repository",
+        "Refuse to release from anything but the integration branch",
+        "Refuse if this file's own branch constants disagree",
+        "Refuse unless the tree is clean and contains the triggering commit",
+        "Refuse to overwrite an existing tag",
+    ):
+        assert fragment in names, f"{fragment!r} is gone from the release workflow"
+    # And every one of them runs before the first thing that writes.
+    bumped = names.index("Bump all three version literals (scripts/release.sh)")
+    assert names.index("Refuse to overwrite an existing tag") < bumped
+
+
+def test_the_release_is_tested_before_it_is_tagged(release: dict[Any, Any]) -> None:
+    """A broken release must not get a tag, and the suite must run against the
+    BUMPED tree — the literal-agreement tests above are part of what is being
+    verified, and before the bump they would be testing the previous release."""
+    steps = _release_steps(release)
+    names = [step.get("name", "") for step in steps]
+    runs = [step.get("run", "") for step in steps]
+    bumped = next(i for i, run in enumerate(runs) if "./scripts/release.sh" in run)
+    tested = next(i for i, run in enumerate(runs) if re.search(r"^\s*pytest\b", run, re.M))
+    committed = names.index("Commit the bump")
+    tagged = names.index("Tag that commit")
+    pushed = next(i for i, run in enumerate(runs) if "git push" in run)
+    assert bumped < tested < committed < tagged < pushed, names
+
+
+def test_the_tag_is_verified_against_its_own_commit_before_anything_is_pushed(
+    release: dict[Any, Any],
+) -> None:
+    """THE ORDERING CONSTRAINT.
+
+    The tag must point at a commit whose `EXPORTER_TAG` already names that tag,
+    because `export.yml`'s runtime guard fails a contractor's run when they
+    disagree. The proof step reads the literals back out of the TAGGED TREE
+    (`git show $TAG:...`), not out of the working tree, and it runs before the
+    push.
+    """
+    steps = _release_steps(release)
+    names = [step.get("name", "") for step in steps]
+    proof = names.index("Prove the tag names a commit that already names the tag")
+    pushed = next(i for i, step in enumerate(steps) if "git push" in step.get("run", ""))
+    assert proof < pushed
+    run = steps[proof]["run"]
+    assert 'git show "$TAG:.github/workflows/export.yml"' in run
+    assert 'git show "$TAG:docs/examples/connector-export.yml"' in run
+    assert 'git show "$TAG:pyproject.toml"' in run
+
+
+def test_the_tag_is_cut_from_the_commit_by_sha_not_by_head(release: dict[Any, Any]) -> None:
+    tag_step = next(
+        step for step in _release_steps(release) if step.get("name") == "Tag that commit"
+    )
+    assert 'git tag -a "$TAG" "$SHA"' in tag_step["run"]
+
+
+def test_the_commit_and_the_tag_are_pushed_atomically(release: dict[Any, Any]) -> None:
+    """A half-push is one of the shapes being eliminated: a tag whose commit the
+    branch does not have, or a bump commit nobody tagged. It is also what makes a
+    branch that moved under the run reject the whole release rather than half."""
+    push = next(
+        step["run"] for step in _release_steps(release) if "git push" in step.get("run", "")
+    )
+    assert "--atomic" in push
+    assert "refs/tags/$TAG" in push
+    assert "HEAD:refs/heads/$INTEGRATION_BRANCH" in push
+
+
+def test_the_drift_warning_never_fails_a_build() -> None:
+    """Information, not a gate: a branch legitimately sits ahead of the newest tag
+    for the minutes a release run takes, and for any merge the rules skip."""
+    drift: Any = yaml.safe_load(DRIFT.read_text())
+    assert set(_triggers(dict(drift))) == {"schedule", "workflow_dispatch"}
+    assert drift["permissions"] == {"contents": "read"}
+    step = drift["jobs"]["drift"]["steps"][-1]
+    assert step["continue-on-error"] is True
+    assert step["run"].rstrip().endswith("exit 0")
+    assert "::warning" in step["run"] and "::error" not in step["run"]
