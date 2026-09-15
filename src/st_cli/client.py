@@ -15,7 +15,7 @@ _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.0  # seconds
 
 
-def _is_retriable_transport(method: str, exc: httpx.HTTPError) -> bool:
+def _is_retriable_transport(method: str, exc: httpx.HTTPError, *, idempotent: bool = False) -> bool:
     """Whether a request that never got a status may be sent AGAIN.
 
     A ``ReadTimeout`` or a ``RemoteProtocolError`` after a POST means the
@@ -27,13 +27,20 @@ def _is_retriable_transport(method: str, exc: httpx.HTTPError) -> bool:
 
     - a read (``GET``, which ``get_bytes`` also uses) is retried freely — it has
       no effect to duplicate;
+    - a non-GET the CALLER has declared ``idempotent`` — meaning re-sending it
+      cannot create or mutate anything — is retried on the same terms as a GET;
     - any other method is retried ONLY when the failure proves the request was
       never sent, i.e. the connection itself was never established
       (``ConnectError`` / ``ConnectTimeout``);
     - everything else raises ``TransportError`` immediately, which is the
       pre-branch behaviour and what every per-tab guard already handles.
+
+    ``idempotent`` exists for exactly one caller: ServiceTitan's
+    ``POST reporting/.../data``, which is a *read* whose parameters merely do
+    not fit a query string. It is never a property of the verb and never a
+    property of a create or an update — see ``ServiceTitanClient.post``.
     """
-    if method.upper() == "GET":
+    if method.upper() == "GET" or idempotent:
         return True
     return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
 
@@ -67,8 +74,27 @@ class ServiceTitanClient:
         resource: str,
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        *,
+        idempotent: bool = False,
     ) -> Any:
-        return self._request("POST", module, resource, params=params, json_body=json_body)
+        """POST and decode the JSON answer.
+
+        :param idempotent: **"Re-sending this request cannot create or mutate
+            anything."** Not "the endpoint is safe to call twice-ish", not "the
+            server dedupes": a literal guarantee that the request has no effect
+            at all, so replaying it after a lost answer is indistinguishable
+            from a GET. Setting it on a create or an update — a booking, a lead,
+            a job, a price push — re-enables the duplicate-write bug that
+            ``_is_retriable_transport`` exists to prevent, and the duplicate
+            lands in a real contractor's ServiceTitan tenant where nothing can
+            take it back. There is exactly ONE caller in this repo,
+            ``st_exporter.feeds.reporting.fetch_report_rows``, whose
+            ``POST .../data`` runs a report; if you are adding a second, it must
+            be a read wearing a POST for the same reason.
+        """
+        return self._request(
+            "POST", module, resource, params=params, json_body=json_body, idempotent=idempotent
+        )
 
     def patch(self, module: str, resource: str, json_body: dict[str, Any] | None = None) -> Any:
         return self._request("PATCH", module, resource, json_body=json_body)
@@ -105,8 +131,11 @@ class ServiceTitanClient:
         resource: str,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        idempotent: bool = False,
     ) -> Any:
-        resp = self._send(method, module, resource, params=params, json_body=json_body)
+        resp = self._send(
+            method, module, resource, params=params, json_body=json_body, idempotent=idempotent
+        )
         if resp.status_code == 204:
             return None
         return resp.json()
@@ -118,6 +147,7 @@ class ServiceTitanClient:
         resource: str,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
+        idempotent: bool = False,
     ) -> httpx.Response:
         """Issue one API call and map failures onto the exception hierarchy.
 
@@ -145,7 +175,10 @@ class ServiceTitanClient:
                 # Raised as an STCLIError (never a bare httpx exception, which
                 # once killed three already-fetched tabs) — but retried only
                 # when re-sending is PROVABLY safe, see `_is_retriable_transport`.
-                if _is_retriable_transport(method, exc) and retries < _MAX_RETRIES:
+                if (
+                    _is_retriable_transport(method, exc, idempotent=idempotent)
+                    and retries < _MAX_RETRIES
+                ):
                     retries += 1
                     time.sleep(_BACKOFF_BASE * (2 ** (retries - 1)))
                     continue

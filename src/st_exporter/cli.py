@@ -153,7 +153,15 @@ def _summary_line(summary: ExportSummary | None, outcomes: list[LaneOutcome]) ->
             message += (
                 f" images_uploaded={images.uploaded} images_already={images.already_uploaded} "
                 f"images_failed={images.download_failed + images.upload_rejected} "
-                f"images_permission_denied={str(images.permission_denied).lower()}"
+                f"images_permission_denied={str(images.permission_denied).lower()} "
+                # `stopped` is the one that changes what the counts MEAN: a pass
+                # that aborted has "not looked at" the rest of the catalogue, so
+                # images_uploaded=0 reads as "nothing to do" unless this says
+                # otherwise. Named in the run's output, not only in the log —
+                # the same rule as pricebook_failed / financial_failed above.
+                f"images_stopped={images.stopped or 'no'} "
+                f"images_too_large={images.too_large} "
+                f"images_unsupported={images.unsupported}"
             )
 
     for outcome in outcomes:

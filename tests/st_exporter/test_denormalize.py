@@ -585,3 +585,148 @@ class TestCustomerContactColumns:
             _cache(),
         )
         assert result.rows[0]["customer_phone"] is None
+
+
+class TestCustomerContactsArray:
+    """The shape ServiceTitan's own customer schema documents: `contacts[]`.
+
+    The documented v2 customer object is
+    `id, active, name, type, address, contacts, balance, doNotMail,
+    doNotService, hasActiveMembership, memberships, customFields, createdOn,
+    modifiedOn, mergedToId, externalData` — with
+    `contacts[] {id, type ∈ Phone|MobilePhone|Email|Fax, value, memo}` and
+    **none** of `phone`, `phoneNumber`, `email`, `emailAddress`,
+    `phoneSettings` or `emailSettings` on the customer at all. If that is the
+    real shape, every spelling the previous round widened to is read off an
+    object that carries none of them and both columns are blank on every row —
+    `job_number` again. So `contacts[]` is read too.
+    """
+
+    def test_a_phone_contact_is_read_when_nothing_else_is_there(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane Doe",
+                "contacts": [
+                    {"id": 1, "type": "Phone", "value": "555-7777", "memo": "home"},
+                    {"id": 2, "type": "Email", "value": "jane@contacts.test"},
+                ],
+            }
+        )
+        assert row["customer_phone"] == "555-7777"
+        assert row["customer_email"] == "jane@contacts.test"
+
+    def test_a_mobile_phone_counts_as_a_phone(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "contacts": [{"id": 1, "type": "MobilePhone", "value": "555-8888"}],
+            }
+        )
+        assert row["customer_phone"] == "555-8888"
+
+    def test_the_type_is_matched_case_insensitively(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "contacts": [{"type": "phone", "value": "555-9999"}],
+            }
+        )
+        assert row["customer_phone"] == "555-9999"
+
+    def test_a_fax_is_not_a_phone_number(self) -> None:
+        """Selection is by `type`, never by position — the phone column is what
+        somebody rings, and a wrong number is worse than a blank one."""
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "contacts": [
+                    {"type": "Fax", "value": "555-0000"},
+                    {"type": "Phone", "value": "555-1234"},
+                ],
+            }
+        )
+        assert row["customer_phone"] == "555-1234"
+
+    def test_an_email_never_lands_in_the_phone_column(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "contacts": [{"type": "Email", "value": "jane@contacts.test"}],
+            }
+        )
+        assert row["customer_phone"] is None
+        assert row["customer_email"] == "jane@contacts.test"
+
+    def test_an_untyped_contact_is_skipped_rather_than_guessed_at(self) -> None:
+        row = _rows_for_customer({"id": 10, "name": "Jane", "contacts": [{"value": "555-????"}]})
+        assert row["customer_phone"] is None
+
+    def test_a_blank_contact_value_falls_through_to_the_next_entry(self) -> None:
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "contacts": [
+                    {"type": "Phone", "value": ""},
+                    {"type": "Phone", "value": "555-2468"},
+                ],
+            }
+        )
+        assert row["customer_phone"] == "555-2468"
+
+    def test_contacts_sit_above_the_flat_scalar_and_below_the_settings_array(self) -> None:
+        """Widen-only: the new layer is INSERTED, so no shape that resolved a
+        value before resolves a different one now."""
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "phoneSettings": [{"phone": "from-settings"}],
+                "contacts": [{"type": "Phone", "value": "from-contacts"}],
+                "phone": "from-scalar",
+            }
+        )
+        assert row["customer_phone"] == "from-settings"
+
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "name": "Jane",
+                "contacts": [{"type": "Phone", "value": "from-contacts"}],
+                "phone": "from-scalar",
+            }
+        )
+        assert row["customer_phone"] == "from-contacts"
+
+    def test_a_customer_carrying_only_the_documented_schema_is_not_blank(self) -> None:
+        """The whole point: if `contacts[]` is the only real shape, neither
+        column is blank across the whole tab."""
+        row = _rows_for_customer(
+            {
+                "id": 10,
+                "active": True,
+                "name": "Jane Doe",
+                "type": "Residential",
+                "address": {"street": "1 Main St"},
+                "contacts": [
+                    {"id": 1, "type": "MobilePhone", "value": "555-3141", "memo": None},
+                    {"id": 2, "type": "Email", "value": "jane@doe.test", "memo": None},
+                    {"id": 3, "type": "Fax", "value": "555-0000", "memo": None},
+                ],
+                "balance": 0,
+                "createdOn": "2026-01-01T00:00:00Z",
+            }
+        )
+        assert row["customer_phone"] == "555-3141"
+        assert row["customer_email"] == "jane@doe.test"
+
+    def test_garbage_in_contacts_does_not_crash_the_feed(self) -> None:
+        row = _rows_for_customer(
+            {"id": 10, "name": "Jane", "contacts": ["not-a-dict", None, {"type": "Phone"}]}
+        )
+        assert row["customer_phone"] is None

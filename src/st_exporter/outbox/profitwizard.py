@@ -38,7 +38,7 @@ import httpx
 from st_cli.client import ServiceTitanClient
 from st_exporter.logging_setup import logger
 from st_exporter.outbox.actions import UnsupportedOutboxKindError
-from st_exporter.outbox.client import OutboxItem
+from st_exporter.outbox.client import OutboxItem, drop_unidentified
 from st_exporter.outbox.routes import PROFITWIZARD_ROUTES, LaneRoutes
 
 _DEFAULT_TIMEOUT = 30.0
@@ -85,8 +85,9 @@ class ProfitWizardOutboxClient:
         # An all-null composite row is not an item. Dropping it here rather than
         # letting it through is the same defect Profit Wizard hit from the other
         # side: PostgREST serialises "no row" as an object of nulls, which is
-        # truthy, so only an identifying FIELD can tell the two apart.
-        return [item for item in items if item.id or item.idempotency_key]
+        # truthy, so only an identifying FIELD can tell the two apart. BOTH
+        # fields are required, not either: see `drop_unidentified`.
+        return drop_unidentified(items, "profitwizard")
 
     def report_success(self, item: OutboxItem, st_id: str) -> None:
         self._report(item, {"status": "succeeded", "st_id": st_id, "external_id": st_id})

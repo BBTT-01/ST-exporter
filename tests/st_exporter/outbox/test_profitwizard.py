@@ -258,3 +258,41 @@ class TestPerform:
                 perform_profitwizard_item(client, _item(kind="teleport_van"))
         finally:
             client.close()
+
+
+class TestClaimIdentityGuardMatchesTrueQuote:
+    """Both lanes refuse an item missing EITHER identity field.
+
+    They drifted: Profit Wizard dropped a row only when both were blank, while
+    TrueQuote kept blank-keyed rows outright. A blank `idempotency_key` alone is
+    enough to collapse every such item onto one ledger key and report a write
+    that never happened as delivered, so "either" is not enough.
+    """
+
+    @respx.mock
+    def test_a_row_with_a_key_but_no_id_is_not_an_item(self) -> None:
+        respx.post(f"{BASE}/claim").mock(
+            return_value=httpx.Response(
+                200,
+                json={"items": [{"idempotency_key": "k", "kind": "update_job", "payload": {}}]},
+            )
+        )
+        client = ProfitWizardOutboxClient(BASE, TOKEN)
+        try:
+            assert client.claim() == []
+        finally:
+            client.close()
+
+    @respx.mock
+    def test_a_row_with_an_id_but_no_key_is_not_an_item(self) -> None:
+        respx.post(f"{BASE}/claim").mock(
+            return_value=httpx.Response(
+                200,
+                json={"items": [{"item_id": "pw-9", "kind": "update_job", "payload": {}}]},
+            )
+        )
+        client = ProfitWizardOutboxClient(BASE, TOKEN)
+        try:
+            assert client.claim() == []
+        finally:
+            client.close()

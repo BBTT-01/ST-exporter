@@ -17,7 +17,8 @@ import pydantic
 import pytest
 
 from st_cli.exceptions import ConfigError
-from st_exporter.cli import main
+from st_exporter.cli import _summary_line, main
+from st_exporter.images.upload import ImageUploadSummary
 from st_exporter.outbox.drain import DrainSummary, LaneOutcome
 from st_exporter.run import DEFAULT_FEEDS, ExportSummary
 
@@ -388,3 +389,43 @@ class TestOutboxDrain:
         ):
             main()
         mock_drain.assert_not_called()
+
+
+class TestTheSummaryLineNamesTheImagePass:
+    """`stopped` must reach the run's OUTPUT, not only the log.
+
+    A pass that aborted has not looked at the rest of the catalogue, so
+    `images_uploaded=0 images_failed=0` reads as "nothing to do" — a green line
+    over an image sync that silently stopped. Same rule as `pricebook_failed`
+    and `financial_failed`: a fact that changes what the counters mean is named
+    where the run is read.
+    """
+
+    def _summary(self, images: ImageUploadSummary) -> str:
+        return _summary_line(
+            ExportSummary(
+                jobs_row_count=1,
+                technicians_row_count=1,
+                skipped_no_job=0,
+                dry_run=False,
+                images=images,
+            ),
+            [],
+        )
+
+    def test_a_clean_pass_says_stopped_no(self) -> None:
+        line = self._summary(ImageUploadSummary(considered=3, uploaded=3))
+        assert "images_stopped=no" in line
+
+    def test_a_stopped_pass_names_the_reason(self) -> None:
+        line = self._summary(
+            ImageUploadSummary(stopped="image ledger flush failed: RuntimeError: Sheets 429")
+        )
+        assert "images_stopped=image ledger flush failed" in line
+        # ...and it must not read like a clean run.
+        assert "images_stopped=no" not in line
+
+    def test_too_large_and_unsupported_are_surfaced_too(self) -> None:
+        line = self._summary(ImageUploadSummary(too_large=2, unsupported=5))
+        assert "images_too_large=2" in line
+        assert "images_unsupported=5" in line

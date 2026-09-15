@@ -33,6 +33,32 @@ def _resolve(record: dict[str, Any], key: str) -> Any:
     the same rule ``st_exporter.denormalize._contact_detail`` already applies.
     A value that is empty everywhere is still returned (as the first one seen)
     so "present but blank" stays distinguishable from "absent".
+
+    **Two implementations of one rule, and they are deliberately not identical.**
+    ``denormalize._contact_detail`` applies the same "first non-empty" rule to
+    the same ServiceTitan shapes, and the two have drifted apart once already —
+    that drift *was* the bug round two fixed. They are kept separate (this one
+    is a display-time path resolver for arbitrary column keys; that one knows
+    what a customer contact is), so the agreement is pinned by a test instead:
+    ``tests/test_contact_resolution_parity.py`` runs both over one shared matrix.
+
+    The differences that test asserts are INTENDED, rather than more drift:
+
+    - **Array position.** ``'phoneSettings.0.phone'`` reads index 0 and stops;
+      ``_contact_detail`` scans every entry for the first non-empty one. That is
+      on purpose. A column key is a literal path a human wrote and must resolve
+      to exactly what it says, and the CLI table is a debugging view where
+      "index 0 is blank" is itself the useful fact. The exporter's tab is a
+      frozen contract column read by another system, where a blank cell is
+      indistinguishable from a contractor with no phone number, so it is worth
+      scanning for. A key may always spell ``.1.`` explicitly.
+    - **Spelling order.** The alternation order here is the caller's (see
+      ``crm.CUSTOMER_COLUMNS``); ``fields`` order is the exporter's. Both are
+      widen-only, so order only decides between two populated values.
+    - **``contacts[]``.** ``_contact_detail`` also selects ``contacts[]`` by
+      ``type``; no path DSL can express "the entry whose type is Phone", so this
+      resolver has no equivalent and the CLI's phone/email columns can still be
+      blank where the exporter's are not.
     """
     first_seen: Any = None
     seen = False

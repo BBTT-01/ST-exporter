@@ -279,3 +279,151 @@ class TestDrainLanes:
 
     def test_no_lanes_is_an_empty_result_not_an_error(self) -> None:
         assert drain_lanes(MagicMock(), [], OutboxLedger(InMemorySheetsStore())) == []
+
+
+class _FlushFailingStore(InMemorySheetsStore):
+    """A store whose `_outbox_ledger` write fails a given number of times.
+
+    Sheets answering 429 on the ledger flush is routine, and it lands in the one
+    window where the ServiceTitan write has already happened.
+    """
+
+    def __init__(self, failures: int = 1) -> None:
+        super().__init__()
+        self.failures = failures
+
+    def replace_grid(self, tab_name: str, grid: list[list[str]]) -> None:
+        if tab_name == "_outbox_ledger" and self.failures:
+            self.failures -= 1
+            raise RuntimeError("Sheets 429 on _outbox_ledger")
+        super().replace_grid(tab_name, grid)
+
+
+class TestLedgerFlushFailureAfterARealWrite:
+    """A ledger flush that fails after `perform` must NOT leave the item unreported.
+
+    Before this guard, the exception escaped `drain_outbox`, `drain_lanes`
+    recorded a lane error, and the item was in neither the ledger nor the app's
+    settled queue — so the lease expired, the app redelivered it, and the
+    ServiceTitan write happened a SECOND time. One booking, two bookings.
+    """
+
+    def test_a_flush_failure_still_reports_success_to_the_app(self) -> None:
+        item = OutboxItem(id="i1", idempotency_key="k1", kind="booking", payload={})
+        lane = _lane([item], product="truequote", perform=lambda c, i: "st-1")
+
+        summary = drain_outbox(MagicMock(), lane, OutboxLedger(_FlushFailingStore()))
+
+        # The write happened, so it counts as succeeded...
+        assert summary == DrainSummary(claimed=1, succeeded=1, failed=0, replayed=0)
+        # ...and, crucially, the app was told, so it will not redeliver.
+        lane.report_success.assert_called_once_with(item, "st-1")
+
+    def test_the_lane_does_not_blow_up_and_the_run_is_not_redelivered(self) -> None:
+        item = OutboxItem(id="i1", idempotency_key="k1", kind="booking", payload={})
+        performs: list[str] = []
+
+        def perform(client, outbox_item):  # type: ignore[no-untyped-def]
+            performs.append(outbox_item.id)
+            return "st-1"
+
+        lane = _lane([item], product="truequote", perform=perform)
+        store = _FlushFailingStore()
+
+        outcomes = drain_lanes(MagicMock(), [lane], OutboxLedger(store))
+        # A lane that performed and reported is a lane that ran, not a lane error.
+        assert outcomes[0].error is None
+        assert outcomes[0].summary == DrainSummary(claimed=1, succeeded=1, failed=0, replayed=0)
+        assert lane.report_success.called
+
+        # Second run: the app has settled the item, so it is not reclaimed. Even
+        # if it were, the point is that run 1 reported it.
+        lane.claim.return_value = []
+        drain_lanes(MagicMock(), [lane], OutboxLedger(store))
+        assert performs == ["i1"], "one ServiceTitan write, not two"
+
+    def test_no_further_items_are_performed_once_the_ledger_is_unwritable(self) -> None:
+        items = [
+            OutboxItem(id="i1", idempotency_key="k1", kind="booking", payload={}),
+            OutboxItem(id="i2", idempotency_key="k2", kind="booking", payload={}),
+        ]
+        performs: list[str] = []
+
+        def perform(client, outbox_item):  # type: ignore[no-untyped-def]
+            performs.append(outbox_item.id)
+            return f"st-{outbox_item.id}"
+
+        lane = _lane(items, product="truequote", perform=perform)
+        # Every ledger write fails, not just the first.
+        summary = drain_outbox(MagicMock(), lane, OutboxLedger(_FlushFailingStore(failures=99)))
+
+        assert performs == ["i1"], "the second item must not be performed unledgerable"
+        assert summary == DrainSummary(claimed=2, succeeded=1, failed=0, replayed=0)
+        lane.report_success.assert_called_once_with(items[0], "st-i1")
+
+    def test_the_flush_failure_is_logged_at_error_with_the_idempotency_key(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        import logging
+
+        item = OutboxItem(id="i1", idempotency_key="booking:sess-7", kind="booking", payload={})
+        lane = _lane([item], product="truequote", perform=lambda c, i: "st-1")
+
+        with caplog.at_level(logging.ERROR):
+            drain_outbox(MagicMock(), lane, OutboxLedger(_FlushFailingStore()))
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "a lost ledger row after a real write is not a warning"
+        assert "booking:sess-7" in errors[0].getMessage()
+
+
+class TestAnItemWithNoIdentityIsNeverPerformed:
+    """The drain-level backstop under each lane's claim-time refusal.
+
+    The ledger key is `(product, idempotency_key)`, so N blank-keyed items are
+    ONE item to it. The first is performed and recorded under `(product, "")`;
+    every later one is reported succeeded with the FIRST one's ServiceTitan id
+    and never created. Pinning it here means a lane added later, or a raw item
+    built by hand, cannot reintroduce it.
+    """
+
+    def test_two_blank_keyed_items_do_not_collapse_into_one_booking(self) -> None:
+        items = [
+            OutboxItem(id="", idempotency_key="", kind="booking", payload={"name": "Alice"}),
+            OutboxItem(id="", idempotency_key="", kind="booking", payload={"name": "Bob"}),
+        ]
+        performs: list[str] = []
+        lane = _lane(
+            items,
+            product="truequote",
+            perform=lambda c, i: (performs.append(i.payload["name"]), f"st-{len(performs)}")[1],
+        )
+
+        summary = drain_outbox(MagicMock(), lane, OutboxLedger(InMemorySheetsStore()))
+
+        assert performs == [], "nothing may be written for an item with no identity"
+        assert summary == DrainSummary(claimed=2, succeeded=0, failed=2, replayed=0)
+        # Never reported succeeded — that is the lost-write shape.
+        lane.report_success.assert_not_called()
+
+    def test_a_blank_key_alone_is_enough_to_refuse(self) -> None:
+        item = OutboxItem(id="row-A", idempotency_key="", kind="booking", payload={})
+        lane = _lane([item], product="truequote")
+        summary = drain_outbox(MagicMock(), lane, OutboxLedger(InMemorySheetsStore()))
+        assert summary.failed == 1 and summary.succeeded == 0
+        lane.perform.assert_not_called()
+
+    def test_a_blank_id_alone_is_enough_to_refuse(self) -> None:
+        item = OutboxItem(id="", idempotency_key="k1", kind="booking", payload={})
+        lane = _lane([item], product="truequote")
+        summary = drain_outbox(MagicMock(), lane, OutboxLedger(InMemorySheetsStore()))
+        assert summary.failed == 1 and summary.succeeded == 0
+        lane.perform.assert_not_called()
+
+    def test_a_good_item_in_the_same_batch_is_still_performed(self) -> None:
+        items = [
+            OutboxItem(id="", idempotency_key="", kind="booking", payload={}),
+            OutboxItem(id="i2", idempotency_key="k2", kind="booking", payload={}),
+        ]
+        lane = _lane(items, product="truequote")
+        summary = drain_outbox(MagicMock(), lane, OutboxLedger(InMemorySheetsStore()))
+        assert summary == DrainSummary(claimed=2, succeeded=1, failed=1, replayed=0)
+        lane.report_success.assert_called_once_with(items[1], "st-i2")

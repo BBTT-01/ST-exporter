@@ -240,8 +240,19 @@ def fetch_report_rows(
         try:
             # A read, despite the verb — the parameters simply don't fit a query
             # string. Never gate this behind a mutation guard or a dry-run check.
+            #
+            # `idempotent=True` says exactly that to the client's write-retry
+            # gate: running a report a second time cannot create or mutate
+            # anything, so a lost answer (a ReadTimeout is routine — a 90-day
+            # report against a 30s client timeout) may be re-sent, as it was
+            # before that gate existed. This is the ONLY place in the repo that
+            # may pass it; a booking, a lead or a price push must not.
             envelope = client.post(
-                MODULE, resource, json_body=body, params={"page": page, "pageSize": page_size}
+                MODULE,
+                resource,
+                json_body=body,
+                params={"page": page, "pageSize": page_size},
+                idempotent=True,
             )
         except RateLimitError as exc:
             raise ReportRateLimitedError(

@@ -77,13 +77,28 @@ def _first_present(*sources: dict[str, Any] | None, keys: tuple[str, ...]) -> An
     return None
 
 
+#: ServiceTitan's documented customer object carries contact details as
+#: ``contacts: [{id, type, value, memo}]`` with ``type`` one of
+#: ``Phone | MobilePhone | Email | Fax``. Matched case-folded. Fax is
+#: deliberately NOT a phone: the tab's `customer_phone` is what somebody rings.
+_PHONE_CONTACT_TYPES = ("phone", "mobilephone")
+_EMAIL_CONTACT_TYPES = ("email",)
+
+
 def _contact_detail(
     customer: dict[str, Any] | None,
     *,
     settings_key: str,
     fields: tuple[str, ...],
+    contact_types: tuple[str, ...] = (),
 ) -> Any:
-    """One customer phone/email, preferring the settings ARRAY over the scalar.
+    """One customer phone/email, from every place ServiceTitan might put it.
+
+    Three layers, tried in order, first non-empty wins:
+    ``customer[settings_key][i][field]`` -> ``customer['contacts'][i]`` selected
+    by ``type`` -> the flat ``customer[field]`` scalar. The middle layer is the
+    one ServiceTitan's own customer schema documents (see ``_typed_contact``);
+    the other two are prior readings kept because this contract only widens.
 
     ServiceTitan's CRM customer carries its contact details as
     ``phoneSettings: [{phone: ...}]`` / ``emailSettings: [{email: ...}]``. Profit
@@ -115,7 +130,46 @@ def _contact_detail(
             value = entry.get(field)
             if value is not None and str(value).strip():
                 return value
+    contact_value = _typed_contact(customer, contact_types)
+    if contact_value is not None:
+        return contact_value
     return _first_present(customer, keys=fields)
+
+
+def _typed_contact(customer: dict[str, Any], contact_types: tuple[str, ...]) -> Any:
+    """First non-empty ``contacts[]`` entry of one of ``contact_types``.
+
+    This is the shape ServiceTitan's own customer schema documents — ``id,
+    active, name, type, address, contacts, balance, …`` with
+    ``contacts[] {id, type, value, memo}`` and ``type`` in
+    ``Phone | MobilePhone | Email | Fax``. That schema lists **none** of
+    ``phone``/``phoneNumber``/``email``/``emailAddress`` on the customer, and no
+    ``phoneSettings``/``emailSettings`` array either: `phoneSettings` appears to
+    belong to the CONTACT record and to be an object rather than an array. So
+    this is the reading most likely to be the real one.
+
+    It is added BENEATH the settings-array and ABOVE the flat scalar rather than
+    replacing either, because the contract only ever widens: no tenant shape
+    that resolved a number before resolves a different one now, and a tenant
+    that only ever had `contacts[]` stops exporting a blank column. Selection is
+    by ``type``, never by position — index 0 of a customer's contacts can just
+    as easily be their fax number, and an email in the phone column is a wrong
+    answer, which is worse than a blank one.
+
+    Untyped entries are skipped for the same reason. An empty ``contact_types``
+    means the caller is not asking about contacts at all.
+    """
+    if not contact_types:
+        return None
+    for contact in customer.get("contacts") or []:
+        if not isinstance(contact, dict):
+            continue
+        if str(contact.get("type") or "").strip().lower() not in contact_types:
+            continue
+        value = contact.get("value")
+        if value is not None and str(value).strip():
+            return value
+    return None
 
 
 def _coordinate(location: dict[str, Any] | None) -> tuple[Any, Any]:
@@ -291,11 +345,13 @@ def build_job_rows(
                         customer,
                         settings_key="phoneSettings",
                         fields=("phone", "phoneNumber", "number"),
+                        contact_types=_PHONE_CONTACT_TYPES,
                     ),
                     "customer_email": _contact_detail(
                         customer,
                         settings_key="emailSettings",
                         fields=("email", "emailAddress"),
+                        contact_types=_EMAIL_CONTACT_TYPES,
                     ),
                     "service_address": build_service_address(location.get("address"))
                     if location

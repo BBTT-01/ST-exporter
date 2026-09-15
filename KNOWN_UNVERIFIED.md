@@ -74,32 +74,66 @@ get there are an absurd job or a server that ignores `page` and hands back the
 same page forever, and neither may be written as a complete tab. The tab is
 skipped for that run, keeps its previous contents and is named in the summary.
 
-## CRM customer contact details: the settings-array element field names
+## CRM customer contact details: WHERE a phone number and an email live
 
-`src/st_exporter/denormalize.py`, `_contact_detail`;
+`src/st_exporter/denormalize.py`, `_contact_detail` / `_typed_contact`;
 `src/st_cli/commands/crm.py`, `CUSTOMER_COLUMNS`
 
-That a customer's contact details live in `phoneSettings[]` / `emailSettings[]`
-arrays rather than flat scalars is well-evidenced (Profit Wizard's production
-client reads them that way, `lib/crm/servicetitan.ts:903-906`). **The field name
-inside each element is not.** ServiceTitan's documented `CustomerPhoneSettings`
-element appears to be `{phoneNumber, doNotText}` — `phoneNumber`, not `phone` —
-and the v2 customer object may document no `emailSettings` at all, with email
-living on `crm/v2/.../customers/{id}/contacts` instead.
+**This is unverified for the phone as much as for the email, and the doubt is
+now about the container, not only the spelling.**
 
-This is the `job_number` trap exactly: every fixture in this repo spells it
-`phone`, so the suite is green whichever spelling a real tenant returns, and a
-wrong guess is a column blank on every row that reads as "this contractor has no
-phone numbers" rather than as an error. So all the plausible spellings are read,
-widest-first and widen-only — `phone`, `phoneNumber`, `number` for the phone and
-`email`, `emailAddress` for the email, in the settings entry and then in the flat
-scalar. Fixtures now cover both spellings, so neither can go untested.
+ServiceTitan's documented v2 customer object is `id, active, name, type,
+address, contacts, balance, doNotMail, doNotService, hasActiveMembership,
+memberships, customFields, createdOn, modifiedOn, mergedToId, externalData` —
+with `contacts[] {id, type ∈ Phone | MobilePhone | Email | Fax, value, memo}`
+and **none** of `phone`, `phoneNumber`, `email`, `emailAddress`, `phoneSettings`
+or `emailSettings` on the customer at all. `phoneSettings {phoneNumber,
+doNotText}` appears to belong to the *contact* record rather than the customer,
+and to be an object rather than an array. The Profit Wizard citation this repo
+leaned on (`lib/crm/servicetitan.ts:903-906`) is itself an unverified guess
+against a different endpoint, so it is not evidence either way.
 
-**Check on the first real tenant:** which key each settings element actually
-uses, and whether `emailSettings` exists at all. If email turns out to live only
-on the contacts sub-resource, `customer_email` will be blank on every row and
-this feed needs that extra call — the column being blank across the whole tab is
-the signal to look for.
+This is the `job_number` trap exactly, twice over: every fixture in this repo
+spells the source the way the code guesses, so the suite stays green whichever
+reality holds, and a wrong guess is a column blank on **every** row — which
+reads as "this contractor has no phone numbers" rather than as an error.
+
+So the code widens rather than choosing, three layers deep, first non-empty
+wins and nothing is ever removed:
+
+1. `customer.phoneSettings[] / emailSettings[]` — each entry tried for `phone`,
+   `phoneNumber`, `number` / `email`, `emailAddress`;
+2. `customer.contacts[]` selected by `type` — `Phone`/`MobilePhone` for the
+   phone column, `Email` for the email, matched case-folded. **`Fax` is
+   deliberately not a phone** and an untyped entry is skipped: an email or a fax
+   in the phone column is a wrong answer, which is worse than a blank one;
+3. the flat `customer.phone` / `customer.email` scalars.
+
+Fixtures cover all three shapes, so whichever one a live tenant returns is
+tested and no future narrowing can pass the suite.
+
+**Check on the first real tenant:** which of the three containers a customer
+actually carries. **The first-run signal for both halves is the same: the column
+blank across the WHOLE tab.** `customer_phone` blank everywhere, or
+`customer_email` blank everywhere, means none of the three layers matched — look
+at one raw customer object before assuming the contractor has no contact
+details.
+
+**If even `contacts[]` on the customer turns out to be empty**, the details live
+only on the `crm/v2/tenant/{id}/customers/{id}/contacts` sub-resource and this
+feed needs an extra pull: an `export/customers/contacts`-style list call joined
+back by `customerId`, cached like the other raw feeds. That is a new feed, not a
+widening, and is deliberately NOT built here — build it only once a real tenant
+shows both columns blank.
+
+**The CLI table lags the exporter here.** `st crm customers-list`'s Phone/Email
+columns resolve through the `a|b` alternation DSL, which can express a path and
+an index but not "the entry whose `type` is Phone", so they read layers 1 and 3
+only. If `contacts[]` is the real shape, the exporter's tab is right and the
+CLI's two columns are blank. Fixing that means teaching the DSL type selection
+or giving `crm.py` a bespoke resolver; see the parity note in
+`st_cli/output._resolve` and `tests/test_contact_resolution_parity.py` before
+touching either.
 
 ## `appointment-assignments` "removed" status values
 

@@ -49,7 +49,7 @@ from typing import Any
 import httpx
 
 from st_cli.client import ServiceTitanClient
-from st_exporter.outbox.client import OutboxItem
+from st_exporter.outbox.client import OutboxItem, drop_unidentified
 from st_exporter.outbox.routes import TRUEQUOTE_ROUTES, LaneRoutes
 
 _DEFAULT_TIMEOUT = 30.0
@@ -94,7 +94,12 @@ class TrueQuoteBookingOutboxClient:
         resp.raise_for_status()
         body = resp.json()
         items = (body or {}).get("items") or []
-        return [_to_item(item) for item in items]
+        # Same refusal the Profit Wizard lane makes: an item with a blank
+        # `item_id` or `idempotency_key` is not an item. Keeping one would give
+        # the ledger a `("truequote", "")` key that every other blank-keyed item
+        # collides with, so the second customer's booking is reported delivered
+        # with the FIRST one's booking id and never created.
+        return drop_unidentified([_to_item(item) for item in items], "truequote")
 
     def report_success(self, item: OutboxItem, booking_id: str) -> None:
         self._report(item, {"status": "succeeded", "booking_id": booking_id})

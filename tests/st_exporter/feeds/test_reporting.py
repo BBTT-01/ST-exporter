@@ -11,6 +11,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+import respx
 
 from st_cli.exceptions import RateLimitError
 from st_exporter.feeds.reporting import (
@@ -272,3 +273,53 @@ class TestColumnGuard:
         }
         rows = fetch_report_rows(client, self.ref, parameters=[], required_columns=self.required)
         assert rows == [{"JobNumber": "J-7", "TotalCosts": 500, "TotalRevenue": 900}]
+
+
+class TestTheDataPostIsTreatedAsAReadByTheRetryGate:
+    """`POST .../data` must survive a ReadTimeout, because it mutates nothing.
+
+    The round-two write-retry gate stopped retrying every non-GET. This endpoint
+    is a read wearing a POST, so it was caught by a guard aimed at bookings and
+    leads — and a report over a 90-day window against a 30s client timeout times
+    out routinely, which would have failed `reporting.jobCosts` on every run.
+    """
+
+    @respx.mock
+    def test_the_report_data_post_is_retried_on_a_read_timeout(self, st_settings) -> None:
+        from unittest.mock import patch
+
+        import httpx
+
+        from st_cli.client import ServiceTitanClient
+        from tests.st_exporter.conftest import mock_auth_token
+
+        mock_auth_token(st_settings.auth_url)
+        route = respx.post(
+            f"{st_settings.api_base}/reporting/v2/tenant/12345/report-category/c/reports/r/data"
+        ).mock(
+            side_effect=[
+                httpx.ReadTimeout("report generation > 30s"),
+                httpx.Response(
+                    200,
+                    json={
+                        "fields": [{"name": "JobNumber"}],
+                        "data": [["J1"]],
+                        "hasMore": False,
+                    },
+                ),
+            ]
+        )
+        client = ServiceTitanClient(st_settings)
+        try:
+            with patch("st_cli.client.time.sleep"):
+                rows = fetch_report_rows(
+                    client,
+                    ReportRef("c", "r", JOB_COSTING_SUMMARY_REPORT_NAME),
+                    parameters=[],
+                    required_columns=("JobNumber",),
+                )
+        finally:
+            client.close()
+
+        assert rows == [{"JobNumber": "J1"}]
+        assert route.call_count == 2

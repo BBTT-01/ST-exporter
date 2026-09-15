@@ -9,6 +9,7 @@ merged to their `main`. See KNOWN_UNVERIFIED.md.
 from __future__ import annotations
 
 import json
+import logging
 
 import httpx
 import pytest
@@ -84,6 +85,95 @@ class TestClaim:
         assert items[0].kind == "booking"
         assert items[0].payload == {"sessionId": "sess-1", "name": "Jane"}
         assert items[0].extra["booking_provider_id"] == "77"
+
+    @respx.mock
+    def test_an_item_with_no_identity_is_dropped_not_collapsed(self, caplog) -> None:
+        """A blank `idempotency_key` is a LOST booking, not a harmless one.
+
+        The reviewer's repro: two raw items spelling their id `id` instead of
+        `item_id` both parse to `idempotency_key=""`. In the drain the first is
+        performed and ledgered under `("truequote", "")`; the second then looks
+        like an idempotency replay and is reported *succeeded, with the first
+        customer's booking id*. That customer's booking is never created and
+        TrueQuote is told it was delivered.
+
+        The Profit Wizard lane already refuses such a row; this asserts the two
+        lanes now agree.
+        """
+        respx.post(f"{BASE}/booking/claim").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {"id": "row-A", "booking": {"name": "Alice"}, "booking_provider_id": 7},
+                        {"id": "row-B", "booking": {"name": "Bob"}, "booking_provider_id": 7},
+                        {
+                            "item_id": "row-C",
+                            "idempotency_key": "servicetitan:booking:sess-C",
+                            "booking": {"name": "Carol"},
+                            "booking_provider_id": 7,
+                        },
+                    ]
+                },
+            )
+        )
+        client = _client()
+        try:
+            with caplog.at_level(logging.WARNING):
+                items = client.claim()
+        finally:
+            client.close()
+
+        assert [i.id for i in items] == ["row-C"], "blank-keyed items must not reach the drain"
+        assert sum("dropping a claimed item" in r.getMessage() for r in caplog.records) == 2
+
+    @respx.mock
+    def test_an_item_with_a_key_but_no_id_is_dropped_too(self) -> None:
+        """`item.id` is what the result is POSTed against, so a blank one
+        settles nothing in their queue even when the write landed."""
+        respx.post(f"{BASE}/booking/claim").mock(
+            return_value=httpx.Response(
+                200,
+                json={"items": [{"idempotency_key": "k", "booking": {"name": "Dan"}}]},
+            )
+        )
+        client = _client()
+        try:
+            assert client.claim() == []
+        finally:
+            client.close()
+
+    def test_the_blank_key_collapse_cannot_happen_through_the_drain(self) -> None:
+        """End to end over the real drain loop: the repro's two raw items yield
+        no booking at all rather than one booking reported twice."""
+        from unittest.mock import MagicMock
+
+        from st_exporter.outbox.client import drop_unidentified
+        from st_exporter.outbox.drain import drain_outbox
+        from st_exporter.outbox.ledger import OutboxLedger
+        from st_exporter.outbox.truequote import _to_item
+        from st_exporter.sheets import InMemorySheetsStore
+
+        raw = [
+            {"id": "row-A", "booking": {"name": "Alice"}, "booking_provider_id": 7},
+            {"id": "row-B", "booking": {"name": "Bob"}, "booking_provider_id": 7},
+        ]
+        items = drop_unidentified([_to_item(r) for r in raw], "truequote")
+
+        performs: list[str] = []
+        lane = MagicMock()
+        lane.product = "truequote"
+        lane.claim.return_value = items
+        lane.perform.side_effect = lambda c, i: (
+            performs.append(i.payload["name"]),
+            f"st-{len(performs)}",
+        )[1]
+
+        summary = drain_outbox(MagicMock(), lane, OutboxLedger(InMemorySheetsStore()))
+
+        assert performs == []
+        assert summary.replayed == 0
+        lane.report_success.assert_not_called()
 
 
 class TestReport:

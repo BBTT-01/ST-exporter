@@ -274,6 +274,47 @@ class TestWritesAreNeverResent:
         assert route.call_count == 2
 
     @respx.mock
+    def test_a_post_declared_idempotent_is_resent_after_a_read_timeout(self, client):
+        """`idempotent=True` is the one narrow exemption: a POST that is a READ.
+
+        ServiceTitan's `POST reporting/.../data` runs a report — its parameters
+        are in the body only because they do not fit a query string — so a lost
+        answer may be re-asked for, exactly like a GET. Without this, a 90-day
+        Job Costing Summary against a 30s client timeout fails every six-hourly
+        run.
+        """
+        route = respx.post("/reporting/v2/tenant/12345/report-category/c/reports/r/data").mock(
+            side_effect=[
+                httpx.ReadTimeout("report generation > 30s"),
+                httpx.Response(200, json={"data": []}),
+            ]
+        )
+        with patch("st_cli.client.time.sleep"):
+            answer = client.post(
+                "reporting",
+                "report-category/c/reports/r/data",
+                json_body={"parameters": []},
+                idempotent=True,
+            )
+        assert answer == {"data": []}
+        assert route.call_count == 2
+
+    @respx.mock
+    def test_the_exemption_is_opt_in_so_a_plain_post_is_still_never_resent(self, client):
+        """The flag must default off. A create that forgets it fails loudly; a
+        create that is silently exempted duplicates a real booking."""
+        route = respx.post("/crm/v2/tenant/12345/booking-provider/7/bookings").mock(
+            side_effect=[
+                httpx.ReadTimeout("response never arrived"),
+                httpx.Response(200, json={"id": 2}),
+            ]
+        )
+        with patch("st_cli.client.time.sleep"):
+            with pytest.raises(TransportError):
+                client.post("crm", "booking-provider/7/bookings", json_body={"name": "Jane"})
+        assert route.call_count == 1
+
+    @respx.mock
     def test_a_read_is_still_retried_freely(self, client):
         # A GET has no effect to duplicate; this is the behaviour that keeps a
         # network blip from discarding three already-fetched tabs.

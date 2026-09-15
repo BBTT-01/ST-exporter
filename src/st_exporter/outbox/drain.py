@@ -11,6 +11,14 @@ can go wrong, so this loop flushes per item, immediately after recording and
 before reporting — not once at the end, which would lose every already-performed
 item in the batch to a crash or to one item's report failing.
 
+**Never leave a performed item unreported.** The ledger is a best-effort
+optimisation for recognising a redelivery; the app's own queue is the other half
+of the same guarantee. So if the flush itself fails after a real ServiceTitan
+write, the item is still reported succeeded — the app then stops redelivering it
+— and the lane performs nothing further this run. Both records failing at once
+is the only way a write duplicates, and that is strictly better than the flush
+exception escaping, which leaves the item in neither.
+
 Nothing here knows which app it is draining. Everything product-specific —
 paths, claim envelope, ServiceTitan write, result vocabulary — lives behind
 ``lanes.OutboxLane``.
@@ -90,8 +98,35 @@ def drain_outbox(
 ) -> DrainSummary:
     items = lane.claim(limit)
     succeeded = failed = replayed = 0
+    ledger_unwritable = False
 
     for item in items:
+        if not item.idempotency_key or not item.id:
+            # **An item with no identity is never performed.** The ledger key is
+            # `(product, idempotency_key)`, so two blank-keyed items are ONE item
+            # to it: the first is performed and recorded under `(product, "")`,
+            # and every later one looks like a replay and is reported succeeded
+            # *with the first one's ServiceTitan id*. That second customer's
+            # booking is reported delivered and never created — a silently lost
+            # write, which is the worst outcome this package has.
+            #
+            # Each lane's client already refuses these at claim time; this is the
+            # backstop that makes it true for every lane, including one added
+            # later that forgets. Not reported either way: with a blank `id`
+            # there is nowhere to report TO, and nothing was performed, so the
+            # app's lease simply expires and it redelivers — which is correct.
+            failed += 1
+            logger.error(
+                "%s outbox item (id=%r, idempotency_key=%r) has no identity and was NOT "
+                "performed. A blank idempotency key collides with every other blank one "
+                "in the ledger and would report a write that never happened as delivered. "
+                "This means the claim envelope is being read wrong.",
+                lane.product,
+                item.id,
+                item.idempotency_key,
+            )
+            continue
+
         existing = ledger.get(item.idempotency_key, lane.product)
         if existing is not None:
             replayed += 1
@@ -136,13 +171,52 @@ def drain_outbox(
                 product=lane.product,
             )
         )
-        ledger.flush()
         succeeded += 1
+        try:
+            ledger.flush()
+        except Exception as exc:
+            # **Never leave a performed item unreported.** The ServiceTitan
+            # write is real and cannot be taken back, but the ledger row that
+            # would recognise a redelivery is NOT durable — a Sheets 429 here is
+            # routine. Letting this propagate is what made the write duplicate:
+            # the lane ended with the item neither ledgered nor reported, the
+            # app's lease expired, it redelivered, and we performed it a second
+            # time. So report success anyway: the app's own queue then becomes
+            # the record that this item is done, and it will not redeliver.
+            logger.error(
+                "%s outbox item %s (idempotency key %s): the ServiceTitan write SUCCEEDED "
+                "(%s) but the ledger flush failed: %s. Reporting success to the app anyway "
+                "so the item is not redelivered and re-performed; its queue, not our "
+                "ledger, is the record for this one. No further items are performed in "
+                "this lane on this run.",
+                lane.product,
+                item.id,
+                item.idempotency_key,
+                st_id,
+                exc,
+            )
+            _report(lane, item, succeeded=True, value=st_id)
+            # Stop performing: the ledger is not accepting rows, so every further
+            # write in this lane would carry the same duplicate risk.
+            ledger_unwritable = True
+            break
         _report(lane, item, succeeded=True, value=st_id)
 
     # Safety net only — every recorded item was already flushed above, and
-    # OutboxLedger.flush() is a no-op when nothing was ever loaded.
-    ledger.flush()
+    # OutboxLedger.flush() is a no-op when nothing was ever loaded. Guarded for
+    # the same reason as the per-item flush: by here every performed item has
+    # already been reported, and raising would turn a completed lane into a
+    # `LaneOutcome(error=...)` that hides its counts.
+    if not ledger_unwritable:
+        try:
+            ledger.flush()
+        except Exception as exc:
+            logger.error(
+                "%s outbox: final ledger flush failed: %s. Every item performed this run "
+                "was already flushed and reported individually.",
+                lane.product,
+                exc,
+            )
     logger.info(
         "%s outbox drain: claimed=%d succeeded=%d failed=%d replayed=%d",
         lane.product,
