@@ -117,11 +117,35 @@ _COMPLETED_ON_KEYS: tuple[str, ...] = ("completedOn", "completedOnUtc")
 #: there, so at least one of the two is real and populated on ~446 of that
 #: tenant's jobs.
 #:
-#: The order is Profit Wizard's. One difference, and it is deliberate: PW uses
-#: ``||``, so a genuine ``0`` total falls through to ``invoiceTotal``. This uses
-#: ``_first_present``, which treats ``0`` as a value. A zero-dollar job is a real
-#: fact and this repo's contract is explicit that blank is not zero — collapsing
-#: them is the same error as turning missing cost into free work.
+#: **A resolved ``0`` means ABSENT here, not a zero-dollar job**, and that is the
+#: one place this column departs from how every other money cell in the export is
+#: read. It is worth the paragraph, because the first cut of this column got it
+#: the other way round and shipped.
+#:
+#: The reasoning then was that ``0`` is a real fact and the contract says blank is
+#: not zero, so ``_first_present`` (which treats ``0`` as a value) was used and
+#: Profit Wizard's ``||`` was called a difference made on purpose. The live tenant
+#: says that was wrong. Measured across 1256 rows of `tr-doorservpro`'s jobs tab:
+#: **no row was blank**, 45% of distinct jobs read exactly ``0``, and 41% of
+#: COMPLETED jobs reported ``$0``. ServiceTitan does not send null here — it sends
+#: ``0`` for "no revenue recorded" — so reading ``0`` as a real zero labels four
+#: jobs in ten as free work.
+#:
+#: PW's choice of ``||`` over ``??`` is the same judgement, made earlier: it lets
+#: a ``0`` fall through and omits the field entirely when nothing is left, which
+#: is why the direct baseline carries revenue on 446 of ~999 jobs as NULL rather
+#: than as zeros. Matching it restores parity between the two paths on ~400 jobs.
+#:
+#: The asymmetry is what settles it. A blank makes Profit Wizard REFUSE to compute
+#: a margin; a ``0`` makes it compute one against zero revenue, i.e. **-100%**.
+#: One is a gap, the other is a confident wrong number on a customer's screen, and
+#: the blank-column tripwire cannot catch it — it only fires on a column that is
+#: empty on every row, and an all-zero column sails straight past.
+#:
+#: The cost is real and accepted: a genuine zero-dollar job (a warranty callback,
+#: a goodwill visit) is now indistinguishable from one with nothing recorded. This
+#: field cannot tell them apart in the first place, the direct path already makes
+#: that trade, and "I cannot tell you" beats "they worked for free".
 #:
 #: If neither field exists on the export change-feed's job record, the next run
 #: says so: ``total_revenue`` is not in ``blank_columns.ALL_BLANK_OK``, so a
@@ -248,6 +272,33 @@ def _typed_contact(customer: dict[str, Any], contact_types: tuple[str, ...]) -> 
     if not contact_types:
         return None
     return select_contact_value(customer.get("contacts") or [], contact_types)
+
+
+def _money_or_absent(source: dict[str, Any], *, keys: tuple[str, ...]) -> Any:
+    """First value for ``keys`` that is neither missing nor zero, else ``None``.
+
+    ``_first_present`` with one change: a numeric ``0`` does not stop the search
+    and does not become the answer. See :data:`_TOTAL_REVENUE_KEYS` for why this
+    field, alone among the money cells here, reads ``0`` as "not recorded".
+
+    Deliberately narrow. It is NOT a general money reader and must not become
+    one: a ``0`` cost and a ``0`` price elsewhere in this export are real facts,
+    and the contract's "blank is not zero" rule holds everywhere it is not
+    overridden with evidence like the paragraph above.
+
+    A non-numeric value (a string, say) is returned as-is rather than judged —
+    parsing is the consumer's job and refusing to guess is this module's habit.
+    """
+    for key in keys:
+        value = source.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and value == 0:
+            continue
+        return value
+    return None
 
 
 def _coordinate(location: dict[str, Any] | None) -> tuple[Any, Any]:
@@ -472,7 +523,7 @@ def build_job_rows(
                     # rather than show a wrong one, so the product is hollow
                     # rather than wrong. Blank means "no revenue recorded", and
                     # blank is not zero — a zero-dollar job is its own fact.
-                    "total_revenue": _first_present(job, keys=_TOTAL_REVENUE_KEYS),
+                    "total_revenue": _money_or_absent(job, keys=_TOTAL_REVENUE_KEYS),
                     # Not a contract column; used by run.py to sort deterministically
                     # without re-deriving ints from formatted text.
                     "_sort_key": _sort_key(job.get("id"), appointment_id),

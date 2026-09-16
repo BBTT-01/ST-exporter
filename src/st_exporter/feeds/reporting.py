@@ -630,16 +630,29 @@ def fetch_report_rows(
 
     rows: list[dict[str, Any]] = []
     names: list[str] = []
-    page = 1
-    # Time this pull has spent parked on 429s, summed across pages. The client
-    # sleeps; this only observes, via the governor hook the client already calls
-    # before every rate-limit sleep.
-    throttled_for = 0.0
+    # Where this pull has got to, and how long it has spent parked on 429s,
+    # summed across pages. The client sleeps; this only observes, via the
+    # governor hook the client already calls before every rate-limit sleep.
+    progress = _PullProgress()
     previous_observer = client.on_rate_limited
 
     def _observe(wait: float) -> None:
-        nonlocal throttled_for
-        throttled_for += wait
+        progress.throttled_for += wait
+        # A multi-page report legitimately spends MINUTES here — reporting allows
+        # roughly one run of the same report per minute per tenant and each page
+        # counts as a run — and until this line existed the whole stretch was
+        # silent. Run 35159471697 wrote 1563 rows and took from 22:51:34 to
+        # 22:58:44 without emitting anything, which is indistinguishable from a
+        # hang to whoever is deciding whether to cancel the run.
+        logger.info(
+            "reporting: %r page %d is rate-limited — waiting %.0fs; %.0fs of the "
+            "%.0fs this pull may spend waiting is used. Throttled, not stuck.",
+            ref.name,
+            progress.page,
+            wait,
+            progress.throttled_for,
+            _MAX_RATE_LIMIT_SECONDS_PER_REPORT,
+        )
         if previous_observer is not None:
             previous_observer(wait)
 
@@ -654,11 +667,25 @@ def fetch_report_rows(
             required_columns=required_columns,
             rows=rows,
             names=names,
-            page=page,
-            budget=lambda: throttled_for,
+            progress=progress,
         )
     finally:
         client.on_rate_limited = previous_observer
+
+
+class _PullProgress:
+    """Where one report pull has got to: its page, and its spent wait budget.
+
+    Both live here rather than in :func:`_fetch_report_pages`'s own locals
+    because the rate-limit observer runs a frame BELOW that loop — the client
+    calls it just before it sleeps — and a log line naming the wait is not much
+    use without the page it is stalling. One pull owns one of these and nothing
+    else touches it, so there is no sharing to synchronise.
+    """
+
+    def __init__(self) -> None:
+        self.page = 1
+        self.throttled_for = 0.0
 
 
 def _fetch_report_pages(
@@ -671,18 +698,25 @@ def _fetch_report_pages(
     required_columns: Sequence[str],
     rows: list[dict[str, Any]],
     names: list[str],
-    page: int,
-    budget: Any,
+    progress: _PullProgress,
 ) -> list[dict[str, Any]]:
     while True:
-        if budget() > _MAX_RATE_LIMIT_SECONDS_PER_REPORT:
+        page = progress.page
+        if progress.throttled_for > _MAX_RATE_LIMIT_SECONDS_PER_REPORT:
             raise ReportRateLimitedError(
-                f"the {ref.name!r} report spent {budget():.0f}s waiting on ServiceTitan's "
+                f"the {ref.name!r} report spent {progress.throttled_for:.0f}s "
+                "waiting on ServiceTitan's "
                 f"rate limiter, past the {_MAX_RATE_LIMIT_SECONDS_PER_REPORT:.0f}s ceiling "
                 f"for one pull (reached on page {page}). Stopping rather than risking the "
                 "whole job being killed for one tab. The other financial tabs are "
                 "unaffected; the next run starts over."
             )
+        logger.info(
+            "reporting: fetching %r page %d (%d row(s) so far)",
+            ref.name,
+            page,
+            len(rows),
+        )
         try:
             # A read, despite the verb — the parameters simply don't fit a query
             # string. Never gate this behind a mutation guard or a dry-run check.
@@ -731,12 +765,26 @@ def _fetch_report_pages(
                     "has no costs' rather than as an error."
                 )
             require_columns(ref, names, required_columns, source="first data page")
+        before = len(rows)
         for data_row in envelope.get("data") or []:
             rows.append(dict(zip(names, data_row)))
 
-        if not envelope.get("hasMore", False):
+        more = bool(envelope.get("hasMore", False))
+        logger.info(
+            "reporting: %r page %d returned %d row(s), %d total%s",
+            ref.name,
+            page,
+            len(rows) - before,
+            len(rows),
+            (
+                "; another page follows and will be throttled by this one"
+                if more
+                else " (last page)"
+            ),
+        )
+        if not more:
             break
-        page += 1
+        progress.page = page = page + 1
         if page > _MAX_DATA_PAGES:
             raise ReportRateLimitedError(
                 f"the {ref.name!r} report still reported hasMore after "
