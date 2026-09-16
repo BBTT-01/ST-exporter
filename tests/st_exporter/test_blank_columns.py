@@ -151,7 +151,7 @@ class TestHookedIntoTheFeeds:
         new_meta_rows = MetaRowSet()
         guard = _TabGuard(
             label="pricebook",
-            contract_version="pricebook.v1",
+            contract_version="pricebook.v2",
             meta_rows={},
             new_meta_rows=new_meta_rows,
             run_at="2026-09-15T00:00:00+00:00",

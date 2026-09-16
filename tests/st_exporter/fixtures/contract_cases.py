@@ -196,6 +196,24 @@ _SERVICE_3_UNKNOWN_ACTIVE = {
 }
 
 
+#: A material whose cost is explicitly null, sitting on the same tab as one whose
+#: cost is a real ``0``. Blank-is-not-zero is the rule a pricing formula breaks
+#: most expensively: a null cost read as zero prices the item at pure margin.
+_MATERIAL_2_NULL_COST = {
+    "id": 201,
+    "code": "MAT-2",
+    "displayName": "Bottom Seal",
+    "description": "Cost not recorded upstream",
+    "price": 24,
+    "cost": None,
+    "hours": 0,
+    "active": True,
+    "categories": [{"id": 11, "name": "Doors"}],
+    "assets": [],
+    "modifiedOn": "2026-09-06T00:00:00Z",
+}
+
+
 #: The category-name lookup a live run builds from the categories endpoint, over
 #: the same two categories the `pricebook.categories` fixture pins.
 _CATEGORY_NAMES = category_name_index([tenant_pricebook.CATEGORY_10, tenant_pricebook.CATEGORY_11])
@@ -248,7 +266,11 @@ SOURCE_RECORDS: dict[str, list[dict[str, Any]]] = {
         {"code": "SVC-NO-ID", "displayName": "Dropped", "price": 1},
     ],
     "pricebook.equipment": _as_fetched(tenant_pricebook.EQUIPMENT_1),
-    "pricebook.materials": _as_fetched(tenant_pricebook.MATERIAL_1),
+    # Both intents kept: the new null-cost material rides through the SAME
+    # `_as_fetched` category-name pass as its sibling. Dropping that wrapper to
+    # take the new record is what blanked category_ids/category_names on 15031
+    # live rows of run 35134016237.
+    "pricebook.materials": _as_fetched(tenant_pricebook.MATERIAL_1, _MATERIAL_2_NULL_COST),
     "pricebook.categories": [tenant_pricebook.CATEGORY_10, tenant_pricebook.CATEGORY_11],
     "accounting.invoices": [tenant_financial.INVOICE_1, tenant_financial.INVOICE_2_NO_ITEMS],
     "payroll.timesheets": (

@@ -667,7 +667,58 @@ Unverified, and worth knowing before trusting the quiet half:
 
 Also unverified: that the four tabs' row counts are small enough that a full
 replace every run stays well inside a Sheets write. A very large catalogue has
-never been measured.
+never been measured — and `pricebook.v2` widened the item tabs from 12 columns to
+42, so the arithmetic moved. Google Sheets caps a spreadsheet at 10,000,000 cells
+across all tabs; the pilot tenant's 35,138 items now come to ~1.48M (was ~0.42M),
+around 15% of the cap, with room for roughly 238,000 item rows before the
+pricebook tabs alone reach it. Still comfortable, no longer irrelevant. What has
+never been tested is a single `values.update` write of that size, or the write
+time for a six-figure catalogue.
+
+## Pricebook full payload — spellings verified against the spec, not a tenant
+
+`src/st_exporter/pricebook.py`
+
+Every column `pricebook.v2` added is named after a field in the published Pricebook
+v2 OpenAPI document — `Pricebook.V2.{Service,Equipment,Material,Category}Response`
+and the nested `SkuWarrantyResponse` / `SkuVendorResponse` — rather than guessed or
+copied from a consumer's client type. `cost` and `hours` are the two that matter
+most:
+
+- `Pricebook.V2.MaterialResponse` and `Pricebook.V2.EquipmentResponse` both
+  declare `cost` (decimal, "The cost paid to acquire the material") and `hours`
+  (decimal, "The number of hours associated with the installing the …").
+- `Pricebook.V2.ServiceResponse` declares `hours` ("Hours needed to complete this
+  service") and **no cost field of any spelling**. So `pricebook.services.cost` is
+  blank on every row of every tenant by construction, and `blank_columns` exempts
+  it by name with that reason.
+
+What is still unverified is the same thing as everywhere else on this page: that a
+live tenant's payload matches its own document. The tripwire is in place either
+way — `cost` is NOT exempted on `pricebook.equipment` or `pricebook.materials`, so
+a wrong spelling there fires the whole-column-blank warning above 25 rows, and
+`hours` is exempted on no tab at all.
+
+The wider column set makes that detector work harder, and the exemption list is
+where it can be blunted. Two kinds of entry now sit in
+`blank_columns.ALL_BLANK_OK` for the item tabs and they are NOT the same strength
+of claim:
+
+- **structurally absent** — the resource's schema has no such field, so the column
+  is blank on every row of every tenant forever (`cost` on services, `is_labor` on
+  equipment). Certain, from the spec.
+- **optional upstream** — the field exists and is commonly unset catalogue-wide
+  (`cross_sale_group`, `external_id`, `account`). A guess about contractor
+  behaviour, and the weaker one: if a spelling in that group is wrong, the
+  exemption is what hides it. Every money and hours column is deliberately left
+  OUT of both groups on every tab that has the field.
+
+Deliberately NOT copied from Profit Wizard's direct integration: its
+`item.price || item.memberPrice || item.addOnPrice` price fallback. Those are three
+different prices in the API (list, member, add-on), not three spellings of one, and
+a `||` chain fires on a real `0` — it would turn a genuinely free item into its
+member price. The exporter exports `price` and leaves the reconciliation to the
+consumer, which is the same reason `cost` and `hours` are blank-when-null here.
 
 ## Pricebook image upload — what could not be confirmed without a live TrueQuote
 

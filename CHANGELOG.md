@@ -4,6 +4,91 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · The pricebook tabs carry the whole payload
+
+### Added: every scalar ServiceTitan returns on the pricebook item and category tabs
+
+`pricebook.v1` emitted twelve hand-picked columns. `cost` and `hours` were sitting
+in the same JSON response, unpicked, and Profit Wizard imported **35,138 items for
+the pilot tenant that it could not price a single one of**. The same shape had
+already cost three other round trips through an exporter change, a re-run and a
+redeploy.
+
+So the judgement about which fields matter moves to the consumer, where it is
+cheap to change. The three item tabs go from 12 columns to **42**; the category tab
+from 4 to **13**.
+
+`cost` and `hours` are the two that prompted this and the two to check first:
+
+| Column | Source | Present on |
+|---|---|---|
+| `cost` | `item.cost` | `equipment`, `materials` — **not `services`** |
+| `hours` | `item.hours` | all three |
+
+`Pricebook.V2.ServiceResponse` has no cost field of any spelling, so
+`pricebook.services.cost` is blank on every row of every tenant by construction.
+
+Also added to the item tabs: `member_price`, `add_on_price`, `add_on_member_price`,
+`taxable`, `is_labor`, `is_inventory`, `deduct_as_job_cost`, `pays_commission`,
+`commission_bonus`, `unit_of_measure`, `cross_sale_group`, `account`,
+`cost_of_sale_account`, `asset_account`, the three warranty pairs
+(`warranty_*`, `manufacturer_warranty_*`, `service_provider_warranty_*`),
+`primary_vendor_id` / `_name` / `_part` / `_cost`, `other_vendor_ids` /
+`other_vendor_names`, `source`, `external_id`. And to the category tab:
+`description`, `image`, `position`, `category_type`, `business_unit_ids`,
+`sku_image_refs`, `sku_video_refs`, `source`, `external_id`.
+
+Every name is taken from the published Pricebook v2 OpenAPI document, not guessed.
+Every value follows the tabs' existing cell rules: null or absent is a **blank
+cell**, a real `0` is `"0"`, booleans are lowercase, every cell is text.
+
+Flattening follows conventions these tabs already used — nested objects become
+prefixed per-scalar columns, lists of objects become index-aligned CSV pairs like
+`category_ids` / `category_names`, lists of scalars become one comma-separated cell
+like `image_refs`. No cell is ever a JSON blob; a test asserts it.
+
+**Deliberately not exported**, because a cell that cannot carry the fact honestly
+is worse than no column: `externalData` (an arbitrary key/value bag any other
+integration can write to — the one field here that could plausibly hold a token),
+`serviceMaterials` / `serviceEquipment` / `equipmentMaterials` / `recommendations` /
+`upgrades` (bills of materials and cross-sell links: `{skuId, quantity}` per entry,
+where a CSV of ids would look like a usable BOM with every quantity silently
+dropped — that needs its own tab at its own grain), and `subcategories` (a
+recursive tree `parent_id` already carries, one row at a time).
+
+**One column set across three tabs.** The item header is the UNION of the three
+resources' fields, so one parser still reads all three and a column a resource does
+not have is blank on every one of its rows. `blank_columns.ALL_BLANK_OK` now
+distinguishes *structurally absent* (certain, from the spec) from *optional
+upstream* (a guess about contractor behaviour); no money or hours column is
+exempted on any tab that has the field, so a wrong spelling still trips the
+whole-column-blank detector.
+
+**Size.** Google Sheets caps a spreadsheet at 10,000,000 cells across all tabs. At
+42 columns the pilot tenant's 35,138 items come to ~1.48M cells, up from ~0.42M —
+about 15% of the cap, with headroom for roughly 238,000 item rows before the
+pricebook tabs alone would reach it. Noted in `KNOWN_UNVERIFIED.md`; a six-figure
+catalogue is now worth measuring rather than assuming.
+
+### Changed: `pricebook.v1` → `pricebook.v2` (append-only, but a bump)
+
+Every original column keeps its name, its meaning and its position; the tabs, the
+grain and the row key are untouched. By the contract's own rules an appended column
+is additive and does not force a bump.
+
+It is a bump anyway, because a released fixture's bytes may never change and
+appending a column changes every row of every `pricebook.v1` fixture.
+`--republish pricebook.v1` is refused structurally the moment `columns` moves, and
+relaxing that refusal would open exactly the hole the published register closes.
+So `pricebook.v1` stays frozen on disk for consumers still pinned to it, and
+`pricebook.v2` gets its own fixture directory.
+
+**TrueQuote, TradeRated and Profit Wizard must each widen their supported
+`pricebook` range to include `pricebook.v2`.** Until they do, their contract check
+refuses the four tabs — loudly, which is the intended order of events, not a
+regression. A reader that keeps `pricebook.v1` in its range and looks columns up by
+name is otherwise unaffected: nothing it reads moved.
+
 ## [Unreleased] · A `0` in `total_revenue` meant "free work", and it shipped
 
 ### Fixed: a resolved `0` is now ABSENT, not a zero-dollar job
