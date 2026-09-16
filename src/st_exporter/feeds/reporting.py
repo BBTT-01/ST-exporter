@@ -49,6 +49,7 @@ from typing import Any, Iterator, Sequence
 from st_cli.client import ServiceTitanClient
 from st_cli.exceptions import RateLimitError, STCLIError
 from st_cli.pagination import fetch_all
+from st_exporter.logging_setup import logger
 
 MODULE = "reporting"
 
@@ -118,6 +119,17 @@ class ReportRateLimitedError(ReportUnavailableError):
     """ServiceTitan throttled the report run even after the client's own retries."""
 
 
+class JobCostingReportPinNotFoundError(ReportUnavailableError):
+    """``EXPORTER_JOB_COST_REPORT_ID`` names a report this tenant does not have.
+
+    Its own case, and deliberately not a fall-back to name resolution. A pin is
+    somebody's recorded decision about which report carries the money; if that
+    report has gone (deleted, renamed into another category, or the id was
+    mistyped) then silently resolving by name again would quietly undo the
+    decision and could re-select the very report the pin was added to avoid.
+    """
+
+
 class ReportColumnsMismatchError(ReportUnavailableError):
     """The report we found does not declare the columns this tab is built from.
 
@@ -145,14 +157,26 @@ class ReportRef:
     name: str
 
 
-def find_job_costing_summary(client: ServiceTitanClient) -> ReportRef:
-    """Locate the built-in Job Costing Summary report for this tenant, by name.
+def find_job_costing_summary(
+    client: ServiceTitanClient,
+    *,
+    required_columns: Sequence[str] = (),
+    pinned_report_id: str | None = None,
+) -> ReportRef:
+    """Locate the built-in Job Costing Summary report for this tenant.
 
     Tries each of :data:`JOB_COSTING_SUMMARY_REPORT_NAMES` in order. Raises
-    :class:`JobCostingReportNotFoundError` or :class:`JobCostingReportAmbiguousError`
-    rather than returning a best guess. See the module docstring.
+    :class:`JobCostingReportNotFoundError`, :class:`JobCostingReportAmbiguousError`
+    or :class:`JobCostingReportPinNotFoundError` rather than returning a best
+    guess. See the module docstring, and :func:`find_builtin_report` for what
+    ``pinned_report_id`` and ``required_columns`` do.
     """
-    return find_builtin_report(client, JOB_COSTING_SUMMARY_REPORT_NAMES)
+    return find_builtin_report(
+        client,
+        JOB_COSTING_SUMMARY_REPORT_NAMES,
+        required_columns=required_columns,
+        pinned_report_id=pinned_report_id,
+    )
 
 
 #: Caps on the census quoted back in a refusal. A tenant can hold thousands of
@@ -293,6 +317,30 @@ class _Census:
         )
 
 
+def _why_columns_did_not_decide(capable: list[ReportRef] | None) -> str:
+    """One sentence saying why the column check left the tie unbroken.
+
+    Without it the refusal reads as though the columns were never consulted, and
+    the reader's next move — "surely you can tell them apart by their fields" —
+    is the thing that was already tried.
+    """
+    if capable is None:
+        return (
+            "Their columns could not be compared (one or more declared no fields, or "
+            "its metadata could not be read), so they could not be told apart that way."
+        )
+    if not capable:
+        return (
+            "None of them declares the columns this tab is built from, so none could "
+            "have produced it in any case."
+        )
+    return (
+        f"{len(capable)} of them declare the columns this tab is built from, so the "
+        "columns cannot tell them apart either — which is what two copies of one "
+        "report look like."
+    )
+
+
 def _quote_names(names: Sequence[str]) -> str:
     """``'A'`` / ``'A' or 'B'`` / ``'A', 'B' or 'C'`` — for refusal messages."""
     if not names:
@@ -302,9 +350,64 @@ def _quote_names(names: Sequence[str]) -> str:
     return ", ".join(repr(n) for n in names[:-1]) + f" or {names[-1]!r}"
 
 
+def capable_of(
+    client: ServiceTitanClient,
+    candidates: Sequence[ReportRef],
+    required_columns: Sequence[str],
+) -> list[ReportRef] | None:
+    """Which ``candidates`` DECLARE every one of ``required_columns``, or ``None``.
+
+    ``None`` means "cannot judge" and must be treated as unresolved, never as
+    "none of them" — see below.
+
+    This is elimination, not scoring, and the distinction is the whole reason it
+    is allowed to exist in a module whose entire purpose is refusing to guess.
+    The module docstring rejects Profit Wizard's "score every report by its
+    columns and take the best" precisely because a score always returns a
+    winner. This asks a different, binary question, and only ever of reports
+    that have ALREADY passed the exact-name and not-custom guards: *can this
+    report produce the tab at all?* A report that does not declare
+    ``JOB_COST_COLUMNS`` cannot — ``require_columns`` would refuse it moments
+    later in :func:`fetch_report_rows` regardless — so dropping it removes a
+    candidate that was never viable, rather than preferring one viable candidate
+    over another.
+
+    What it therefore CANNOT do is pick between two reports that are both
+    capable. Two copies of the same built-in both declare the same columns, so
+    they both survive here and the caller still refuses. That is the intended
+    outcome: this resolves the case where the duplicate is structurally
+    incapable, and leaves the genuinely undecidable case undecided.
+
+    A candidate whose metadata declares no fields at all makes the whole answer
+    ``None``. ``field_names`` treats an empty ``fields`` list as "could not check
+    here" rather than "no columns", so counting such a report as incapable would
+    eliminate it on missing evidence — and if it were the real one, that would
+    silently select the impostor. Unresolvable is the safe reading.
+    """
+    if not required_columns or not candidates:
+        return None
+    wanted = set(required_columns)
+    capable: list[ReportRef] = []
+    for ref in candidates:
+        try:
+            declared = field_names(report_metadata(client, ref))
+        except STCLIError:
+            # One unreadable candidate makes every verdict unsafe, not just its
+            # own: the report we could not read may be the real one.
+            return None
+        if not declared:
+            return None
+        if wanted <= set(declared):
+            capable.append(ref)
+    return capable
+
+
 def find_builtin_report(
     client: ServiceTitanClient,
     report_names: str | Sequence[str],
+    *,
+    required_columns: Sequence[str] = (),
+    pinned_report_id: str | None = None,
 ) -> ReportRef:
     """The one built-in report carrying one of ``report_names`` exactly, or refuse.
 
@@ -325,6 +428,8 @@ def find_builtin_report(
     wanted = [_normalize(name) for name in accepted]
     #: index into `accepted` -> the distinct built-ins found under that name
     matches_by_name: list[dict[tuple[str, str], ReportRef]] = [{} for _ in accepted]
+    #: every report seen, by id — populated only to resolve ``pinned_report_id``
+    by_report_id: dict[str, ReportRef] = {}
     skipped_custom = 0
     census = _Census(wanted)
 
@@ -335,6 +440,10 @@ def find_builtin_report(
         census.saw_category()
         for report in _iter_reports(client, str(category_id)):
             census.saw_report(report.get("name"))
+            if pinned_report_id is not None and report.get("id") is not None:
+                by_report_id[str(report.get("id"))] = ReportRef(
+                    str(category_id), str(report.get("id")), str(report.get("name"))
+                )
             normalized = _normalize(report.get("name"))
             try:
                 index = wanted.index(normalized)
@@ -350,6 +459,28 @@ def find_builtin_report(
             ref = ReportRef(str(category_id), str(report_id), str(report.get("name")))
             matches_by_name[index][(ref.category_id, ref.report_id)] = ref
 
+    if pinned_report_id is not None:
+        pinned = by_report_id.get(str(pinned_report_id).strip())
+        if pinned is not None:
+            logger.warning(
+                "reporting: using the PINNED job-cost report id %s (%r, category %s) "
+                "rather than resolving by name. Unset EXPORTER_JOB_COST_REPORT_ID to go "
+                "back to name resolution.",
+                pinned.report_id,
+                pinned.name,
+                pinned.category_id,
+            )
+            return pinned
+        raise JobCostingReportPinNotFoundError(
+            f"EXPORTER_JOB_COST_REPORT_ID is set to "
+            f"{str(pinned_report_id).strip()!r} but no report with that id is visible "
+            f"to this tenant. {_plural(census.reports, 'report was', 'reports were')} "
+            "enumerated. Refusing to fall back to resolving by name: the pin is a "
+            "recorded decision about which report carries the money, and re-resolving "
+            "could silently re-select the report the pin was added to avoid. Correct "
+            "the id, or unset it to go back to name resolution."
+        )
+
     for name, matches in zip(accepted, matches_by_name):
         if not matches:
             continue
@@ -357,10 +488,28 @@ def find_builtin_report(
             located = ", ".join(
                 f"category {c}/report {r} ({matches[(c, r)].name!r})" for c, r in sorted(matches)
             )
+            candidates = [matches[key] for key in sorted(matches)]
+            capable = capable_of(client, candidates, required_columns)
+            if capable is not None and len(capable) == 1:
+                logger.warning(
+                    "reporting: %d reports are named %r (%s), but only report %s "
+                    "declares the columns this tab is built from; the others could "
+                    "not produce the tab at all, so it is selected. Set "
+                    "EXPORTER_JOB_COST_REPORT_ID to record this rather than "
+                    "re-deriving it every run.",
+                    len(matches),
+                    name,
+                    located,
+                    capable[0].report_id,
+                )
+                return capable[0]
             raise JobCostingReportAmbiguousError(
                 f"{len(matches)} distinct reports are named {name!r} ({located}). "
                 "Refusing to choose between them — picking the wrong one would produce "
-                "wrong cost numbers with no error."
+                f"wrong cost numbers with no error. {_why_columns_did_not_decide(capable)} "
+                "Resolve it either in ServiceTitan, by deleting or renaming the "
+                "duplicate, or here, by setting EXPORTER_JOB_COST_REPORT_ID to the id "
+                "of the report that carries the job-cost figures."
             )
         return next(iter(matches.values()))
 

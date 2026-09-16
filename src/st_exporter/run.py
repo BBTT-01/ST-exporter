@@ -280,6 +280,7 @@ def run_export(
             feeds=feeds,
             window_days=exporter_settings.window_days,
             financial_window_days=exporter_settings.financial_window_days,
+            job_cost_report_id=exporter_settings.job_cost_report_id,
             financial_max_jobs=exporter_settings.financial_max_jobs,
             contacts_route=exporter_settings.contacts_route,
             contacts_max_customers=exporter_settings.contacts_max_customers,
@@ -469,6 +470,7 @@ def _run(
     feeds: frozenset[str] = DEFAULT_FEEDS,
     window_days: int = DEFAULT_WINDOW_DAYS,
     financial_window_days: int = FINANCIAL_WINDOW_DAYS,
+    job_cost_report_id: str = "",
     financial_max_jobs: int = DEFAULT_MAX_TIMESHEET_JOBS,
     contacts_route: str = ROUTE_PER_CUSTOMER,
     contacts_max_customers: int = DEFAULT_MAX_CONTACT_CUSTOMERS,
@@ -631,6 +633,7 @@ def _run(
             today=today,
             window_days=financial_window_days,
             max_jobs=financial_max_jobs,
+            job_cost_report_id=job_cost_report_id,
             scopes=scopes,
             dry_run=dry_run,
         )
@@ -1329,6 +1332,7 @@ def _run_financial_feed(
     today: Any,
     window_days: int,
     max_jobs: int,
+    job_cost_report_id: str = "",
     scopes: ScopeLedger | None = None,
     dry_run: bool,
 ) -> tuple[dict[str, int], dict[str, str]]:
@@ -1386,7 +1390,14 @@ def _run_financial_feed(
     guard.attempt(
         FINANCIAL_JOB_COSTS_TAB,
         lambda: (
-            build_job_cost_grid(fetch_job_costs(client, today=today, window_days=window_days)),
+            build_job_cost_grid(
+                fetch_job_costs(
+                    client,
+                    today=today,
+                    window_days=window_days,
+                    report_id=job_cost_report_id,
+                )
+            ),
             None,
         ),
     )
