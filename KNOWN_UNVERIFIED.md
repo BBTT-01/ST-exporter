@@ -748,3 +748,82 @@ run only STORES validators; it cannot yet test them):
 - `unstable_refs > 0` → those assets can never be deduplicated at all, by any
   mechanism in this repo, because their ledger identity changes every listing.
   That is a much bigger finding than this ticket and should be raised on its own.
+
+---
+
+## Nobody has ever measured a real pricebook image
+
+**Status: unverified, and now instrumented.**
+
+`MIN_PLAUSIBLE_IMAGE_BYTES = 1024` is justified in `images/assets.py` with "the
+smallest real pricebook assets seen are 2-4 KiB". That figure is an
+**assumption**: it was written alongside the constant in commit `2298a15`, and
+no asset from any live tenant has ever been sized. The only payload anyone has
+measured is a 246-byte placeholder. Run 35145303072 uploaded five real images
+and logged not one byte count.
+
+If 2-4 KiB is accurate, ServiceTitan is serving THUMBNAILS and this whole lane
+is shipping unusable pictures into contractors' catalogues.
+
+**How it gets settled.** `ImageUploadSummary` now carries every uploaded
+payload's size, and the run reports
+`images_bytes[min=… median=… max=… total=…]`. A capped run additionally names
+each upload with its item id, its byte size and its decoded dimensions. One
+uncapped run, or one run with `image_max_assets: 20`, answers it:
+
+- median in the low single-digit KB → thumbnails, and the product question is
+  whether ServiceTitan can be asked for a larger rendition at all;
+- median in the hundreds of KB → photographs, and the floor's justification was
+  merely unsourced rather than wrong.
+
+## The blank-placeholder defence does not hold, and cannot be fixed with a constant
+
+**Status: MEASURED as insufficient. Not fixed. Reported per run.**
+
+Measured by hand on 2026-09-16 against ServiceTitan's **web-app image proxy**:
+
+```
+GET .../Image/Images%2FService%2F<guid>.png                          -> 404, 272 bytes
+GET .../Image/Images%2FService%2F<guid>.png?size=1200
+        &default=Default%2F1.png                                     -> 200, image/webp, 2798 bytes
+```
+
+The 2,798-byte body is a **completely blank white 1200x1200 image**. It clears
+the 1 KiB floor with room to spare, and the placeholder's size scales with the
+`size=` parameter — so no fixed byte threshold can be both above every
+placeholder and below every photograph. The floor cannot do the job it was
+written for.
+
+**The signal that does scale is DENSITY**, compressed bytes per pixel.
+`assets.image_dimensions` reads width and height from the file header
+(PNG/JPEG/WebP; no decode, no image-processing dependency, no pixel touched) and
+`assets.looks_blank` compares byte count against pixel count. The measured blank
+is 0.0019 bytes/pixel; a photograph, however aggressively compressed, is one to
+two orders of magnitude denser.
+
+**It is reported, not enforced**, and deliberately so. Setting a rejection
+threshold requires knowing what a real asset's density looks like on this
+tenant, which is the unverified item above; a rule guessed today could silently
+drop real images, which is strictly worse than uploading a blank. The pass
+counts `images_suspected_blank=N` and uploads them anyway. A run reporting
+`images_suspected_blank=16000` is the finding, and the rule can then be written
+from evidence. (The sha256 of every payload rejected by the existing floor is
+still logged, so the hash-blocklist route remains open if density ever proves
+too blunt for a specific tenant.)
+
+**SCOPE — read before acting on this.** The exporter calls the **authenticated**
+`pricebook/v2/tenant/{id}/images?path=…` endpoint, never that web-app proxy, and
+it sends neither `size=` nor `default=` (`is_storage_path` forbids a `?` in the
+ref ServiceTitan hands us, so we could not add one by accident). `default=` is
+what turns a missing asset into a 200 OK placeholder instead of an honest 404,
+and we never send it. Run 35145303072 reported `placeholders=0 unsupported=0`
+on five real uploads, which is consistent with the authenticated endpoint
+behaving honestly.
+
+**What is NOT known** is what the authenticated endpoint returns for an asset
+the caller may not see, or one that no longer exists. Reading the code, a 4xx
+would surface as `NotFoundError`/`APIError` and be counted as
+`download_failed` — but that is an inference from `st_cli/client.py`, not an
+observation. **What would settle it:** one run against a tenant with a known-bad
+asset path, or simply an uncapped sweep whose `images_download_failed`,
+`images_placeholders` and `images_suspected_blank` counts are read together.

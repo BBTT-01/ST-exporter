@@ -555,7 +555,33 @@ def _image_fields(images: ImageUploadSummary) -> str:
         f"images_placeholders={images.placeholders} "
         # WHAT the unsupported payloads looked like. `html:5` and `gif:5` are
         # the same `images_unsupported=5` and opposite diagnoses.
-        f"images_unsupported_shapes={images.unsupported_shapes_field}"
+        f"images_unsupported_shapes={images.unsupported_shapes_field} "
+        # HOW MUCH SHARING there is in this catalogue. Several items routinely
+        # point at one photograph, and the pass now downloads it once: run
+        # 35145303072 fetched one GUID five times before this existed. The ratio
+        # is measured over the whole listing, free, and is the number that says
+        # what a first sync will actually cost.
+        f"images_item_assets={images.item_assets} "
+        f"images_distinct={images.distinct_assets} "
+        f"images_dedupe={images.dedupe_ratio:.2f}x "
+        # WHAT SIZE the images we are actually uploading are. Nobody has ever
+        # confirmed that what ServiceTitan serves is a photograph rather than a
+        # thumbnail, and a median in the low single-digit KB is the answer
+        # "thumbnails". On the run's own output line because it is a question
+        # about the product, not about the exporter.
+        f"images_bytes[{images.bytes_field}] "
+        # Uploads whose byte density says "blank fill". Counted, never acted on:
+        # the 1 KiB floor demonstrably cannot catch a blank (a white 1200x1200
+        # WebP is 2,798 bytes) and no real asset has been measured, so this is
+        # the measurement that would let a rule be written from evidence.
+        f"images_suspected_blank={images.suspected_blank} "
+        # Non-zero means the pass was throttled and is being held back by its
+        # own governor or by a 429. Zero on a healthy run.
+        f"images_rate_limited={images.rate_limit_penalties} "
+        # How many times the ledger reached the Sheet mid-pass. On a multi-hour
+        # backfill this is the resumability guarantee, stated as a number: a
+        # killed process loses at most the work since the last one.
+        f"images_ledger_flushes={images.ledger_flushes}"
     )
 
 

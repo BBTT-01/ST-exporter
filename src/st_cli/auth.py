@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from threading import Lock
 
 import httpx
 
@@ -23,6 +24,12 @@ class TokenManager:
         self._settings = settings
         self._token: str | None = None
         self._expires_at: float = 0.0
+        # Refreshes are serialised. Without this, a concurrent caller (the image
+        # pass runs a pool of workers) can have every thread discover the same
+        # expired token at the same moment: N simultaneous POSTs to the auth
+        # endpoint — itself rate limited — and N interleaved read-modify-writes
+        # of one JSON cache file, which is how that file ends up truncated.
+        self._lock = Lock()
         self._load_from_file()
 
     def get_token(self) -> str:
@@ -30,11 +37,27 @@ class TokenManager:
         if self._is_valid():
             assert self._token is not None
             return self._token
-        return self._refresh()
+        with self._lock:
+            # Re-check inside the lock: while this thread was waiting, another
+            # may already have done the refresh it was waiting for.
+            if self._is_valid():
+                assert self._token is not None
+                return self._token
+            return self._refresh()
 
     def force_refresh(self) -> str:
-        """Force a token refresh (used on 401 retry)."""
-        return self._refresh()
+        """Force a token refresh (used on 401 retry).
+
+        "Force" means "do not trust the token I just used", not "issue a request
+        whatever else is happening". If another thread replaced the token while
+        this one was waiting for the lock, that new token IS the answer — asking
+        for a second one would be the thundering herd this lock exists to stop.
+        """
+        stale = self._token
+        with self._lock:
+            if self._token is not None and self._token != stale and self._is_valid():
+                return self._token
+            return self._refresh()
 
     def _is_valid(self) -> bool:
         return self._token is not None and time.time() < (self._expires_at - _EARLY_EXPIRY_BUFFER)

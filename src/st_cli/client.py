@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -111,15 +111,53 @@ def _is_retriable_transport(method: str, exc: httpx.HTTPError, *, idempotent: bo
 
 
 class ServiceTitanClient:
-    """HTTP client for ServiceTitan API v2."""
+    """HTTP client for ServiceTitan API v2.
+
+    Safe to share across threads: ``httpx.Client`` is, ``TokenManager`` is made
+    so explicitly, and every other piece of per-request state below is a local.
+    """
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._token_manager = TokenManager(settings)
-        self._http = httpx.Client(base_url=settings.api_base, timeout=30.0)
+        self._http = httpx.Client(
+            base_url=settings.api_base,
+            timeout=30.0,
+            # Enough to let a concurrent caller (the image pass) actually use
+            # its workers, and low enough that no caller can open an unbounded
+            # number of sockets against one tenant. httpx's own default is 100;
+            # this is narrower on purpose.
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+        )
+        # Called with the seconds this client is ABOUT to sleep, every time it
+        # backs off a 429. Optional, and None by default, so nothing changes for
+        # the CLI or for any single-threaded caller.
+        #
+        # It exists because a per-request exponential backoff is not a rate
+        # limiter: under concurrency, N workers each back off on their own
+        # clock, wake together and hit the endpoint again as a wave. A caller
+        # that holds a shared governor (`st_exporter.images.pacing`) sets this
+        # so the 429 one worker earned slows down ALL of them — which is the
+        # difference between a backoff and a rate limit.
+        self.on_rate_limited: Callable[[float], None] | None = None
 
     def close(self) -> None:
         self._http.close()
+
+    def _notify_rate_limited(self, wait: float) -> None:
+        """Tell a shared governor, if one is listening, that we were throttled.
+
+        Never lets the observer's own failure change what the request does: a
+        governor is an optimisation over the backoff that is about to happen
+        anyway.
+        """
+        observer = self.on_rate_limited
+        if observer is None:
+            return
+        try:
+            observer(wait)
+        except Exception:  # noqa: BLE001 - an observer may not break a request
+            pass
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -317,6 +355,7 @@ class ServiceTitanClient:
             if resp.status_code == 429 and retries < _MAX_RETRIES:
                 retries += 1
                 wait = _BACKOFF_BASE * (2 ** (retries - 1))
+                self._notify_rate_limited(wait)
                 time.sleep(wait)
                 continue
 

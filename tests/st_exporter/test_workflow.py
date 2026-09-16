@@ -1089,3 +1089,33 @@ def test_the_exporter_is_told_the_asset_cap(workflow_text: str) -> None:
     """Forwarding it is not optional and its absence is SILENT: the input would
     accept a number and the run would ignore it."""
     assert "EXPORTER_IMAGE_MAX_ASSETS: ${{ inputs.image_max_assets }}" in workflow_text
+
+
+def test_the_image_concurrency_dial_exists_and_defaults_to_eight(workflow_text: str) -> None:
+    """The number that turns a ~20-hour first sync into a ~2.5-hour one.
+
+    Eight rather than one because the image pass is almost entirely network
+    wait, and eight rather than thirty-two because a payload can be 8 MiB and
+    the bound on memory is the worker count.
+    """
+    inputs: Any = yaml.safe_load(workflow_text)
+    declared = inputs.get("on", inputs.get(True))["workflow_call"]["inputs"]
+    assert declared["image_concurrency"]["default"] == 8
+
+
+def test_the_exporter_is_told_the_image_concurrency(workflow_text: str) -> None:
+    """Forwarding it is not optional and its absence is SILENT: the input would
+    accept a number and every run would quietly stay on the default."""
+    assert "EXPORTER_IMAGE_CONCURRENCY: ${{ inputs.image_concurrency }}" in workflow_text
+
+
+def test_the_rate_ceiling_is_declared_and_forwarded(workflow_text: str) -> None:
+    """A concurrency dial with no governor behind it is how a pass discovers
+    somebody's rate limit by collecting 429s."""
+    inputs: Any = yaml.safe_load(workflow_text)
+    declared = inputs.get("on", inputs.get(True))["workflow_call"]["inputs"]
+    assert declared["image_requests_per_second"]["default"] == 6
+    assert (
+        "EXPORTER_IMAGE_REQUESTS_PER_SECOND: ${{ inputs.image_requests_per_second }}"
+        in workflow_text
+    )

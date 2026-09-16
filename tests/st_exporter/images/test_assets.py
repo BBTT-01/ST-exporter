@@ -9,10 +9,15 @@ from __future__ import annotations
 import time_machine
 
 from st_exporter.images.assets import (
+    MIN_PLAUSIBLE_IMAGE_BYTES,
+    describe_image_size,
     idempotency_key,
+    image_dimensions,
     is_displayable,
+    is_placeholder_image,
     is_storable,
     is_storage_path,
+    looks_blank,
     select_uploadable_asset,
     sniff_content_type,
 )
@@ -172,3 +177,122 @@ class TestIdempotencyKey:
         )
         assert moved is not None
         assert idempotency_key(self._asset(), PNG) != idempotency_key(moved, PNG)
+
+
+# ---------------------------------------------------------------------------
+# DIMENSIONS AND DENSITY — the measurement the byte floor cannot make.
+#
+# Measured on 2026-09-16 against ServiceTitan's web-app image proxy: a request
+# for a missing asset with `?size=1200&default=Default%2F1.png` answers 200
+# `image/webp`, 2,798 bytes — and the bytes are a COMPLETELY BLANK WHITE
+# 1200x1200 image. It clears `MIN_PLAUSIBLE_IMAGE_BYTES` (1024) with room to
+# spare, and because the placeholder's size scales with `size=`, no fixed byte
+# threshold can be both above every placeholder and below every photograph.
+#
+# Nothing here REJECTS anything. It exists to measure, because no real
+# pricebook asset from any live tenant has ever been sized.
+# ---------------------------------------------------------------------------
+
+
+def _png(width: int, height: int, body: bytes = b"") -> bytes:
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + (13).to_bytes(4, "big")
+        + b"IHDR"
+        + width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
+        + body
+    )
+
+
+def _webp_vp8x(width: int, height: int, body: bytes = b"") -> bytes:
+    return (
+        b"RIFF"
+        + b"\x00\x00\x00\x00"
+        + b"WEBP"
+        + b"VP8X"
+        + (10).to_bytes(4, "little")
+        + b"\x00\x00\x00\x00"
+        + (width - 1).to_bytes(3, "little")
+        + (height - 1).to_bytes(3, "little")
+        + body
+    )
+
+
+def _jpeg(width: int, height: int, body: bytes = b"") -> bytes:
+    sof = (
+        b"\xff\xc0"
+        + (11).to_bytes(2, "big")
+        + b"\x08"
+        + height.to_bytes(2, "big")
+        + width.to_bytes(2, "big")
+        + b"\x03\x00\x00\x00"
+    )
+    return b"\xff\xd8\xff" + b"\xe0" + (4).to_bytes(2, "big") + b"JF" + sof + body
+
+
+class TestDimensionsComeFromTheHeaderAlone:
+    """No decode, no image library, no pixel touched — just the file header."""
+
+    def test_png(self) -> None:
+        assert image_dimensions(_png(1200, 800)) == (1200, 800)
+
+    def test_webp_vp8x(self) -> None:
+        assert image_dimensions(_webp_vp8x(1200, 1200)) == (1200, 1200)
+
+    def test_jpeg(self) -> None:
+        assert image_dimensions(_jpeg(640, 480)) == (640, 480)
+
+    def test_an_unreadable_header_answers_none_rather_than_a_wrong_number(self) -> None:
+        """The harmless direction: no dimensions means no density is reported,
+        never a density computed from a guess."""
+        assert image_dimensions(b"") is None
+        assert image_dimensions(b"\x89PNG\r\n\x1a\n" + b"short") is None
+        assert image_dimensions(b"GIF89a" + b"\x00" * 40) is None
+        assert image_dimensions(b"RIFF" + b"\x00" * 40) is None
+
+    def test_a_hostile_jpeg_cannot_make_it_scan_forever(self) -> None:
+        """A malformed segment chain costs a bounded walk, not 8 MiB."""
+        assert image_dimensions(b"\xff\xd8\xff" + b"\xe0\x00\x04ab" * 500) is None
+
+
+class TestDensityIsWhatDistinguishesABlank:
+    def test_the_measured_blank_placeholder_is_recognised(self) -> None:
+        """2,798 bytes over 1200x1200 = 0.0019 bytes/pixel. The real one."""
+        blank = _webp_vp8x(1200, 1200, body=b"\x00" * 2768)
+        assert len(blank) == 2798
+        assert looks_blank(blank) is True
+        assert "SUSPECTED-BLANK" in describe_image_size(blank)
+        assert "1200x1200" in describe_image_size(blank)
+
+    def test_the_byte_floor_does_not_catch_it_which_is_the_whole_point(self) -> None:
+        blank = _webp_vp8x(1200, 1200, body=b"\x00" * 2768)
+        assert len(blank) > MIN_PLAUSIBLE_IMAGE_BYTES
+        assert is_placeholder_image(blank) is False, (
+            "the fixed byte floor passes a 2798-byte blank; density is why this exists"
+        )
+
+    def test_a_real_photograph_is_orders_of_magnitude_denser(self) -> None:
+        """A 640x480 JPEG at even low quality carries tens of KB."""
+        photo = _jpeg(640, 480, body=b"\x7f" * 40_000)
+        assert looks_blank(photo) is False
+        assert "SUSPECTED-BLANK" not in describe_image_size(photo)
+
+    def test_a_small_thumbnail_is_not_mistaken_for_a_blank(self) -> None:
+        """64x64 is 4,096 pixels; 3 KB over them is 0.75 bytes/pixel."""
+        thumb = _png(64, 64, body=b"\x11" * 3000)
+        assert looks_blank(thumb) is False
+
+    def test_unknown_dimensions_are_never_called_blank(self) -> None:
+        """No evidence is not evidence. The payload is uploaded either way, but
+        a count that guessed would be worse than no count."""
+        assert looks_blank(b"GIF89a" + b"\x00" * 5000) is False
+        assert describe_image_size(b"GIF89a") == "bytes=6 dimensions=unknown density=unknown"
+
+    def test_nothing_here_changes_what_is_accepted(self) -> None:
+        """Deliberately measurement-only: no real pricebook asset has ever been
+        sized, so there is no evidence from which to set a rejection rule, and a
+        rule guessed today would silently drop real images."""
+        blank = _webp_vp8x(1200, 1200, body=b"\x00" * 2768)
+        assert sniff_content_type(blank) == "image/webp"
+        assert is_placeholder_image(blank) is False
