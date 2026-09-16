@@ -205,6 +205,22 @@ jobs:
       # per item resource. The feed itself is gated by nothing but ServiceTitan's
       # Pricebook scope.
       pricebook_category_ids: ${{ vars.PRICEBOOK_CATEGORY_IDS }}
+      # 25 rather than the default 10, and ONLY on this job.
+      #
+      # This is the one feed that downloads image bytes, and a large catalogue
+      # is more bytes than a 10-minute job can move. It used to be killed
+      # mid-download every hour — which, before the pass was resumable, meant it
+      # re-started from the beginning and delivered nothing, for ever.
+      #
+      # The pass is now resumable and stops itself two minutes short of this
+      # number, so a smaller value is slower, not broken: each run works through
+      # the images the last one did not reach. What this number buys is fewer
+      # runs to a first full sweep.
+      #
+      # The cost is the shared `...-export` lock: for as long as this job runs,
+      # the 5-minute jobs feed queues behind it. Raise it for a tenant with
+      # thousands of images; leave it out entirely for one with none.
+      job_timeout_minutes: 25
     secrets:
       ST_CLIENT_ID: ${{ secrets.SERVICETITAN_CLIENT_ID }}
       ST_CLIENT_SECRET: ${{ secrets.SERVICETITAN_CLIENT_SECRET }}

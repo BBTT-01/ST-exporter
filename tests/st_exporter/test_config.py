@@ -98,3 +98,30 @@ def test_financial_max_jobs_defaults_and_rejects_zero(monkeypatch) -> None:
     _set_env(monkeypatch, EXPORTER_FINANCIAL_MAX_JOBS="0")
     with pytest.raises(pydantic.ValidationError):
         ExporterSettings()  # type: ignore[call-arg]
+
+
+def test_the_job_timeout_defaults_to_the_workflows_own_default(monkeypatch) -> None:
+    # The two numbers are the same number. If the workflow's default moves and
+    # this one does not, a run with no env var set budgets against a clock that
+    # is not the one that will kill it.
+    _set_env(monkeypatch)
+    assert ExporterSettings().job_timeout_minutes == 10  # type: ignore[call-arg]
+
+
+def test_the_image_budget_stops_short_of_the_job_timeout(monkeypatch) -> None:
+    # The reserve covers checkout, setup-python and `pip install` — all of which
+    # spend the job's clock before this process exists — plus the ledger flush.
+    _set_env(monkeypatch, EXPORTER_JOB_TIMEOUT_MINUTES="25")
+    assert ExporterSettings().image_budget_seconds == 23 * 60  # type: ignore[call-arg]
+
+
+def test_a_tiny_job_timeout_still_buys_a_minute_of_uploading(monkeypatch) -> None:
+    # A budget of zero is not "run briefly", it is "never upload anything".
+    _set_env(monkeypatch, EXPORTER_JOB_TIMEOUT_MINUTES="1")
+    assert ExporterSettings().image_budget_seconds == 60  # type: ignore[call-arg]
+
+
+def test_a_job_timeout_of_zero_is_rejected(monkeypatch) -> None:
+    _set_env(monkeypatch, EXPORTER_JOB_TIMEOUT_MINUTES="0")
+    with pytest.raises(pydantic.ValidationError):
+        ExporterSettings()  # type: ignore[call-arg]

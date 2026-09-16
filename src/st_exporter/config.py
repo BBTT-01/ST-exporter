@@ -19,6 +19,22 @@ from st_exporter.feeds.contacts import (
 from st_exporter.feeds.financial import DEFAULT_MAX_TIMESHEET_JOBS
 from st_exporter.window import FINANCIAL_WINDOW_DAYS
 
+# The reusable workflow's own default `job_timeout_minutes`, repeated here so a
+# local run and a CI run reason about the same clock.
+DEFAULT_JOB_TIMEOUT_MINUTES = 10
+
+# Taken off the job timeout before the image pass may start another asset. It
+# has to cover what happens OUTSIDE this process — checkout, setup-python and
+# `pip install -e .` all run before the exporter exists — and the ledger flush
+# that happens after the pass. A minute pessimistic costs a few images; a minute
+# optimistic costs the whole ledger to a SIGKILL.
+IMAGE_BUDGET_RESERVE_MINUTES = 2
+
+# Never hand the image pass a budget smaller than this, however small the job
+# timeout. Zero is not "run briefly", it is "never upload anything" — the bug
+# rather than a configuration of it.
+MIN_IMAGE_BUDGET_SECONDS = 60.0
+
 
 class ExporterSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="GOOGLE_")
@@ -110,6 +126,30 @@ class ExporterSettings(BaseSettings):
     pricebook_category_ids_raw: str = Field(
         default="", validation_alias="EXPORTER_PRICEBOOK_CATEGORY_IDS"
     )
+
+    # What the caller workflow's `timeout-minutes` is set to. The exporter is
+    # told rather than left to guess, because the runner does not warn before it
+    # SIGKILLs the job and a killed process writes no image ledger: every upload
+    # that run made is forgotten and re-sent by the next one, for ever, on any
+    # tenant whose catalogue is bigger than one job. ge=1 because a job timeout
+    # of zero is not a thing GitHub accepts either. Not GOOGLE_-prefixed; see
+    # window_days.
+    job_timeout_minutes: int = Field(
+        default=DEFAULT_JOB_TIMEOUT_MINUTES,
+        ge=1,
+        validation_alias="EXPORTER_JOB_TIMEOUT_MINUTES",
+    )
+
+    @property
+    def image_budget_seconds(self) -> float:
+        """How long, from the start of the run, the image pass may keep going.
+
+        One knob, not two: a caller that raises `job_timeout_minutes` must not
+        also have to remember a second number, and two numbers that can disagree
+        would eventually disagree in the direction that loses the ledger.
+        """
+        budget = (self.job_timeout_minutes - IMAGE_BUDGET_RESERVE_MINUTES) * 60.0
+        return max(MIN_IMAGE_BUDGET_SECONDS, budget)
 
     @property
     def pricebook_category_ids(self) -> tuple[str, ...]:

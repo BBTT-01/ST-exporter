@@ -7,6 +7,7 @@ is the actual download-and-POST path, not a mock of it.
 
 from __future__ import annotations
 
+from time import monotonic
 from typing import Generator
 from unittest.mock import patch
 
@@ -16,8 +17,8 @@ import respx
 
 from st_cli.client import ServiceTitanClient
 from st_exporter.images.client import TrueQuoteImageClient
-from st_exporter.images.ledger import ImageLedger
-from st_exporter.images.upload import upload_pricebook_images
+from st_exporter.images.ledger import ImageLedger, ImageLedgerEntry
+from st_exporter.images.upload import BUDGET_SPENT, upload_pricebook_images
 from st_exporter.sheets import InMemorySheetsStore
 from tests.st_exporter.conftest import mock_auth_token
 
@@ -59,9 +60,14 @@ def _accepted(status: str = "stored") -> httpx.Response:
     )
 
 
-def _run(st_client, image_client, records, ledger=None):
+def _run(st_client, image_client, records, ledger=None, deadline=None):
     return upload_pricebook_images(
-        st_client, image_client, ledger or ImageLedger(InMemorySheetsStore()), records, now=NOW
+        st_client,
+        image_client,
+        ledger or ImageLedger(InMemorySheetsStore()),
+        records,
+        now=NOW,
+        deadline=deadline,
     )
 
 
@@ -408,3 +414,170 @@ class TestServiceTitanUnreachable:
         assert summary.stopped is None
         assert summary.download_failed == 1
         assert summary.uploaded == 1
+
+
+class TestTheTimeBudget:
+    """The runner does not stop a pass, it SIGKILLs the process.
+
+    A killed process flushes no ledger, so every upload that run made is
+    forgotten and re-sent by the next one — which is how a tenant with more
+    images than one job can download uploaded nothing at all, on every run, for
+    ever. The budget is what turns that into a clean partial pass.
+    """
+
+    @respx.mock
+    def test_a_spent_budget_stops_before_a_single_download(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        public = respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=PNG))
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [PUBLIC_ITEM], deadline=monotonic() - 1)
+
+        assert summary.stopped == BUDGET_SPENT
+        assert (summary.uploaded, summary.considered, summary.pending) == (0, 0, 1)
+        assert not public.called
+        assert not upload.called
+
+    @respx.mock
+    def test_a_budget_that_runs_out_mid_pass_keeps_what_it_did(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=PNG))
+        respx.get(_images_url(st_settings)).mock(return_value=httpx.Response(200, content=JPEG))
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        ledger = ImageLedger(InMemorySheetsStore())
+
+        # First reading is inside the budget, second is past it.
+        with patch("st_exporter.images.upload.monotonic", side_effect=[0.0, 100.0]):
+            summary = _run(
+                st_client,
+                image_client,
+                [PUBLIC_ITEM, STORAGE_ITEM],
+                ledger=ledger,
+                deadline=50.0,
+            )
+
+        assert (summary.uploaded, summary.pending) == (1, 1)
+        assert summary.stopped == BUDGET_SPENT
+        assert upload.call_count == 1
+        # What it did upload is in the ledger, so the next run does not re-send it.
+        assert ledger.last_verified("100:a1") == NOW
+
+    @respx.mock
+    def test_a_budget_that_is_never_reached_changes_nothing(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=PNG))
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [PUBLIC_ITEM], deadline=monotonic() + 3600)
+
+        assert summary.stopped is None
+        assert (summary.uploaded, summary.pending) == (1, 0)
+        assert summary.complete is True
+
+    @respx.mock
+    def test_a_budget_stop_never_prunes_the_ledger(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """`complete` is what vetoes the prune, and a budget stop is not complete.
+
+        Pruning against a partial pass's `seen_keys` would forget every upload
+        the run never got round to re-verifying and send all of it again.
+        """
+        mock_auth_token(st_settings.auth_url)
+        summary = _run(st_client, image_client, [PUBLIC_ITEM], deadline=monotonic() - 1)
+
+        assert summary.complete is False
+
+
+class TestResumeOrder:
+    """Oldest verification first, so a bounded pass resumes instead of restarting.
+
+    Without this every run works the catalogue in the same order and a tenant
+    whose images do not fit in one job re-treads the same prefix for ever: the
+    images past it are never reached, however many runs go by.
+    """
+
+    @respx.mock
+    def test_an_asset_the_ledger_has_never_seen_goes_first(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=PNG))
+        respx.get(_images_url(st_settings)).mock(return_value=httpx.Response(200, content=JPEG))
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        ledger = ImageLedger(InMemorySheetsStore())
+        ledger.record(
+            ImageLedgerEntry(
+                idempotency_key="whatever",
+                asset_ref="100:a1",
+                storage_path="p",
+                verified_at="2026-09-16T08:00:00+00:00",
+            )
+        )
+
+        # PUBLIC_ITEM is first in the catalogue but already verified, so the
+        # single asset this budget affords must be the one never seen.
+        with patch("st_exporter.images.upload.monotonic", side_effect=[0.0, 100.0]):
+            summary = _run(
+                st_client,
+                image_client,
+                [PUBLIC_ITEM, STORAGE_ITEM],
+                ledger=ledger,
+                deadline=50.0,
+            )
+
+        assert summary.uploaded == 1
+        assert upload.calls[0].request.url.params["external_item_id"] == "200"
+
+    @respx.mock
+    def test_successive_bounded_runs_reach_the_whole_catalogue(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """The property the whole design exists for: two one-asset runs cover
+        two assets, rather than uploading the first one twice."""
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=PNG))
+        respx.get(_images_url(st_settings)).mock(return_value=httpx.Response(200, content=JPEG))
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        store = InMemorySheetsStore()
+        records = [PUBLIC_ITEM, STORAGE_ITEM]
+
+        for _ in range(2):
+            ledger = ImageLedger(store)
+            with patch("st_exporter.images.upload.monotonic", side_effect=[0.0, 100.0]):
+                upload_pricebook_images(
+                    st_client, image_client, ledger, records, now=NOW, deadline=50.0
+                )
+            ledger.flush()
+
+        uploaded = {call.request.url.params["external_item_id"] for call in upload.calls}
+        assert uploaded == {"100", "200"}
+
+    @respx.mock
+    def test_a_re_verified_asset_moves_behind_the_ones_it_was_ahead_of(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=PNG))
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        store = InMemorySheetsStore()
+        first = ImageLedger(store)
+        _run(st_client, image_client, [PUBLIC_ITEM], ledger=first)
+        first.flush()
+
+        later = ImageLedger(store)
+        summary = upload_pricebook_images(
+            st_client, image_client, later, [PUBLIC_ITEM], now="2026-09-17T12:00:00+00:00"
+        )
+
+        assert summary.already_uploaded == 1
+        assert later.last_verified("100:a1") == "2026-09-17T12:00:00+00:00"

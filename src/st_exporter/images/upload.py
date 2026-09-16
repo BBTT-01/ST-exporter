@@ -36,11 +36,30 @@ Failure policy, in one place because it is the whole point of the module:
   catalogue is the queue. ``images/client.py`` converts the transport failure
   into a retryable rejection so this stays a promise about *outcomes*, not one
   about HTTP status codes that an exception could walk straight past.
+
+The pass is BOUNDED and RESUMABLE, and the two only work together:
+
+- ``deadline`` stops it cleanly while the job is still alive. The runner's
+  ``timeout-minutes`` does not stop a pass, it SIGKILLs the process — and a
+  killed process never flushes the ledger, so every upload that run made is
+  forgotten and re-sent by the next one. A tenant whose catalogue is larger than
+  one job can download therefore uploaded nothing, for ever, on every run.
+- The order is oldest-verification-first (``ImageLedger.last_verified``), so a
+  bounded pass resumes where the last one stopped instead of re-treading the
+  same prefix. An asset the ledger has never seen is attempted before one
+  already confirmed, so a first sweep reaches the whole catalogue in as few runs
+  as the budget allows; afterwards the same order becomes a fair rotation that
+  re-checks the least recently confirmed images for changed bytes.
+
+Neither is a queue. The catalogue is still the queue, and the ledger still only
+ever says what has already been delivered: losing it costs bandwidth, never
+correctness.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import Any, Iterable
 
 import httpx
@@ -72,6 +91,9 @@ _PUBLIC_TIMEOUT = 60.0
 # loses the image to a 422.
 _MAX_TEXT_FIELD = 300
 
+# The one `stopped` reason a larger `job_timeout_minutes` fixes.
+BUDGET_SPENT = "time budget for the image pass spent"
+
 
 @dataclass
 class ImageUploadSummary:
@@ -89,9 +111,15 @@ class ImageUploadSummary:
     # the tenant has not granted `Pricebook → Images`. Not an error — a fact the
     # run has to state out loud.
     permission_denied: bool = False
-    # Set when the pass stopped early (TrueQuote unreachable/rate limited). The
-    # remaining assets are untouched and the next run retries them.
+    # Set when the pass stopped early (TrueQuote unreachable/rate limited, or
+    # the time budget spent). The remaining assets are untouched and the next
+    # run picks them up first, because they are the least recently verified.
     stopped: str | None = None
+    # Assets this pass never reached. Zero on a pass that saw the catalogue out.
+    # The number an operator watches: it falls run over run while a first sweep
+    # converges, and a run that leaves it high with a `stopped=budget` is asking
+    # for a larger `job_timeout_minutes`, not for a bug report.
+    pending: int = 0
     seen_keys: set[str] = field(default_factory=set)
 
     @property
@@ -113,6 +141,7 @@ class ImageUploadSummary:
             f"already={self.already_uploaded} no_image={self.no_image} "
             f"download_failed={self.download_failed} rejected={self.upload_rejected} "
             f"unsupported={self.unsupported} too_large={self.too_large} "
+            f"pending={self.pending} "
             f"permission_denied={str(self.permission_denied).lower()} "
             f"stopped={self.stopped or 'no'}"
         )
@@ -125,19 +154,27 @@ def upload_pricebook_images(
     records: Iterable[dict[str, Any]],
     *,
     now: str,
+    deadline: float | None = None,
     http: httpx.Client | None = None,
 ) -> ImageUploadSummary:
-    """Upload one image per pricebook item. Never raises for a single bad asset."""
+    """Upload one image per pricebook item. Never raises for a single bad asset.
+
+    ``deadline`` is a ``time.monotonic()`` reading past which no further asset is
+    started. None means no budget, which is only safe where nothing will kill the
+    process — in tests, and in a local run.
+    """
     summary = ImageUploadSummary()
     owns_http = http is None
     public = http or httpx.Client(timeout=_PUBLIC_TIMEOUT, follow_redirects=True)
 
+    assets = _ordered_assets(records, ledger, summary)
+    attempted = 0
     try:
-        for record in records:
-            asset = select_uploadable_asset(record)
-            if asset is None:
-                summary.no_image += 1
-                continue
+        for asset in assets:
+            if deadline is not None and monotonic() >= deadline:
+                summary.stopped = BUDGET_SPENT
+                break
+            attempted += 1
             summary.considered += 1
             if not _upload_one(client, image_client, ledger, public, asset, summary, now=now):
                 break
@@ -145,7 +182,43 @@ def upload_pricebook_images(
         if owns_http:
             public.close()
 
+    summary.pending = len(assets) - attempted
+    if summary.stopped == BUDGET_SPENT:
+        logger.warning(
+            "pricebook image pass stopped on its time budget with %d asset(s) still to "
+            "visit; the next run starts with them because they are the least recently "
+            "verified. Raise the caller's `job_timeout_minutes` to converge sooner.",
+            summary.pending,
+        )
     return summary
+
+
+def _ordered_assets(
+    records: Iterable[dict[str, Any]],
+    ledger: ImageLedger,
+    summary: ImageUploadSummary,
+) -> list[PricebookAsset]:
+    """Every uploadable asset, least recently verified first.
+
+    A blank ``last_verified`` sorts before any timestamp, so assets the ledger
+    has never seen are attempted first — the fastest route to full coverage on a
+    catalogue too large for one job. Python's sort is stable, so equally stale
+    assets keep the catalogue's own order and a pass with no ledger at all
+    behaves exactly as it did before there was one.
+    """
+    assets: list[PricebookAsset] = []
+    for record in records:
+        asset = select_uploadable_asset(record)
+        if asset is None:
+            summary.no_image += 1
+            continue
+        assets.append(asset)
+    assets.sort(key=lambda asset: ledger.last_verified(_asset_ref(asset)) or "")
+    return assets
+
+
+def _asset_ref(asset: PricebookAsset) -> str:
+    return f"{asset.external_item_id}:{asset.identity}"
 
 
 def _upload_one(
@@ -187,6 +260,10 @@ def _upload_one(
     summary.seen_keys.add(key)
     if ledger.has(key):
         summary.already_uploaded += 1
+        # Re-stamp it so it sorts to the BACK of the next pass. Leave the old
+        # timestamp and this asset is re-downloaded first on every run for ever,
+        # and the ones behind it are never reached.
+        ledger.verify(key, now)
         return True
 
     if len(asset.identity) > _MAX_TEXT_FIELD:
@@ -211,9 +288,9 @@ def _upload_one(
         ledger.record(
             ImageLedgerEntry(
                 idempotency_key=key,
-                asset_ref=f"{asset.external_item_id}:{asset.identity}",
+                asset_ref=_asset_ref(asset),
                 storage_path=result.storage_path,
-                uploaded_at=now,
+                verified_at=now,
             )
         )
         return True

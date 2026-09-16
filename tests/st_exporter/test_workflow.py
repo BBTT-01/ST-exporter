@@ -443,6 +443,32 @@ def test_ci_cannot_interfere_with_the_customer_export_workflow(ci: dict[Any, Any
     assert not any("export.yml" in entry for entry in used), used
 
 
+def test_the_job_timeout_is_an_input_and_still_defaults_to_ten(
+    workflow_text: str,
+) -> None:
+    """Every existing caller pins a tag and passes nothing new.
+
+    A default other than 10 would change the deadline of every feed of every
+    contractor the moment they repoint, which is not what this input is for:
+    only a pricebook job with a large image catalogue should ever raise it.
+    """
+    workflow = dict(yaml.safe_load(workflow_text))
+    inputs = workflow[True]["workflow_call"]["inputs"]
+    assert inputs["job_timeout_minutes"]["default"] == 10
+    assert inputs["job_timeout_minutes"]["type"] == "number"
+    assert "timeout-minutes: ${{ inputs.job_timeout_minutes }}" in workflow_text
+
+
+def test_the_exporter_is_told_the_deadline_it_is_running_against(
+    workflow_text: str,
+) -> None:
+    """The image pass stops itself short of `timeout-minutes` so the run ends
+    with a written ledger rather than a SIGKILL — which it can only do if it is
+    told the number. Declaring the input without forwarding it is a silent
+    no-op: the job simply runs longer and is still killed mid-download."""
+    assert "EXPORTER_JOB_TIMEOUT_MINUTES: ${{ inputs.job_timeout_minutes }}" in workflow_text
+
+
 def test_the_export_workflow_is_still_reusable_only(workflow_text: str) -> None:
     """The other direction of the same separation: adding CI must not have given
     `export.yml` a trigger of its own, which would run it here against no secrets."""

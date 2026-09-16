@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any, Callable, TypeVar
 
 from st_cli.client import ServiceTitanClient
@@ -246,6 +247,13 @@ def run_export(
     """
     configure_logging()
 
+    # Taken here, not in the image pass: the budget is the whole run's share of
+    # the job, and the pricebook export that precedes the pass spends minutes of
+    # it. Measuring from the pass's own start would let a slow export push the
+    # pass straight through the runner's `timeout-minutes`, which is the failure
+    # the budget exists to prevent.
+    image_deadline = monotonic() + exporter_settings.image_budget_seconds
+
     owns_client = client is None
     active_client = client or ServiceTitanClient(st_settings)
     try:
@@ -264,6 +272,7 @@ def run_export(
             contacts_max_customers=exporter_settings.contacts_max_customers,
             pricebook_category_ids=exporter_settings.pricebook_category_ids,
             image_client=image_client,
+            image_deadline=image_deadline,
             dry_run=dry_run,
         )
     finally:
@@ -306,6 +315,9 @@ def _run(
     contacts_max_customers: int = DEFAULT_MAX_CONTACT_CUSTOMERS,
     pricebook_category_ids: tuple[str, ...] = (),
     image_client: TrueQuoteImageClient | None = None,
+    # None = no budget. Only a caller that knows nothing will kill the process
+    # may leave it unset; `run_export` always sets one.
+    image_deadline: float | None = None,
     dry_run: bool,
 ) -> ExportSummary:
     now = datetime.now(timezone.utc)
@@ -505,6 +517,7 @@ def _run(
             raw_cache_store,
             pricebook_item_records,
             image_client=image_client,
+            image_deadline=image_deadline,
             run_at=run_at,
             dry_run=dry_run,
             # An item tab that did not produce a grid — failed, or refused with a
@@ -1231,6 +1244,7 @@ def _upload_pricebook_images(
     item_records: list[dict[str, Any]],
     *,
     image_client: TrueQuoteImageClient | None,
+    image_deadline: float | None,
     run_at: str,
     dry_run: bool,
     catalogue_complete: bool = True,
@@ -1252,6 +1266,10 @@ def _upload_pricebook_images(
     ``ImageLedger.keep``'s precondition is that the caller saw the WHOLE
     catalogue, and a failed `pricebook.equipment` means every equipment image
     key is simply absent from ``seen_keys`` rather than gone.
+
+    ``image_deadline`` bounds the pass so it ends with a flushed ledger rather
+    than a SIGKILL. A pass that runs out of budget is ``stopped``, which already
+    vetoes the prune for exactly the right reason: it did not see the catalogue.
     """
     if image_client is None or dry_run:
         return None
@@ -1259,7 +1277,9 @@ def _upload_pricebook_images(
     ledger = ImageLedger(raw_cache_store)
     summary = ImageUploadSummary()
     try:
-        summary = upload_pricebook_images(client, image_client, ledger, item_records, now=run_at)
+        summary = upload_pricebook_images(
+            client, image_client, ledger, item_records, now=run_at, deadline=image_deadline
+        )
         # Only prune on a pass that actually saw the whole catalogue — a run
         # stopped by a 403, a rate limit or a failed download has "not looked
         # at" assets that must not be mistaken for "gone" and re-uploaded next

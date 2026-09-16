@@ -499,6 +499,16 @@ The wire format was derived by READING TrueQuote's receiving route
 - Nothing here has met a real ServiceTitan tenant: the `Pricebook → Images`
   permission, the real `Content-Type` ServiceTitan returns for a storage-path
   image, and whether real assets ever exceed the 8 MiB cap are all unconfirmed.
+- **How many images one minute of budget actually buys is unmeasured.** The pass
+  is bounded and resumable, so a wrong guess costs runs, not correctness — but
+  the only way to learn the rate is to read `pending=` on two consecutive
+  pricebook runs of a real tenant. Until that is done, nobody can say how many
+  runs a 7,000-image first sweep takes at `job_timeout_minutes: 25`.
+- **The 2-minute reserve taken off the job timeout is a judgement, not a
+  measurement.** It has to cover checkout, setup-python and `pip install -e .`
+  before the exporter starts, plus the ledger flush after the pass. If a runner
+  is ever slower than that, the pass is SIGKILLed again and the run's uploads are
+  forgotten — the failure would look exactly like the original one.
 
 
 ## Three outbox path shapes — confirmed, not a bug to reconcile

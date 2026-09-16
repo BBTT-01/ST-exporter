@@ -4,7 +4,7 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] · Customer phone and email were never exported
+## [Unreleased] · Customer phone and email, and an image pass that could never finish
 
 ### Fixed: `customer_phone` / `customer_email` blank on every row ever exported
 
@@ -53,6 +53,75 @@ feed was found). So the route is a setting, not a guess:
 the other five, and a 404/400 from it is announced and falls back to the
 per-customer route for that run. Flipping it on once is how the question gets
 answered.
+
+### Fixed: the pricebook image pass uploaded nothing, on every run, for ever
+
+Door Serv Pro's hourly `pricebook` job ran for 10 minutes 35 seconds and was
+killed (run 35130164187, 2026-09-16). It delivered **zero** images. So did the
+run before it, and every run after — the feed had been red every hour since
+image bytes were switched on, and the only thing that had changed was that the
+image token finally reached the job. Before that it skipped the pass silently and
+the run was green.
+
+Two separate things had to be wrong for that, and both were:
+
+* **The job's `timeout-minutes: 10` was a hardcoded number with no input behind
+  it**, so no caller could give a large tenant more clock. This tenant has ~7,191
+  image references and the pricebook export itself takes about five minutes.
+* **Nothing inside the exporter knew about that deadline.** The runner does not
+  ask a job to wind up, it SIGKILLs it (`Terminate orphan process: pid (2133)
+  (st-export)`). A killed process never flushes the image ledger, so every upload
+  the run did make was forgotten — and the next run, starting the catalogue from
+  the top again, spent its ten minutes re-downloading exactly the same prefix.
+  The pass was not slow. It could not converge. More clock alone would not have
+  fixed it; it would have moved the cliff.
+
+So the pass is now **bounded** and **resumable**, and it needs to be both:
+
+* It stops itself two minutes short of the job's timeout and ends normally —
+  ledger written, summary logged, every pricebook tab and its `_meta` row
+  untouched (the pass already ran after the `_meta` write and still does). A pass
+  that runs out of budget is `stopped`, which already vetoes the ledger prune for
+  exactly the right reason: it did not see the whole catalogue.
+* It works **least-recently-verified first**. An asset the ledger has never heard
+  of is attempted before one confirmed an hour ago, so successive bounded runs
+  sweep the catalogue instead of re-treading its first few hundred items. Once
+  the sweep is done the same rule becomes a fair rotation that keeps re-checking
+  the oldest confirmations for changed bytes — no image ends up permanently
+  unwatched, which a "skip anything already uploaded" shortcut would have caused.
+
+The summary line gained `pending=` — assets this pass did not reach. It falls run
+over run while a first sweep converges and reaches 0 when the catalogue is
+covered. It is the number to watch, and a run that leaves it high is asking for a
+larger `job_timeout_minutes`, not for a bug report.
+
+The `_image_ledger` tab's fourth column is now named `verified_at` rather than
+`uploaded_at`, in place: same position, same data, an existing ledger loads
+unchanged. The rename is the honest one — the value is refreshed whenever a later
+run re-downloads the same bytes and finds them already delivered, not only when
+bytes are sent. The tab is private to the exporter's own raw-cache Sheet and no
+consumer reads it.
+
+Nothing else changed shape. No contract bump, no tab touched, and a tenant whose
+images already fit inside ten minutes behaves exactly as before: the budget only
+stops a pass that would have been killed anyway.
+
+### Added: `job_timeout_minutes` on the reusable workflow
+
+**Default 10 — the value it replaces — so every existing caller and every feed
+other than `pricebook` is untouched.** Raise it only on a `pricebook` job whose
+tenant has a large image catalogue; `docs/examples/connector-export.yml` now
+passes 25 there and says why.
+
+One number, not two: the exporter is handed the same value as
+`EXPORTER_JOB_TIMEOUT_MINUTES` and derives its own image budget from it. A
+separate "image budget" input could disagree with the job timeout, and the
+direction it would eventually disagree in is the one that loses the ledger.
+
+The cost of raising it is the shared `...-export` concurrency lock: while a long
+pricebook run holds it, the 5-minute jobs feed queues behind it. That is the same
+trade the lock has always made, now with a longer worst case — which is why this
+is an input per caller job and not a new default.
 
 ## [0.2.10] — 2026-09-15 · A feed that fails is a run that fails
 
