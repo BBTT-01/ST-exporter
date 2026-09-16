@@ -1688,3 +1688,179 @@ class TestTheRunReportsTheSizeOfWhatItUploaded:
         assert "image asset sharing: 4 uploadable item-asset(s) reference 2 distinct" in caplog.text
         assert "2 download(s) this pass does not have to make" in caplog.text
         assert "1 item(s) have no image at all" in caplog.text
+
+
+# A fixture with a REAL IHDR, so `describe_image_size` can report dimensions and
+# a density rather than `dimensions=unknown` — the whole point of the refusal
+# line is that it names what arrived. 120x80 over 2,072 bytes is 0.2158/px,
+# comfortably above the blank-fill density, so this stands in for a photograph.
+SIZED_PNG = (
+    b"\x89PNG\r\n\x1a\n"
+    + (13).to_bytes(4, "big")
+    + b"IHDR"
+    + (120).to_bytes(4, "big")
+    + (80).to_bytes(4, "big")
+    + _REAL_IMAGE_PADDING
+)
+
+
+def _refused(status_code: int, error: str) -> httpx.Response:
+    return httpx.Response(status_code, json={"error": error})
+
+
+def _refusal_lines(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "TrueQuote REFUSED one pricebook image" in record.getMessage()
+    ]
+
+
+class TestARefusedImageIsNamedAndRemembered:
+    """Run 35152460933 logged `HTTP 413 http_413` and `rejected=1`, and nothing
+    else: no item, no asset, no size — and wrote nothing, so the same image was
+    re-downloaded, re-POSTed and re-refused on every run after it.
+    """
+
+    @respx.mock
+    def test_a_413_names_the_item_asset_bytes_and_dimensions_when_uncapped(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        """UNCAPPED, because that is the run that named nothing at all."""
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=SIZED_PNG))
+        respx.post(TQ_UPLOAD).mock(return_value=_refused(413, "image_too_large"))
+
+        with caplog.at_level(logging.WARNING):
+            summary = _run(st_client, image_client, [PUBLIC_ITEM])
+
+        assert summary.max_assets == 0  # NO_ASSET_CAP: the detail is not cap-gated
+        assert summary.upload_rejected == 1
+        line = _refusal_lines(caplog)[0]
+        assert "HTTP 413 image_too_large" in line
+        assert "item=100" in line
+        assert "asset=a1" in line
+        assert f"source={PUBLIC_URL}" in line
+        assert f"bytes={len(SIZED_PNG)}" in line
+        assert "120x80" in line
+        assert "density=" in line
+        assert "content_type=image/png" in line
+        # WARNING, not INFO: a refusal is not a routine event.
+        assert [r.levelname for r in caplog.records if "REFUSED one pricebook" in r.getMessage()]
+        assert all(
+            r.levelno == logging.WARNING
+            for r in caplog.records
+            if "REFUSED one pricebook" in r.getMessage()
+        )
+        print("\nREFUSAL LINE:", line)
+
+    @respx.mock
+    def test_a_signed_url_is_redacted_in_the_refusal_line(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(SIGNED_URL).mock(return_value=httpx.Response(200, content=SIZED_PNG))
+        respx.post(TQ_UPLOAD).mock(return_value=_refused(413, "image_too_large"))
+
+        with caplog.at_level(logging.WARNING):
+            _run(st_client, image_client, [SIGNED_ITEM])
+
+        line = _refusal_lines(caplog)[0]
+        assert "deadbeefsecret" not in line
+        assert "source=https://cdn.example.com/a1.jpg?<redacted>" in line
+
+    @respx.mock
+    def test_a_refused_image_is_not_offered_again_next_run(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """THE LOOP, closed. One POST ever, not one per run for ever."""
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=SIZED_PNG))
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_refused(413, "image_too_large"))
+        store = InMemorySheetsStore()
+
+        first_ledger = ImageLedger(store)
+        first = _run(st_client, image_client, [PUBLIC_ITEM], first_ledger)
+        first_ledger.flush()
+
+        second = _run(st_client, image_client, [PUBLIC_ITEM], ImageLedger(store))
+
+        assert (first.upload_rejected, first.rejected_remembered) == (1, 0)
+        assert upload.call_count == 1
+        assert (second.upload_rejected, second.rejected_remembered) == (0, 1)
+        # Counted APART from a delivery: nothing was ever uploaded for this item.
+        assert (second.uploaded, second.already_uploaded) == (0, 0)
+
+    @respx.mock
+    def test_changed_bytes_are_offered_again_after_a_refusal(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """The memory is keyed on the payload hash, so a replaced image retries."""
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=SIZED_PNG))
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_refused(413, "image_too_large"))
+        store = InMemorySheetsStore()
+
+        ledger = ImageLedger(store)
+        _run(st_client, image_client, [PUBLIC_ITEM], ledger)
+        ledger.flush()
+
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=SIZED_PNG + b"edited"))
+        upload.mock(return_value=_accepted())
+        second = _run(st_client, image_client, [PUBLIC_ITEM], ImageLedger(store))
+
+        assert upload.call_count == 2
+        assert (second.uploaded, second.rejected_remembered) == (1, 0)
+
+    @respx.mock
+    def test_a_retryable_rejection_is_never_remembered(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """503 is about the CONNECTION, not the asset. It must come back."""
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=SIZED_PNG))
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_refused(503, "unavailable"))
+        store = InMemorySheetsStore()
+
+        ledger = ImageLedger(store)
+        first = _run(st_client, image_client, [PUBLIC_ITEM], ledger)
+        ledger.flush()
+
+        upload.mock(return_value=_accepted())
+        second = _run(st_client, image_client, [PUBLIC_ITEM], ImageLedger(store))
+
+        assert first.stopped is not None
+        assert (first.upload_rejected, first.rejected_remembered) == (0, 0)
+        assert upload.call_count == 2
+        assert (second.uploaded, second.rejected_remembered) == (1, 0)
+
+    @respx.mock
+    def test_a_mass_refusal_caps_the_detail_but_not_the_count(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        records = [_item(i) for i in range(1, 8)]
+        for item_id in range(1, 8):
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=SIZED_PNG + str(item_id).encode())
+            )
+        respx.post(TQ_UPLOAD).mock(return_value=_refused(413, "image_too_large"))
+
+        with (
+            patch("st_exporter.images.upload.REJECTION_DETAIL_LIMIT", 3),
+            caplog.at_level(logging.WARNING),
+        ):
+            summary = _run(st_client, image_client, records)
+
+        assert summary.upload_rejected == 7  # counting is complete
+        assert summary.rejection_detail_logged == 3
+        assert len(_refusal_lines(caplog)) == 3
+        assert any("will not be described individually" in m for m in caplog.messages)
+
+    def test_the_summary_line_and_a_fresh_summary_carry_the_new_counter(self) -> None:
+        assert "rejected_remembered=0" in ImageUploadSummary().as_log_fields()
+        summary = ImageUploadSummary()
+        summary.upload_rejected = 2
+        summary.rejected_remembered = 5
+        line = summary.as_log_fields()
+        assert "rejected=2 rejected_remembered=5" in line

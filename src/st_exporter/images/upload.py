@@ -296,6 +296,17 @@ PROGRESS_EVERY_SECONDS = 30.0
 # byte size. Bounded anyway, because `image_max_assets: 20000` is legal.
 UPLOAD_DETAIL_LIMIT = 500
 
+# How many REFUSED uploads get a full WARNING line naming the image.
+#
+# Its own cap, and deliberately NOT gated on the run being capped the way
+# `UPLOAD_DETAIL_LIMIT` is: a refusal is the one outcome nobody can act on
+# without knowing WHICH image it was, and run 35152460933 logged exactly
+# `rejected=1` with no way to find it. Bounded all the same, because a
+# TrueQuote-side change could refuse a 16,000-image catalogue wholesale and the
+# log is not the place to enumerate that; past the cap the summary's
+# `rejected` count carries on alone.
+REJECTION_DETAIL_LIMIT = 500
+
 # However fresh `modifiedOn` says an asset is, RE-VERIFY it after this long.
 #
 # `_is_still_fresh` rests on ServiceTitan bumping an item's `modifiedOn` when
@@ -338,6 +349,13 @@ class ImageUploadSummary:
     uploaded: int = 0
     download_failed: int = 0
     upload_rejected: int = 0
+    # Assets NOT POSTed this run because the ledger remembers TrueQuote
+    # permanently refusing these exact bytes on an earlier run. Its own counter
+    # rather than folded into `already_uploaded`, because the two are opposite
+    # facts: one says the image is delivered, the other says it never will be
+    # until the bytes change. A run whose `rejected_remembered` climbs run over
+    # run is a catalogue TrueQuote will not take, not a converging sweep.
+    rejected_remembered: int = 0
     unsupported: int = 0
     too_large: int = 0
     # Byte-valid images too small to be a picture: ServiceTitan answers 200 OK
@@ -414,6 +432,9 @@ class ImageUploadSummary:
     # How many individual uploads have already been described in full, and how
     # many mid-pass ledger flushes happened (and failed).
     upload_detail_logged: int = 0
+    # How many REFUSALS have been described in full. Bounds the log, never the
+    # counting.
+    rejection_detail_logged: int = 0
     # Uploads whose compressed BYTES PER PIXEL say the picture is a flat fill.
     #
     # Counted, reported, and NEVER acted on. The 1 KiB byte floor cannot catch a
@@ -492,6 +513,7 @@ class ImageUploadSummary:
             f"considered={self.considered} uploaded={self.uploaded} "
             f"already={self.already_uploaded} no_image={self.no_image} "
             f"download_failed={self.download_failed} rejected={self.upload_rejected} "
+            f"rejected_remembered={self.rejected_remembered} "
             f"unsupported={self.unsupported} "
             f"unsupported_shapes={self.unsupported_shapes_field} "
             f"too_large={self.too_large} placeholders={self.placeholders} "
@@ -886,9 +908,19 @@ class _ImagePass:
             # prunes everything it did not see. A key left out here is an
             # upload forgotten and re-sent for ever.
             summary.seen_keys.add(key)
-            already = self._ledger.has(key)
+            # Two reasons not to POST, counted apart because they mean opposite
+            # things: the bytes are already delivered, or TrueQuote refused
+            # these exact bytes permanently on an earlier run and will refuse
+            # them again. The key hashes the payload, so a REPLACED image gets a
+            # new key and is offered afresh either way.
+            remembered_rejection = self._ledger.is_rejected(key)
+            already = self._ledger.has(key) and not remembered_rejection
+            settled = already or remembered_rejection
             if already:
                 summary.already_uploaded += 1
+            elif remembered_rejection:
+                summary.rejected_remembered += 1
+            if settled:
                 # Re-stamp it so it sorts to the BACK of the next pass, and
                 # store the validators on the way past: this is the run that
                 # teaches the ledger what to quote back, so the NEXT weekly
@@ -897,7 +929,7 @@ class _ImagePass:
                     key, self._now, etag=fetched.etag, last_modified=fetched.last_modified
                 )
                 self._dirty = True
-        if already:
+        if settled:
             return
 
         if len(member.identity) > _MAX_TEXT_FIELD:
@@ -961,11 +993,22 @@ class _ImagePass:
 
         with self._lock:
             summary.upload_rejected += 1
-        logger.warning(
-            "TrueQuote refused one pricebook image (HTTP %d %s); the run continues",
-            result.status_code,
-            result.error,
-        )
+            # A permanent refusal is remembered, keyed on the SAME idempotency
+            # key the accepted path writes. Without this row the next run
+            # re-downloads these bytes, re-POSTs them, and is refused again --
+            # for ever, on every run, with nothing in the log naming the image.
+            self._ledger.record_rejected(
+                ImageLedgerEntry(
+                    idempotency_key=key,
+                    asset_ref=asset_ref(member),
+                    storage_path="",
+                    verified_at=self._now,
+                    etag=fetched.etag,
+                    last_modified=fetched.last_modified,
+                )
+            )
+            self._dirty = True
+            self._log_rejection(member, payload, content_type, result)
 
     def _fetch(self, group: _DownloadGroup) -> _Fetched | None:
         """One image, fetched CONDITIONALLY where we have something to quote back.
@@ -1256,6 +1299,47 @@ class _ImagePass:
                 "further successful uploads will not be listed individually (cap %d per "
                 "run); the summary's byte statistics still cover every one of them.",
                 UPLOAD_DETAIL_LIMIT,
+            )
+
+    def _log_rejection(
+        self,
+        member: PricebookAsset,
+        payload: bytes,
+        content_type: str,
+        result: ImageUploadRejected,
+    ) -> None:
+        """Name a REFUSED image. Caller holds the lock.
+
+        Unconditional on the cap, unlike ``_log_upload``: a refusal that names
+        no item, no asset, no size and no shape is unactionable, and that is
+        exactly what run 35152460933 produced -- `rejected=1` and a bare
+        `HTTP 413 http_413`. Same bounded, sanitised rendering as everywhere
+        else in this module: the identity loses any query string and userinfo,
+        and no body ever reaches the log.
+        """
+        summary = self._summary
+        if summary.rejection_detail_logged >= REJECTION_DETAIL_LIMIT:
+            return
+        summary.rejection_detail_logged += 1
+        logger.warning(
+            "TrueQuote REFUSED one pricebook image (HTTP %d %s); the run continues: "
+            "item=%s asset=%s source=%s %s (%s) content_type=%s. These bytes are "
+            "remembered as refused and will not be sent again until the image changes.",
+            result.status_code,
+            result.error,
+            member.external_item_id,
+            redact_source_url(member.identity),
+            redact_source_url(member.source_url),
+            describe_image_size(payload),
+            _human_bytes(len(payload)),
+            content_type,
+        )
+        if summary.rejection_detail_logged == REJECTION_DETAIL_LIMIT:
+            logger.warning(
+                "further refused pricebook images will not be described individually "
+                "(cap %d per run); the run summary's `rejected` keeps counting every "
+                "one of them.",
+                REJECTION_DETAIL_LIMIT,
             )
 
     def _log_outcome(self, max_assets: int) -> None:

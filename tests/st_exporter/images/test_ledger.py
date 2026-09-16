@@ -213,3 +213,82 @@ class TestCacheValidators:
         ledger.record(ImageLedgerEntry("a", "100:a1", "p", "2026-01-01T00:00:00+00:00", '"v1"', ""))
         ledger.verify("a", "2026-09-14T12:00:00+00:00")
         assert ledger.validators_for("100:a1") == ('"v1"', "")
+
+
+class TestARememberedRejection:
+    """A permanent refusal (TrueQuote 413/422) is a fact about these exact
+    bytes, and the only place it can be remembered is here. Without it the pass
+    re-downloads and re-POSTs a refused image on every run for ever.
+    """
+
+    def test_a_rejection_round_trips_through_a_flush(self) -> None:
+        store = InMemorySheetsStore()
+        ledger = ImageLedger(store)
+        ledger.record_rejected(ENTRY)
+        ledger.flush()
+
+        reloaded = ImageLedger(store)
+        assert reloaded.has("key-1")
+        assert reloaded.is_rejected("key-1") is True
+
+    def test_a_delivered_entry_is_not_a_rejection(self) -> None:
+        ledger = ImageLedger(InMemorySheetsStore())
+        ledger.record(ENTRY)
+        assert ledger.has("key-1")
+        assert ledger.is_rejected("key-1") is False
+        assert ImageLedger(InMemorySheetsStore()).is_rejected("never-seen") is False
+
+    def test_keep_does_not_drop_a_rejection_the_run_still_sees(self) -> None:
+        store = InMemorySheetsStore()
+        ledger = ImageLedger(store)
+        ledger.record_rejected(ENTRY)
+        ledger.keep({"key-1"})
+        ledger.flush()
+
+        reloaded = ImageLedger(store)
+        assert reloaded.is_rejected("key-1") is True
+
+    def test_re_verifying_a_rejection_keeps_the_marker(self) -> None:
+        """The pass re-stamps a remembered rejection so it sorts to the BACK of
+        the next pass. That must not quietly turn it into a delivery."""
+        ledger = ImageLedger(InMemorySheetsStore())
+        ledger.record_rejected(ENTRY)
+        ledger.verify("key-1", "2026-09-21T12:00:00+00:00")
+        assert ledger.is_rejected("key-1") is True
+        assert ledger.last_verified("100:a1") == "2026-09-21T12:00:00+00:00"
+
+    def test_a_six_column_ledger_written_before_this_feature_still_loads(self) -> None:
+        """The upgrade run must not mistake every existing row for a rejection,
+        or re-upload a whole catalogue: a blank seventh column is "delivered"."""
+        store = InMemorySheetsStore()
+        store.replace_grid(
+            "_image_ledger",
+            [
+                [
+                    "idempotency_key",
+                    "asset_ref",
+                    "storage_path",
+                    "verified_at",
+                    "etag",
+                    "last_modified",
+                ],
+                ["key-1", "100:a1", "p", "2026-09-14T12:00:00+00:00", '"e"', "Mon, 14 Sep 2026"],
+            ],
+        )
+        ledger = ImageLedger(store)
+        assert ledger.has("key-1")
+        assert ledger.is_rejected("key-1") is False
+        assert ledger.validators_for("100:a1") == ('"e"', "Mon, 14 Sep 2026")
+
+    def test_a_four_column_ledger_still_loads_and_is_not_a_rejection(self) -> None:
+        store = InMemorySheetsStore()
+        store.replace_grid(
+            "_image_ledger",
+            [
+                ["idempotency_key", "asset_ref", "storage_path", "uploaded_at"],
+                ["key-1", "100:a1", "p", "2026-09-14T12:00:00+00:00"],
+            ],
+        )
+        ledger = ImageLedger(store)
+        assert ledger.has("key-1")
+        assert ledger.is_rejected("key-1") is False

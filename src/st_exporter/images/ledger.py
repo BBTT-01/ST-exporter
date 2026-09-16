@@ -44,12 +44,22 @@ _COLUMNS = (
     "verified_at",
     "etag",
     "last_modified",
+    # A PERMANENT refusal by TrueQuote for these exact bytes (`_RETRYABLE_STATUSES`
+    # in `client.py` says which are not permanent). Written so the next run does
+    # not re-download and re-POST an image that will be refused again, for ever.
+    # Seventh column, so every ledger written before it pads to blank = "not
+    # rejected" and loads unchanged.
+    "rejected",
 )
 # How many leading columns a row MUST have to be usable. Every ledger written
 # before conditional requests existed has exactly these four and nothing else;
 # requiring all six would silently discard the whole existing ledger on the
 # upgrade run and re-upload a 7,000-image catalogue from scratch.
 _REQUIRED_COLUMNS = 4
+
+# What the `rejected` column holds when the entry is a remembered refusal.
+# Anything else — blank, most of all — means an ordinary delivered row.
+_REJECTED_MARKER = "rejected"
 
 
 @dataclass(frozen=True)
@@ -63,6 +73,11 @@ class ImageLedgerEntry:
     # 200 at best and a wrong 304 at worst.
     etag: str = ""
     last_modified: str = ""
+    # True when this row remembers a PERMANENT rejection rather than a
+    # delivery: the bytes reached TrueQuote and TrueQuote refused them. The key
+    # still hashes the payload, so replaced bytes get a new key and are tried
+    # again; only the identical image is spared the round trip.
+    rejected: bool = False
 
 
 class ImageLedger:
@@ -103,7 +118,17 @@ class ImageLedger:
             # what stops the upgrade run re-downloading the whole catalogue.
             padded = list(row[: len(_COLUMNS)])
             padded += [""] * (len(_COLUMNS) - len(padded))
-            self._remember(ImageLedgerEntry(*padded))
+            self._remember(
+                ImageLedgerEntry(
+                    idempotency_key=padded[0],
+                    asset_ref=padded[1],
+                    storage_path=padded[2],
+                    verified_at=padded[3],
+                    etag=padded[4],
+                    last_modified=padded[5],
+                    rejected=padded[6] == _REJECTED_MARKER,
+                )
+            )
         self._loaded = True
 
     def _remember(self, entry: ImageLedgerEntry) -> None:
@@ -115,6 +140,17 @@ class ImageLedger:
     def has(self, idempotency_key: str) -> bool:
         self._ensure_loaded()
         return idempotency_key in self._entries
+
+    def is_rejected(self, idempotency_key: str) -> bool:
+        """True when this ledger remembers TrueQuote PERMANENTLY refusing these bytes.
+
+        The other half of ``has``: both say "do not POST this", for opposite
+        reasons, and the pass counts them apart because they mean opposite
+        things about the catalogue.
+        """
+        self._ensure_loaded()
+        entry = self._entries.get(idempotency_key)
+        return entry is not None and entry.rejected
 
     def last_verified(self, asset_ref: str) -> str | None:
         """When this asset was last confirmed delivered, or None if never.
@@ -167,6 +203,14 @@ class ImageLedger:
     def record(self, entry: ImageLedgerEntry) -> None:
         self._ensure_loaded()
         self._remember(entry)
+
+    def record_rejected(self, entry: ImageLedgerEntry) -> None:
+        """Remember a permanent refusal. Same row, same key, ``rejected`` set.
+
+        Without this a 413 costs a download and a POST on EVERY run for ever:
+        nothing was written, so the next pass has no idea it has already asked.
+        """
+        self.record(replace(entry, rejected=True))
 
     def verify(
         self,
@@ -251,6 +295,7 @@ class ImageLedger:
                 e.verified_at,
                 e.etag,
                 e.last_modified,
+                _REJECTED_MARKER if e.rejected else "",
             ]
             for e in self._entries.values()
         )

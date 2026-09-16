@@ -788,6 +788,11 @@ class TestTheImagesFeedIsRoutedOnItsOwn:
         # converging rather than failing.
         assert "images_pending=12" in out
         assert "images_stopped=budget" in out
+        # A refusal TrueQuote made this run, and one it made on an earlier run
+        # that this run therefore did not re-send. Both on the output line: a
+        # `rejected=1` nobody can see is the defect this pair closes.
+        assert "images_rejected=0" in out
+        assert "images_rejected_remembered=0" in out
 
     def test_feeds_pricebook_no_longer_uploads_any_bytes(self, monkeypatch) -> None:
         """THE BEHAVIOUR CHANGE, stated.

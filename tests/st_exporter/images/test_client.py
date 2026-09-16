@@ -153,6 +153,17 @@ class TestResponses:
         assert result.kind == "permanent"
 
     @respx.mock
+    def test_413_is_permanent(self, client: TrueQuoteImageClient) -> None:
+        """A proxy's 413 judges the BYTES, exactly as a 422 does: the same image
+        is refused every run, so the pass remembers it rather than re-sending
+        it for ever. Run 35152460933 on `tr-doorservpro` is the one that made
+        this matter."""
+        respx.post(UPLOAD_URL).mock(return_value=httpx.Response(413, text="<html>too big</html>"))
+        result = _upload(client)
+        assert result == ImageUploadRejected(status_code=413, error="http_413", retryable=False)
+        assert result.kind == "permanent"
+
+    @respx.mock
     @pytest.mark.parametrize(
         ("status", "error"),
         [

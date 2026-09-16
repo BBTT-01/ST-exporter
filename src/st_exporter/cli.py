@@ -519,6 +519,12 @@ def _image_fields(images: ImageUploadSummary) -> str:
     return (
         f" images_uploaded={images.uploaded} images_already={images.already_uploaded} "
         f"images_failed={images.download_failed + images.upload_rejected} "
+        # Refusals TrueQuote made this run, and the ones it made on an EARLIER
+        # run that this run therefore did not re-send. The second is the number
+        # that says a refusal is being remembered rather than re-paid for on
+        # every pass; both sit beside `images_failed`, which folds the first in.
+        f"images_rejected={images.upload_rejected} "
+        f"images_rejected_remembered={images.rejected_remembered} "
         f"images_permission_denied={str(images.permission_denied).lower()} "
         # `stopped` and `pending` are the two that change what the counts MEAN: a
         # pass that ran out of budget has "not looked at" the rest of the
