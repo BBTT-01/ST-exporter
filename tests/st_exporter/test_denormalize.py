@@ -854,3 +854,30 @@ def test_completed_on_is_a_job_fact_repeated_on_every_technician_row() -> None:
 
     assert len(result.rows) == 2
     assert {row["completed_on"] for row in result.rows} == {"2026-09-03T16:30:00-05:00"}
+
+
+def test_job_number_is_derived_from_the_job_number_not_copied_from_the_id() -> None:
+    """`job_number` and `st_job_id` are two different facts read from two
+    different keys, and a tenant where they differ must show the difference.
+
+    On `tr-doorservpro` these two columns are EQUAL on all 2458 exported rows,
+    which looks exactly like the column being copied from the id. It is not: QA
+    corroborated it independently from a different endpoint — invoice
+    `ReferenceNumber` equals `JobId` on 2815 of 2817 rows — so in that tenant
+    ServiceTitan genuinely issues job numbers that match job ids.
+
+    This test is what keeps that a coincidence rather than an implementation.
+    `job_number` is the key `reporting.jobCosts` joins on (`JobNumber`), so a
+    tenant whose numbers and ids diverge would mis-join every cost row to the
+    wrong job — silently, since both columns would still be populated and both
+    would still look like plausible ids.
+    """
+    jobs = _cache({"id": 4821, "jobNumber": "1007", "jobStatus": "Completed"})
+    appointments = _cache({"id": 100, "jobId": 4821, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    row = result.rows[0]
+    assert row["st_job_id"] == 4821
+    assert row["job_number"] == "1007"
+    assert str(row["job_number"]) != str(row["st_job_id"])
