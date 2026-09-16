@@ -89,6 +89,47 @@ What does **not** force a bump: **appending** a new column at the end. Consumers
 look columns up by name and ignore the rest, so an appended column is additive.
 Note it in the CHANGELOG; do not bump.
 
+### What an appended column does to the fixture suite
+
+This rule and the published register used to contradict each other, and the
+register won. Appending a column changes the bytes of the released version's
+fixture, `gen_contract_fixtures.py` refused every byte change alike, and the only
+way out it offered was the bump this rule says not to make.
+
+Taking that bump is not a harmless over-signal. A consumer pinned to the old
+version MUST return `unsupported_contract` and stop parsing (see "What a consumer
+MUST do"), so bumping for an appended column takes a tab from *missing one cell*
+to *dark* — for every consumer — until each of them widens its range and deploys.
+For a column added to fix a live outage that inverts the fix.
+
+So a pure append is now recognised rather than refused, and
+`contracts.appended_columns` / `contracts.additive_refusals` are the one place
+that decides what "pure" means. Concretely, when you append a column:
+
+- the released fixture is **left exactly as it was published** — its bytes, its
+  `sha256` in `published.json`, and its `row_count` in `manifest.json` all stay
+  put, so `check_register_append_only.py` stays green and a consumer pinned to
+  that version keeps testing against the file it was released with;
+- the generator prints an `APPENDED COLUMN(S)` notice naming the new columns, and
+  writes nothing;
+- **the appended column has no committed fixture** until the next version bump
+  gives the tab a fresh directory.
+
+That last point is the honest cost of not bumping. It is bounded by what an
+appended column *is* — one no consumer of the current version reads, because the
+current version never promised it — but it does mean a consumer that starts
+reading an appended column is reading something the fixture suite does not cover.
+**If you need fixture coverage of a new column, that is the reason to bump**, and
+the bump should then be co-ordinated with the consumers rather than shipped ahead
+of them.
+
+Everything else is refused exactly as before, and each is pinned by a test: a
+rename, a removal, a **re-order** (`appended_columns` is positional, not
+set-based, precisely so `(a, b, c) -> (b, a, c, d)` is not mistaken for an
+append), a changed cell in a released column — including one riding along beside
+a legitimate append — a changed row count, and an append judged against a
+released file whose sha no longer matches the register.
+
 ## Cell rules that hold across every tab
 
 These are part of the contract, not implementation detail:

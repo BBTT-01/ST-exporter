@@ -49,6 +49,60 @@ date is not sortable at all. The feed now sends `sort: "-Id"` (`JOB_SORT`), the
 stable proxy for "newest first"; the `max_jobs` cap therefore keeps the newest
 jobs in the window rather than the oldest.
 
+## Jobs feed: WHERE the export change-feed puts a job's completion instant
+
+`src/st_exporter/denormalize.py`, `_COMPLETED_ON_KEYS`
+
+The `jobs` tab's `completed_on` column (appended in 0.2.20) reads `completedOn`,
+falling back to `completedOnUtc`.
+
+**What is evidenced.** `completedOn` is the documented spelling on the JPM job
+object, and it is not a bare guess. Three independent lines of evidence:
+
+1. **Profit Wizard's own Direct path reads it in production, for these two
+   contractors.** `profitwizard/lib/crm/servicetitan.ts:852`:
+
+       completed_date: job.completedOn ? new Date(job.completedOn) : undefined,
+
+   That is the same precedent that resolved the customer-contacts entry below —
+   a live, shipped reader against the same tenants is the strongest evidence
+   available short of a recorded response. It is also what fills
+   `completed_date` on the direct baseline this exporter is being compared
+   against, so matching it is what makes the two comparable at all.
+2. The sibling query parameter `completedOnOrAfter` on
+   `GET /jpm/v2/tenant/{tenant}/jobs` is CONFIRMED against the published
+   `tenant-jpm-v2` OpenAPI description (see the first entry on this page) — a
+   parameter that by construction filters on a field of that name.
+3. `financial.warn_if_older_than_window` already reads `completedOn` off live
+   job records from that same endpoint.
+
+**What is NOT verified.** That the **export change-feed** —
+`/jpm/v2/tenant/{tenant}/export/jobs`, which is what actually fills `_raw_jobs`
+and therefore this tab — spells it identically to the LIST endpoint. All three
+evidence lines above are about the LIST/detail endpoint; the two are different
+endpoints with separately-generated response models, and no live response from
+the export feed has been inspected for this field. The alternate
+spelling is carried for the same reason `job_number` still reads `number`
+underneath `jobNumber`; both names mean the same fact, so accepting both cannot
+pick up a different one.
+
+**How the first live run answers it, without anyone remembering to look.**
+`completed_on` is deliberately NOT in `blank_columns.ALL_BLANK_OK`, so if neither
+spelling matches, the next `jobs` run (every 5 minutes) emits
+
+    BLANK COLUMN: jobs.completed_on is empty on all N rows
+
+as a WARNING, a GitHub `::warning` annotation and a step-summary line. Check the
+first run after this ships. The measured baseline to check it against: on
+`tr-doorservpro`, 864 jobs have `jobStatus` = completed, so a correct reading is
+several hundred non-empty cells, not zero.
+
+One false-positive shape is worth knowing about: a tenant with genuinely no
+completed jobs inside the window would also trip that warning. It is left
+checked rather than exempted anyway — an exemption would silence the exact signal
+this entry exists to produce, and "no completed jobs at all in 90 days" is itself
+worth a look.
+
 ## Financial feed: how ServiceTitan marks a report as custom
 
 `src/st_exporter/feeds/reporting.py`, `_CUSTOM_BOOLEAN_FIELDS`, `_CUSTOM_KIND_FIELDS`

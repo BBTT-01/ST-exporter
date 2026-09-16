@@ -264,7 +264,11 @@ def republish_refusals(version: str, files: dict[str, str]) -> list[str]:
     for name in sorted(set(released_names) & set(produced)):
         try:
             was = json.loads((on_disk / name).read_text(encoding="utf-8"))
-            now = json.loads(produced[name])
+            # Narrowed to the released columns: a republish rewrites the RELEASED
+            # bytes, and an appended column is not part of them. Without this an
+            # append makes every republish look like a column change and the
+            # typo-fix hatch stops working for as long as one is outstanding.
+            now = contracts.narrowed_to_released(was, json.loads(produced[name]))
         except (json.JSONDecodeError, OSError) as exc:
             refusals.append(f"{version}/{name} could not be compared as JSON: {exc}")
             continue
@@ -304,8 +308,138 @@ def _refuse_republish(version: str, refusals: list[str]) -> str:
     )
 
 
-def frozen_violations(
+def additive_appends(
     files: dict[str, str], register: dict[str, dict[str, str]]
+) -> dict[str, list[str]]:
+    """Relative path -> the columns it APPENDS to the released fixture.
+
+    Only pure appends appear here, as judged by ``contracts.additive_refusals`` —
+    the single definition both this script and the test suite ask, so the two can
+    never disagree about what "additive" means. Anything else is absent and is
+    left to :func:`frozen_violations` to refuse.
+
+    The released file is read from DISK rather than reconstructed, so the
+    register's recorded sha is checked against it FIRST and a mismatch is not an
+    append. Without that check a tampered register laundered a rewrite into an
+    "append": the comparison would have been made against whatever bytes were on
+    disk instead of against the released ones.
+
+    Appearing here means the released file is left exactly as it is. Nothing is
+    rewritten, no sha moves, and the appended column ships with no committed
+    fixture until the next bump — see ``contracts``' module docstring for why
+    that is the cost of not bumping rather than an oversight.
+    """
+    appends: dict[str, list[str]] = {}
+    for relative, text in sorted(files.items()):
+        version = contracts.version_of_fixture(relative)
+        if version is None:
+            continue
+        name = relative.rsplit("/", 1)[-1]
+        recorded = (register.get(version) or {}).get(name)
+        if recorded is None or recorded == _digest(text):
+            continue
+        released_path = REPO_ROOT / relative
+        if not released_path.exists():
+            continue
+        released_text = released_path.read_text(encoding="utf-8")
+        if _digest(released_text) != recorded:
+            # The file on disk is NOT the one the register says was released, so
+            # there is nothing trustworthy to judge an append against. Fall
+            # through to a refusal rather than comparing today's payload with a
+            # fixture that has itself been edited: doing that would let a
+            # tampered register (or a hand-edited released fixture) be laundered
+            # into "additive, nothing to see here", which is precisely the
+            # bypass `published.json` exists to prevent.
+            continue
+        try:
+            released = json.loads(released_text)
+            current = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if contracts.additive_refusals(released, current):
+            continue
+        added = contracts.appended_columns(
+            released.get("columns") or [], current.get("columns") or []
+        )
+        if added:
+            appends[relative] = added
+    return appends
+
+
+def narrow_to_released(files: dict[str, str], version: str) -> None:
+    """Cut every produced fixture of ``version`` back to its released columns.
+
+    In place, on the ``files`` map about to be written. Used only on the
+    ``--republish`` path: everywhere else a released file with an appended column
+    is frozen outright and never written at all.
+    """
+    on_disk = REPO_ROOT / contracts.FIXTURE_ROOT / version
+    for name, text in sorted(produced_by_version(files).get(version, {}).items()):
+        released_path = on_disk / name
+        if not released_path.exists():
+            continue
+        try:
+            released = json.loads(released_path.read_text(encoding="utf-8"))
+            current = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        narrowed = contracts.narrowed_to_released(released, current)
+        if narrowed is not current:
+            files[f"{contracts.FIXTURE_ROOT}/{version}/{name}"] = render(narrowed)
+
+
+def _report_appends(appends: dict[str, list[str]]) -> None:
+    """Say out loud that a released fixture was left behind, and what it now lacks.
+
+    An append is accepted rather than refused, which makes it the one contract
+    change that produces no failure and no diff in the fixture suite. Saying
+    nothing would make it the quietest change in a system built entirely around
+    being loud, so it gets its own notice naming the columns that now ship with
+    no committed fixture behind them.
+    """
+    if not appends:
+        return
+    print("\nAPPENDED COLUMN(S) — released fixtures left exactly as published:")
+    for relative, added in sorted(appends.items()):
+        print(f"  {relative}: + {', '.join(added)}")
+    print(
+        "This is additive under docs/export-contract.md, so the contract version is\n"
+        "NOT bumped and every consumer keeps parsing. The cost is that the appended\n"
+        "column has no committed fixture until the next bump: pin it with a unit test\n"
+        "here, and note it in CHANGELOG.md."
+    )
+
+
+def freeze_released_entries(files: dict[str, str], appends: dict[str, list[str]]) -> None:
+    """Drop every additively-changed fixture, and re-point the manifest at the released file.
+
+    In place, on the ``files`` map ``main`` is about to write. Two things have to
+    move together or the suite contradicts itself: the fixture must not be
+    rewritten, AND the manifest entry that carries its ``sha256`` and
+    ``row_count`` must keep describing the file that is actually on disk.
+    Dropping the payload without the second half would leave the manifest
+    claiming a checksum for bytes nobody wrote, which
+    ``test_manifest_checksums_match_the_committed_fixtures`` would (correctly)
+    fail on.
+    """
+    manifest = json.loads(files[contracts.MANIFEST_PATH])
+    for relative in appends:
+        files.pop(relative, None)
+        released = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        payload = json.loads(released)
+        for feed in manifest["feeds"].values():
+            entry = feed["tabs"].get(payload["tab"])
+            if entry is None or f"{contracts.FIXTURE_ROOT}/{entry['path']}" != relative:
+                continue
+            entry["sha256"] = _digest(released)
+            entry["row_count"] = len(payload.get("rows") or [])
+    files[contracts.MANIFEST_PATH] = render(manifest)
+
+
+def frozen_violations(
+    files: dict[str, str],
+    register: dict[str, dict[str, str]],
+    appends: dict[str, list[str]] | None = None,
 ) -> dict[str, list[str]]:
     """Version -> what would change under it, as lines. Empty is the good case.
 
@@ -325,6 +459,11 @@ def frozen_violations(
     """
     violations: dict[str, list[str]] = {}
     produced = produced_by_version(files)
+    # `appends` is keyed by repo-relative path; this loop works in
+    # `<version>/<file>`. Normalise once, here, rather than letting the two
+    # spellings meet — they already silently failed to match once, which showed
+    # up as the additive case still being refused.
+    additive = {relative.removeprefix(f"{contracts.FIXTURE_ROOT}/") for relative in (appends or {})}
 
     for version, produced_files in sorted(produced.items()):
         released = register.get(version)
@@ -333,6 +472,12 @@ def frozen_violations(
         for name, text in sorted(produced_files.items()):
             recorded = released.get(name)
             if recorded is not None and recorded == _digest(text):
+                continue
+            if f"{version}/{name}" in additive:
+                # An APPENDED column: additive by `docs/export-contract.md`, so it
+                # is not a rewrite to refuse. The released file is still left
+                # untouched — `main` drops it from what gets written — so nothing
+                # a consumer pinned to this version tests against moves.
                 continue
             violations.setdefault(version, []).append(f"{version}/{name} would change")
 
@@ -407,7 +552,13 @@ def main() -> int:
         print(exc)
         return 2
 
-    violations = frozen_violations(files, register)
+    appends = additive_appends(files, register)
+    # Judged BEFORE the freeze, on the full set the code produces. Freezing first
+    # would remove the appended tab from `files` and trip this function's OTHER
+    # check — "registered as released but the code no longer produces it" — which
+    # exists to catch a tab that was genuinely dropped, not one deliberately left
+    # at its released bytes.
+    violations = frozen_violations(files, register, appends)
     if args.republish and args.republish in violations:
         # Two gates, and the structural one is the load-bearing one: the CHANGELOG
         # line is an audit trail, not a constraint.
@@ -417,9 +568,22 @@ def main() -> int:
             return 2
         if _changelog_mentions_republishing(args.republish):
             violations.pop(args.republish, None)
+            # Rewrite the RELEASED bytes only. `republish_refusals` already
+            # compared narrowed payloads; narrowing what actually gets WRITTEN
+            # too is what stops a republish being the way an appended column
+            # reaches a released file — cleared of its violation, that file is no
+            # longer frozen, so without this the append rides in on the typo fix.
+            narrow_to_released(files, args.republish)
     if violations:
         print(_refuse(violations, args.republish))
         return 2
+
+    # A released fixture is frozen whether the change is additive or not: drop the
+    # appended-column payload so the bytes on disk, the sha in the register and
+    # the row_count in the manifest all stay exactly as released. Only the VERDICT
+    # on the difference changed — the file itself is still never rewritten.
+    if appends:
+        freeze_released_entries(files, appends)
 
     for relative, text in sorted(files.items()):
         version = contracts.version_of_fixture(relative)
@@ -440,6 +604,7 @@ def main() -> int:
             path.write_text(text, encoding="utf-8")
 
     if args.check:
+        _report_appends(appends)
         if stale:
             print("Contract fixtures are STALE:\n  " + "\n  ".join(stale))
             print(
@@ -460,6 +625,7 @@ def main() -> int:
         )
     else:
         print("Contract fixtures already up to date — nothing written.")
+    _report_appends(appends)
     return 0
 
 
