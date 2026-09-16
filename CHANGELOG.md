@@ -4,6 +4,40 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · A `0` in `total_revenue` meant "free work", and it shipped
+
+### Fixed: a resolved `0` is now ABSENT, not a zero-dollar job
+
+`jobs.total_revenue` landed reading `job.total` / `job.invoiceTotal` through
+`_first_present`, which treats `0` as a value. The commit called the divergence
+from Profit Wizard's `||` deliberate, on this contract's "blank is not zero"
+rule. The live tenant disproved it. Measured across 1256 rows of
+`tr-doorservpro`'s jobs tab: **no row was blank**, 45% of distinct jobs read
+exactly `0`, and **41% of COMPLETED jobs reported `$0`**.
+
+ServiceTitan does not send null here — it sends `0` for "no revenue recorded" —
+so reading it literally labelled four completed jobs in ten as free work. Profit
+Wizard's `(job.total || job.invoiceTotal)` makes the opposite choice, and `||`
+rather than `??` is the point: a `0` falls through and the field is omitted when
+nothing remains, which is why the direct baseline carries NULLs where hosted was
+writing zeros. The two paths disagreed on ~400 jobs and hosted held the harmful
+answer.
+
+The asymmetry is what settles it. A blank makes Profit Wizard REFUSE to compute a
+margin; a `0` makes it compute one against zero revenue, i.e. **-100%** — a
+confident wrong number on a customer's screen rather than a gap. And
+`blank_columns` cannot catch it: it fires only on a column empty on EVERY row, so
+an all-zero column sails past the one tripwire built for this class of bug.
+
+`_money_or_absent` is deliberately narrow and must stay so. A `0` cost and a `0`
+price elsewhere in this export are real facts; "blank is not zero" still holds
+everywhere it has not been overridden with live evidence.
+
+Accepted cost, stated rather than hidden: a genuine zero-dollar job (a warranty
+callback, a goodwill visit) is now indistinguishable from one with nothing
+recorded. This field cannot tell them apart in the first place, the direct path
+already makes that trade, and "I cannot tell you" beats "they worked for free".
+
 ## [Unreleased] · Wait as long as ServiceTitan asks
 
 ### Fixed: a 429 that says "try again in 50 seconds" was retried after 7

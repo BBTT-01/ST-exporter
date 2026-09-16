@@ -152,6 +152,47 @@ an Actions annotation. The baseline to check against: the direct pull has revenu
 on 446 of ~999 jobs, so a correct reading is a few hundred populated cells, not
 zero — and notably not all of them either.
 
+## ~~Jobs feed: does a `0` in `job.total` mean $0, or "not recorded"?~~ — MEASURED
+
+`src/st_exporter/denormalize.py`, `_TOTAL_REVENUE_KEYS`, `_money_or_absent`
+
+**"Not recorded", and the first cut of `total_revenue` got this wrong and
+shipped.** It read a resolved `0` as a real zero, on this contract's "blank is
+not zero" rule, and called the divergence from Profit Wizard's `||` deliberate.
+
+Measured on `tr-doorservpro` across 1256 rows of the live jobs tab:
+
+| | share |
+|---|---|
+| rows with a BLANK `total_revenue` | **0** |
+| distinct jobs reading exactly `0` | 45% |
+| **COMPLETED** jobs reading `$0` | **41%** |
+
+Non-zero values ranged `70.00`–`30,302.10`, so the field spelling is right and
+the column is genuinely populated. But ServiceTitan never sends null here — it
+sends `0` for "no revenue recorded" — so reading `0` literally labelled four
+completed jobs in ten as free work.
+
+Profit Wizard's `(job.total || job.invoiceTotal) ?? undefined` makes the opposite
+choice, and `||` rather than `??` is the whole point: a `0` falls through, and
+the field is omitted when nothing is left. That is why the direct baseline
+carries revenue on 446 of ~999 jobs as NULL rather than as zeros, and why the two
+paths disagreed on roughly 400 jobs with hosted holding the harmful answer.
+
+The asymmetry settles it: a blank makes Profit Wizard REFUSE to compute a margin,
+a `0` makes it compute one against zero revenue — **-100%** — and
+`blank_columns` cannot catch that, because it only fires on a column empty on
+EVERY row. An all-zero column passes straight through the tripwire.
+
+Accepted cost: a genuine zero-dollar job is now indistinguishable from one with
+nothing recorded. This field cannot tell them apart anyway, the direct path
+already makes that trade, and "I cannot tell you" beats "they worked for free".
+
+**Still open:** whether `reporting.jobCosts.TotalRevenue` is the better source.
+That tab only started working today (run 35159471697, 1563 rows) and its
+`TotalRevenue` is already in the frozen `JOB_COST_COLUMNS`, but nobody has
+measured how well it is populated. Do that before adopting it.
+
 ## Financial feed: how ServiceTitan marks a report as custom
 
 `src/st_exporter/feeds/reporting.py`, `_CUSTOM_BOOLEAN_FIELDS`, `_CUSTOM_KIND_FIELDS`

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from unittest.mock import patch
 
@@ -456,3 +457,90 @@ class TestItWaitsAsLongAsTheServerAsks:
             client.get("jpm", "jobs")
         assert slept == []
         assert "3600" in str(excinfo.value)
+
+
+class TestALongWaitSaysSoBeforeItStarts:
+    """A 429 the client honours can park a request for a minute and a half, and
+    until this existed it did so in complete silence.
+
+    Silence is indistinguishable from a hang: run 35159471697 on
+    `BBTT-01/tr-doorservpro` succeeded and wrote 1563 job-cost rows, but spent
+    22:51:34 to 22:58:44 emitting nothing at all while it waited its way through
+    a paginated report. The line has to come BEFORE the sleep — one printed
+    afterwards tells whoever was deciding whether to cancel exactly nothing.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _capture_client_logs(self, caplog):
+        """``st_exporter.logging_setup.configure_logging`` sets ``propagate =
+        False`` on this logger too; caplog needs it back on."""
+        log = logging.getLogger("st_cli")
+        previous = log.propagate
+        log.propagate = True
+        yield
+        log.propagate = previous
+
+    @respx.mock
+    def test_a_server_stated_wait_is_announced_with_its_length(
+        self, client, monkeypatch, caplog
+    ) -> None:
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        respx.get(url__regex=r".*/jpm/v2/tenant/.*").mock(
+            side_effect=[
+                httpx.Response(
+                    429,
+                    json={"title": "Rate limit is exceeded. Try again in 50 seconds."},
+                ),
+                httpx.Response(200, json={"data": [], "hasMore": False}),
+            ]
+        )
+        with caplog.at_level(logging.INFO, logger="st_cli.client"):
+            client.get("jpm", "jobs")
+
+        assert "50s" in caplog.text
+        assert "not a hang" in caplog.text.lower()
+
+    @respx.mock
+    def test_the_ordinary_one_second_backoff_stays_quiet(
+        self, client, monkeypatch, caplog
+    ) -> None:
+        """The blind curve is the ordinary noise of a busy endpoint. The pricebook
+        image pass alone can earn hundreds of those across its workers, and
+        narrating every one would bury the run log the line exists to make
+        readable."""
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        respx.get(url__regex=r".*/jpm/v2/tenant/.*").mock(
+            side_effect=[
+                httpx.Response(429, text="slow down"),
+                httpx.Response(200, json={"data": [], "hasMore": False}),
+            ]
+        )
+        with caplog.at_level(logging.INFO, logger="st_cli.client"):
+            client.get("jpm", "jobs")
+
+        assert caplog.text == ""
+
+    @respx.mock
+    def test_no_presigned_redirect_target_reaches_the_log(
+        self, client, monkeypatch, caplog
+    ) -> None:
+        """The line names the ServiceTitan resource, never the request's current
+        url: on an image fetch that url has been rebound to a blob address whose
+        query string is a credential."""
+        monkeypatch.setattr(time, "sleep", lambda s: None)
+        respx.get(url__regex=r".*/pricebook/v2/tenant/.*").mock(
+            return_value=httpx.Response(
+                302, headers={"Location": "https://blob.example.com/i.jpg?sig=SECRETSIG"}
+            )
+        )
+        respx.get("https://blob.example.com/i.jpg").mock(
+            side_effect=[
+                httpx.Response(429, json={"title": "Rate limit is exceeded. Try again in 30 seconds."}),
+                httpx.Response(200, content=b"\x89PNG\r\n\x1a\n", headers={"Content-Type": "image/png"}),
+            ]
+        )
+        with caplog.at_level(logging.INFO, logger="st_cli.client"):
+            client.get_file("pricebook", "images", params={"path": "x.jpg"})
+
+        assert "SECRETSIG" not in caplog.text
+        assert "30s" in caplog.text

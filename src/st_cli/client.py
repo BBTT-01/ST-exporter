@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -15,8 +16,28 @@ from st_cli.auth import TokenManager
 from st_cli.config import Settings
 from st_cli.exceptions import APIError, NotFoundError, RateLimitError, TransportError
 
+#: Where this module says "I am asleep on purpose".
+#:
+#: `st_cli` had no logger at all, which was fine while the longest a 429 could
+#: park a request was four seconds. It is not fine now that the client honours a
+#: server-stated `Retry-After`: a single request can sit silent for a minute and a
+#: half, and silence is indistinguishable from a hang to whoever is watching the
+#: Actions log. `st_exporter.logging_setup.configure_logging` gives this logger
+#: the same level and handler it gives `st_exporter`, so an exporter run shows
+#: these lines; a bare `st` CLI invocation configures no logging and is unchanged.
+logger = logging.getLogger("st_cli.client")
+
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.0  # seconds
+
+#: Only a rate-limit sleep at least this long earns a log line.
+#:
+#: The blind exponential curve (1s, 2s, 4s) is the ordinary noise of a busy
+#: endpoint and narrating it would bury the run log — the pricebook image pass
+#: alone can earn hundreds of those across its workers. A wait this long is
+#: always a server-STATED one, which is the only kind long enough for a human to
+#: mistake for a hang.
+_RATE_LIMIT_LOG_THRESHOLD = 5.0  # seconds
 
 #: The longest one 429 may park a request for, however long the server asks.
 #:
@@ -440,6 +461,24 @@ class ServiceTitanClient:
                         f"{method} {url} was rate-limited and the server asked for "
                         f"{wait:.0f}s, beyond the {_MAX_RATE_LIMIT_WAIT:.0f}s this client "
                         f"will wait on one request. Not waiting. Detail: {resp.text}"
+                    )
+                if wait >= _RATE_LIMIT_LOG_THRESHOLD:
+                    # Said BEFORE the sleep, not after: a line that appears once
+                    # the wait is over is no use to somebody deciding whether to
+                    # cancel a run that has printed nothing for five minutes.
+                    #
+                    # The ServiceTitan resource, never `url`: `url` is rebound to
+                    # the redirect target on an image fetch, and that is a
+                    # PRESIGNED blob address whose query string is a credential.
+                    logger.info(
+                        "rate-limited by ServiceTitan on %s %s — waiting %.0fs "
+                        "(%s; retry %d of %d). This is a throttle, not a hang.",
+                        method,
+                        self._url(module, resource),
+                        wait,
+                        "the server asked for this" if asked is not None else "no stated wait",
+                        retries,
+                        _MAX_RETRIES,
                     )
                 self._notify_rate_limited(wait)
                 time.sleep(wait)

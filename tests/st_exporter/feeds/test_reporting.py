@@ -8,6 +8,7 @@ exists to prevent.
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -960,3 +961,77 @@ class TestTheRateLimitBudgetForOneReport:
         }
         rows = fetch_report_rows(client, ReportRef("7", "42", "R"), parameters=[])
         assert rows == [{"JobNumber": "1"}, {"JobNumber": "2"}]
+
+
+class TestSevenSilentMinutesLookLikeAHang:
+    """A paginated report legitimately spends MINUTES parked on rate limits, and
+    until this existed it spent them mute.
+
+    Run 35159471697 on `BBTT-01/tr-doorservpro` succeeded — it wrote
+    `reporting.jobCosts=1563` — but it ran from 22:51:34 to 22:58:44 and emitted
+    not one line in between. A seven-minute throttle and a hung job are the same
+    thing to whoever is watching the Actions log, and only one of them is worth
+    cancelling. Nothing here changes what the pull DOES.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _capture_exporter_logs(self, caplog):
+        """``configure_logging`` sets ``propagate = False``; caplog needs it back."""
+        log = logging.getLogger("st_exporter")
+        previous = log.propagate
+        log.propagate = True
+        yield
+        log.propagate = previous
+
+    def _throttled_client(self, seconds: float, pages: int):
+        client = MagicMock()
+        client.on_rate_limited = None
+        served = {"page": 0}
+
+        def post(module, resource, json_body=None, params=None, idempotent=False):
+            served["page"] += 1
+            if served["page"] > 1 and client.on_rate_limited is not None:
+                # Stand in for the client's own sleep: it tells the governor how
+                # long it is about to wait, then the page eventually lands.
+                client.on_rate_limited(seconds)
+            return {
+                "fields": [{"name": "JobNumber"}],
+                "data": [["1"], ["2"]],
+                "hasMore": served["page"] < pages,
+            }
+
+        client.post.side_effect = post
+        return client
+
+    def test_every_page_is_announced_with_the_rows_so_far(self, caplog) -> None:
+        client = self._throttled_client(30.0, pages=3)
+        with caplog.at_level(logging.INFO, logger="st_exporter"):
+            rows = fetch_report_rows(client, ReportRef("7", "42", "Job Costing"), parameters=[])
+
+        assert len(rows) == 6
+        assert "fetching 'Job Costing' page 1" in caplog.text
+        assert "fetching 'Job Costing' page 3" in caplog.text
+        assert "6 total" in caplog.text
+
+    def test_a_wait_names_its_page_and_how_much_budget_is_left(self, caplog) -> None:
+        client = self._throttled_client(30.0, pages=2)
+        with caplog.at_level(logging.INFO, logger="st_exporter"):
+            fetch_report_rows(client, ReportRef("7", "42", "Job Costing"), parameters=[])
+
+        assert "page 2 is rate-limited" in caplog.text
+        assert "waiting 30s" in caplog.text
+        # The ceiling is what decides whether this pull will finish or be
+        # skipped, so the line that reports a wait reports it against that.
+        assert "30s of the 420s" in caplog.text
+
+    def test_the_governor_a_caller_already_had_still_hears_every_wait(self, caplog) -> None:
+        """Logging is added INSIDE the borrowed observer, so this pins that the
+        chain to the image pass's real rate limiter survived it."""
+        client = self._throttled_client(30.0, pages=2)
+        heard: list[float] = []
+        client.on_rate_limited = heard.append
+        with caplog.at_level(logging.INFO, logger="st_exporter"):
+            fetch_report_rows(client, ReportRef("7", "42", "R"), parameters=[])
+
+        assert heard == [30.0]
+        assert "page 2 is rate-limited" in caplog.text

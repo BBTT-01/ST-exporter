@@ -921,7 +921,70 @@ def test_total_revenue_prefers_total_over_invoice_total() -> None:
     assert result.rows[0]["total_revenue"] == 1250.50
 
 
-def test_a_zero_dollar_job_exports_zero_not_blank() -> None:
+def test_a_zero_total_is_treated_as_absent_not_as_free_work() -> None:
+    """The correction. `0` here means "no revenue recorded", not "$0".
+
+    The first cut of this column read `0` as a real zero, on the contract's
+    "blank is not zero" rule. The live tenant disproved it: across 1256 rows of
+    `tr-doorservpro`'s jobs tab NO row was blank, 45% of distinct jobs read
+    exactly 0, and 41% of COMPLETED jobs reported $0 — ServiceTitan sends 0
+    rather than null for "nothing recorded", so reading it literally labels four
+    jobs in ten as free work.
+
+    A blank makes Profit Wizard REFUSE to compute a margin; a 0 makes it compute
+    one against zero revenue, i.e. -100%. And the blank-column tripwire cannot
+    catch it, because it only fires on a column empty on EVERY row.
+    """
+    jobs = _cache({"id": 1, "jobStatus": "Completed", "total": 0})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["total_revenue"] is None
+
+
+def test_a_zero_total_falls_through_to_the_invoice_total() -> None:
+    """Mirrors the direct path's `||`: a 0 does not stop the search. Profit
+    Wizard's `(job.total || job.invoiceTotal)` makes exactly this choice, which
+    is why the direct baseline carries NULLs where hosted was writing zeros."""
+    jobs = _cache({"id": 1, "jobStatus": "Completed", "total": 0, "invoiceTotal": 500})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["total_revenue"] == 500
+
+
+def test_zero_on_both_spellings_is_blank_not_zero() -> None:
+    jobs = _cache({"id": 1, "jobStatus": "Completed", "total": 0, "invoiceTotal": 0})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["total_revenue"] is None
+
+
+def test_the_zero_rule_is_scoped_to_revenue_and_nothing_else() -> None:
+    """`_money_or_absent` is narrow on purpose. A 0 cost or a 0 price elsewhere
+    in this export is a real fact, and "blank is not zero" still holds
+    everywhere it has not been overridden with live evidence."""
+    from st_exporter.denormalize import _first_present, _money_or_absent
+
+    record = {"a": 0, "b": 7}
+    assert _first_present(record, keys=("a", "b")) == 0
+    assert _money_or_absent(record, keys=("a", "b")) == 7
+
+
+def test_only_a_numeric_zero_is_treated_as_absent() -> None:
+    """A string is handed on rather than judged — parsing is the consumer's job,
+    and `False` is not a price."""
+    from st_exporter.denormalize import _money_or_absent
+
+    assert _money_or_absent({"a": "0"}, keys=("a",)) == "0"
+    assert _money_or_absent({"a": False, "b": 12}, keys=("a", "b")) == 12
+
+
+def test_superseded_a_zero_dollar_job_exports_zero_not_blank() -> None:
     """Blank is not zero, and this is where the two part company with Profit
     Wizard's own expression.
 
@@ -936,7 +999,8 @@ def test_a_zero_dollar_job_exports_zero_not_blank() -> None:
 
     result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
 
-    assert result.rows[0]["total_revenue"] == 0
+    # SUPERSEDED by the live measurement above: this used to assert `== 0`.
+    assert result.rows[0]["total_revenue"] == 500
 
 
 def test_total_revenue_is_blank_when_servicetitan_records_none() -> None:
@@ -948,23 +1012,34 @@ def test_total_revenue_is_blank_when_servicetitan_records_none() -> None:
     assert result.rows[0]["total_revenue"] is None
 
 
-def test_zero_revenue_and_absent_revenue_format_to_different_cells() -> None:
-    """The distinction has to survive into the SHEET, not just the row dict —
-    `""` and `"0"` are what a consumer actually sees, and PW's `toNum` maps the
-    first to null and the second to 0."""
+def test_no_job_ever_reaches_the_sheet_carrying_a_zero_revenue_cell() -> None:
+    """The distinction that matters has to survive into the SHEET, not just the
+    row dict, because `""` and `"0"` are what a consumer actually sees and PW's
+    `toNum` maps the first to null and the second to a real 0.
+
+    This test used to assert the opposite — `["0", ""]` — and that assertion is
+    exactly what shipped 503 completed jobs to a live customer reading $0. A
+    zero-dollar cell is now never written at all: real money formats as itself,
+    and both "recorded as 0" and "not recorded" format blank, which is what makes
+    Profit Wizard refuse to compute a margin instead of computing -100%.
+    """
     from st_exporter.format import JOB_COLUMNS, build_job_grid
 
     jobs = _cache(
-        {"id": 1, "total": 0, "jobStatus": "Completed"},
-        {"id": 2, "jobStatus": "Scheduled"},
+        {"id": 1, "total": 1250.5, "jobStatus": "Completed"},
+        {"id": 2, "total": 0, "jobStatus": "Completed"},
+        {"id": 3, "jobStatus": "Scheduled"},
     )
     appointments = _cache(
         {"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"},
         {"id": 200, "jobId": 2, "start": "2026-09-03T09:00:00-05:00"},
+        {"id": 300, "jobId": 3, "start": "2026-09-03T09:00:00-05:00"},
     )
 
     result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
     grid = build_job_grid(result.rows)
     column = JOB_COLUMNS.index("total_revenue")
+    cells = [row[column] for row in grid[1:]]
 
-    assert [row[column] for row in grid[1:]] == ["0", ""]
+    assert cells == ["1250.5", "", ""]
+    assert "0" not in cells
