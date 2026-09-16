@@ -71,7 +71,14 @@ _EXCLUDED_JOB_STATUSES = {"canceled", "cancelled"}
 #: Where a JPM job record carries its completion instant, in priority order.
 #:
 #: ``completedOn`` is the documented spelling and is the one expected to match.
-#: It is well-evidenced rather than guessed: the sibling query parameter
+#: It is well-evidenced rather than guessed. Profit Wizard's own Direct path
+#: reads exactly this field in production for these two contractors —
+#: ``profitwizard/lib/crm/servicetitan.ts:852``,
+#: ``completed_date: job.completedOn ? ... : undefined`` — which is both the
+#: strongest evidence short of a recorded response and the thing that fills
+#: `completed_date` on the direct baseline this tab is compared against. The
+#: same precedent (a live shipped reader on the same tenants) is what resolved
+#: the customer-contacts question. Beyond that, the sibling query parameter
 #: ``completedOnOrAfter`` on ``GET /jpm/v2/tenant/{tenant}/jobs`` is CONFIRMED
 #: against the published ``tenant-jpm-v2`` OpenAPI description (see
 #: ``feeds/financial.JOB_COMPLETED_PARAM`` and ``KNOWN_UNVERIFIED.md``), a
