@@ -4,6 +4,52 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Two reports, one name: the job-cost tab can be unblocked
+
+### Fixed: `reporting.jobCosts` on a tenant with duplicate report names
+
+Run 35155266960 on `BBTT-01/tr-doorservpro` finally answered why this tab has
+never been written, and it was none of the assumed causes. The Reporting
+permission is fine and always was. The report NAME was wrong and was fixed in
+0.2.14 — confirmed working today. The `require_columns` guard everyone assumed
+was firing **has never run**. The actual cause:
+
+> `2 distinct reports are named 'Job Costing Summary Report' (category
+> operations/report 21131704, category operations/report 21639096). Refusing to
+> choose between them.`
+
+Both are in `operations`, neither carries a custom marker, and the exporter
+refuses to guess. That refusal is correct and is unchanged. What is added is two
+ways past it that are not guesses:
+
+- **Elimination by declared columns.** When one name matches several reports,
+  any candidate that does not declare `JOB_COST_COLUMNS` is dropped — it could
+  not have produced the tab in any case, since `require_columns` would refuse it
+  moments later. If exactly one survives, it is selected. This is elimination,
+  not scoring: it removes non-viable candidates, it never prefers one viable
+  candidate over another, and **two copies of one report both survive and still
+  refuse**.
+- **`EXPORTER_JOB_COST_REPORT_ID`**, a new workflow input and env setting. A
+  human's recorded decision about which report carries the money. Honoured
+  whatever the report is called and whether or not it looks custom — the guard
+  exists to stop the CODE choosing, not to overrule the operator — but it does
+  not skip the column checks, so a mistyped or stale id fails loudly rather than
+  writing an empty tab. An id the tenant does not have is its own refusal and
+  never falls back to name resolution, which could re-select the very report the
+  pin was added to avoid.
+
+Explicitly **not** added: any tie-break heuristic. Preferring the lower id, the
+higher id, or the better column score always returns a winner, and a wrong winner
+means a contractor's own report silently supplying their cost numbers — the same
+reasoning that rejects Profit Wizard's column-scoring fallback.
+
+Unset, everything behaves exactly as before.
+
+**This does not by itself unblock `tr-doorservpro`.** If both of its reports
+declare the frozen column set — likely, if one is a copy — somebody still has to
+say which is genuine, either by deleting/renaming the duplicate in ServiceTitan
+or by setting the pin.
+
 ## [Unreleased] · A real completion timestamp on the `jobs` tab
 
 ### Added: `jobs.completed_on`, appended (NOT a contract bump)

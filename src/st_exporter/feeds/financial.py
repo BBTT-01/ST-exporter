@@ -282,6 +282,7 @@ def fetch_job_costs(
     *,
     today: date,
     window_days: int = FINANCIAL_WINDOW_DAYS,
+    report_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Run the built-in Job Costing Summary report over the financial window.
 
@@ -289,7 +290,15 @@ def fetch_job_costs(
     partial or best-guess result, and never a result whose columns are not the
     ones ``financial.JOB_COST_COLUMNS`` names. See ``feeds/reporting.py``.
     """
-    ref = reporting.find_job_costing_summary(client)
+    # `JOB_COST_COLUMNS` is handed to the lookup as well as checked below. It is
+    # used there only to ELIMINATE candidates when one name matches more than one
+    # report — a report that does not declare these columns could not produce
+    # this tab anyway — never to prefer one viable report over another. See
+    # `reporting.capable_of`. `report_id`, when set, is a human's recorded choice
+    # and skips name resolution entirely; it does NOT skip the checks below.
+    ref = reporting.find_job_costing_summary(
+        client, required_columns=JOB_COST_COLUMNS, pinned_report_id=report_id or None
+    )
     # Replaying the report's metadata GET before POSTing its data is not
     # redundant: ServiceTitan answers the POST with
     # `Invalid report parameter: [From]` if the report was never described in

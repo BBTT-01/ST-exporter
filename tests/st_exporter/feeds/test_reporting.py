@@ -19,6 +19,7 @@ from st_exporter.feeds.reporting import (
     JOB_COSTING_SUMMARY_REPORT_NAMES,
     JobCostingReportAmbiguousError,
     JobCostingReportNotFoundError,
+    JobCostingReportPinNotFoundError,
     ReportColumnsMismatchError,
     ReportRateLimitedError,
     ReportRef,
@@ -28,6 +29,7 @@ from st_exporter.feeds.reporting import (
     find_job_costing_summary,
     require_columns,
 )
+from st_exporter.financial import JOB_COST_COLUMNS as _REQUIRED
 
 
 def _envelope(data, has_more=False):
@@ -660,3 +662,144 @@ class TestTheDiagnosticsWithAPluralNameSet:
         message = str(excinfo.value)
         assert "'Job Costing Summary' or 'Job Costing Summary Report'" in message
         assert "are custom reports, which are never used" in message
+
+
+class TestTwoReportsSharingOneName:
+    """`tr-doorservpro` has two built-in reports both named 'Job Costing Summary
+    Report' (run 35155266960: ids 21131704 and 21639096, both in `operations`,
+    neither marked custom), so the tab has been refused on every run.
+
+    Two ways out, and neither is a heuristic. Columns can ELIMINATE a candidate
+    that could not have produced the tab at all; a human can PIN the id. What is
+    still refused, and must stay refused, is choosing between two reports that
+    are both capable — two copies of one report look exactly like that.
+    """
+
+    def _two_named(self, fields_by_id):
+        client = _client(
+            [{"id": "operations", "name": "Operations"}],
+            {
+                "operations": [
+                    {"id": 21131704, "name": "Job Costing Summary Report"},
+                    {"id": 21639096, "name": "Job Costing Summary Report"},
+                ]
+            },
+        )
+        real_get = client.get.side_effect
+
+        def get(module, resource, params=None):
+            if resource.startswith("report-category/") and resource.count("/") == 3:
+                return {"fields": [{"name": n} for n in fields_by_id[resource.rsplit("/", 1)[-1]]]}
+            return real_get(module, resource, params)
+
+        client.get.side_effect = get
+        return client
+
+    def test_the_only_capable_report_is_selected(self) -> None:
+        """The impostor cannot produce the tab, so dropping it takes nothing away."""
+        client = self._two_named(
+            {
+                "21131704": ["JobNumber", "SomethingElse"],
+                "21639096": list(_REQUIRED),
+            }
+        )
+        ref = find_job_costing_summary(client, required_columns=_REQUIRED)
+        assert ref.report_id == "21639096"
+
+    def test_two_capable_reports_are_still_ambiguous(self) -> None:
+        """The case that must NOT be resolved. Two copies of one report both
+        declare the right columns, and preferring either is the silent-wrong-money
+        failure this module exists to prevent."""
+        client = self._two_named({"21131704": list(_REQUIRED), "21639096": list(_REQUIRED)})
+        with pytest.raises(JobCostingReportAmbiguousError) as excinfo:
+            find_job_costing_summary(client, required_columns=_REQUIRED)
+        assert "2 of them declare the columns" in str(excinfo.value)
+
+    def test_no_capable_report_is_still_ambiguous(self) -> None:
+        client = self._two_named({"21131704": ["Nope"], "21639096": ["AlsoNope"]})
+        with pytest.raises(JobCostingReportAmbiguousError) as excinfo:
+            find_job_costing_summary(client, required_columns=_REQUIRED)
+        assert "None of them declares" in str(excinfo.value)
+
+    def test_a_candidate_declaring_no_fields_makes_it_unresolvable(self) -> None:
+        """Absent metadata is "could not check", not "no columns". Counting it as
+        incapable would eliminate a report on missing evidence — and if that were
+        the real one, it would silently select the impostor."""
+        client = self._two_named({"21131704": [], "21639096": list(_REQUIRED)})
+        with pytest.raises(JobCostingReportAmbiguousError) as excinfo:
+            find_job_costing_summary(client, required_columns=_REQUIRED)
+        assert "could not be compared" in str(excinfo.value)
+
+    def test_without_required_columns_it_refuses_exactly_as_before(self) -> None:
+        """Elimination is opt-in. A caller that names no columns gets the old
+        behaviour, and no metadata request is made on its behalf."""
+        client = self._two_named({"21131704": list(_REQUIRED), "21639096": ["x"]})
+        with pytest.raises(JobCostingReportAmbiguousError):
+            find_job_costing_summary(client)
+
+    def test_the_refusal_names_both_ids_and_how_to_resolve_it(self) -> None:
+        client = self._two_named({"21131704": list(_REQUIRED), "21639096": list(_REQUIRED)})
+        with pytest.raises(JobCostingReportAmbiguousError) as excinfo:
+            find_job_costing_summary(client, required_columns=_REQUIRED)
+        message = str(excinfo.value)
+        assert "21131704" in message and "21639096" in message
+        assert "EXPORTER_JOB_COST_REPORT_ID" in message
+
+
+class TestThePinnedReportId:
+    def _tenant(self):
+        return _client(
+            [{"id": "operations", "name": "Operations"}],
+            {
+                "operations": [
+                    {"id": 21131704, "name": "Job Costing Summary Report"},
+                    {"id": 21639096, "name": "Job Costing Summary Report"},
+                ]
+            },
+        )
+
+    def test_a_pin_resolves_what_the_name_cannot(self) -> None:
+        ref = find_job_costing_summary(self._tenant(), pinned_report_id="21639096")
+        assert ref == ReportRef("operations", "21639096", "Job Costing Summary Report")
+
+    def test_a_pin_wins_over_name_resolution_entirely(self) -> None:
+        """Pinning a differently-named report selects it. The pin is the decision;
+        the names stop mattering once one exists."""
+        client = _client(
+            [{"id": "7", "name": "Accounting"}],
+            {
+                "7": [
+                    {"id": 42, "name": JOB_COSTING_SUMMARY_REPORT_NAME},
+                    {"id": 99, "name": "Some Other Report"},
+                ]
+            },
+        )
+        assert find_job_costing_summary(client, pinned_report_id="99").report_id == "99"
+
+    def test_a_pin_selects_a_report_marked_custom(self) -> None:
+        """A human who pins a custom report has decided that on purpose — the
+        guard exists to stop the CODE choosing one, not to overrule the operator.
+        The column checks in `fetch_job_costs` still apply to it."""
+        client = _client(
+            [{"id": "7", "name": "Accounting"}],
+            {"7": [{"id": 42, "name": "Contractor's Own", "isCustom": True}]},
+        )
+        assert find_job_costing_summary(client, pinned_report_id="42").report_id == "42"
+
+    def test_a_pin_the_tenant_does_not_have_is_refused_not_fallen_back_from(self) -> None:
+        """The important one. Falling back to the name would quietly undo the
+        decision and could re-select the very report the pin was added to avoid."""
+        with pytest.raises(JobCostingReportPinNotFoundError) as excinfo:
+            find_job_costing_summary(self._tenant(), pinned_report_id="404404")
+        message = str(excinfo.value)
+        assert "404404" in message
+        assert "EXPORTER_JOB_COST_REPORT_ID" in message
+
+    def test_surrounding_whitespace_in_the_pin_is_tolerated(self) -> None:
+        """It arrives through a workflow input and a shell env var."""
+        ref = find_job_costing_summary(self._tenant(), pinned_report_id="  21639096 ")
+        assert ref.report_id == "21639096"
+
+    def test_no_pin_is_the_unchanged_path(self) -> None:
+        with pytest.raises(JobCostingReportAmbiguousError):
+            find_job_costing_summary(self._tenant(), pinned_report_id=None)

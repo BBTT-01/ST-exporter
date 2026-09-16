@@ -123,6 +123,51 @@ columns. That check does not depend on any unverified spelling, and it is what
 turns "wrong report, blank money, reported as success" into a loud refusal.
 Confirm on a tenant that has custom reports.
 
+## ~~Financial feed: why `reporting.jobCosts` is absent on tr-doorservpro~~ — DIAGNOSED
+
+`src/st_exporter/feeds/reporting.py`; `src/st_exporter/config.py`,
+`job_cost_report_id`
+
+**Answered 2026-09-16 by run 35155266960, and it was none of the things it was
+assumed to be.** The chain, in the order each was eliminated:
+
+1. *Reporting permission* — fine. Never the problem. Enumeration reads 12
+   categories and 265 reports.
+2. *Report name* — was wrong, fixed in 0.2.14: this tenant carries "Job Costing
+   Summary Report", not "Job Costing Summary". Confirmed working.
+3. *`require_columns` refusing a mismatched report* — the assumed cause, and it
+   has never run. Resolution fails before it.
+4. **The actual cause: the tenant has TWO distinct reports with that exact
+   name** — ids `21131704` and `21639096`, both in category `operations`,
+   neither carrying any custom marker — and `find_builtin_report` refuses to
+   choose between them.
+
+The refusal is correct and stays. What is new is that there are now two ways
+past it that are not guesses, and a third that is and remains rejected:
+
+- **Elimination by declared columns** (`capable_of`). A candidate that does not
+  declare `JOB_COST_COLUMNS` could not produce the tab at all — `require_columns`
+  would refuse it moments later — so dropping it removes a non-viable candidate
+  rather than preferring one viable one. If exactly one survives it is selected.
+  **This does not resolve two copies of the same report**, which both declare the
+  same columns; that case still refuses, by design.
+- **An explicit pin** (`EXPORTER_JOB_COST_REPORT_ID`). A human's recorded
+  decision. Honoured whatever the report is named and whether or not it looks
+  custom, but it does NOT skip `require_columns`, so a mistyped or stale id fails
+  loudly instead of writing an empty tab. An id the tenant does not have is its
+  own refusal and never falls back to the name — falling back could re-select the
+  very report the pin was added to avoid.
+- **Rejected: any tie-break heuristic.** Lower id, higher id, best column score.
+  Each always returns a winner, and a wrong winner is a contractor's own report
+  silently supplying their cost numbers. This is the same reasoning the module
+  docstring uses to reject Profit Wizard's column-scoring fallback.
+
+**Still unknown, and needs a human:** which of `21131704` / `21639096` is the
+genuine built-in. Nobody has looked in the tenant's ServiceTitan UI. If both
+declare the frozen column set — likely, if one is a copy of the other — the
+exporter will keep refusing until somebody either deletes/renames the duplicate
+there or sets the pin here.
+
 ## Financial feed: the Reporting permission's portal name
 
 The ticket flags this too. `reporting/v2/...` needs a Reporting permission whose

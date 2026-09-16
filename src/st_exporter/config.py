@@ -134,6 +134,34 @@ class ExporterSettings(BaseSettings):
         default="", validation_alias="EXPORTER_PRICEBOOK_CATEGORY_IDS"
     )
 
+    # Which ServiceTitan report the `reporting.jobCosts` tab is built from, when
+    # the tenant's own report names cannot say. Blank (the default) resolves by
+    # name exactly as before; this is an escape hatch, not the normal path.
+    #
+    # It exists because of run 35155266960 on `BBTT-01/tr-doorservpro`, which
+    # found TWO distinct built-in reports both named "Job Costing Summary
+    # Report" — ids 21131704 and 21639096, both in the `operations` category,
+    # neither marked custom — and correctly refused to guess between them. No
+    # heuristic can tell those apart safely: preferring the lower id, the higher
+    # id, or the better column match is exactly the scoring `feeds/reporting.py`
+    # exists to reject, and getting it wrong means a contractor's own report
+    # silently supplying their cost numbers.
+    #
+    # So the choice is made by a HUMAN and recorded here. That keeps the guard's
+    # promise intact — the exporter still never picks a report on its own
+    # judgement; it is told which one. A pin is honoured whatever the report is
+    # called and whether or not it looks custom, but it does NOT skip the column
+    # checks: `require_columns` still runs against the report's metadata and the
+    # first page of its data, so a mistyped or stale id fails loudly rather than
+    # writing an empty tab. An id this tenant does not have is its own refusal
+    # and never falls back to the name, which could re-select the very report
+    # the pin was added to avoid.
+    #
+    # Not GOOGLE_-prefixed; see window_days. A string, not an int: ServiceTitan
+    # ids are identifiers, not quantities, and the rest of this codebase carries
+    # them as text.
+    job_cost_report_id: str = Field(default="", validation_alias="EXPORTER_JOB_COST_REPORT_ID")
+
     # What the caller workflow's `timeout-minutes` is set to. The exporter is
     # TOLD rather than left to guess, because the runner does not warn before it
     # SIGKILLs the job and a killed process writes no image ledger: every upload

@@ -45,6 +45,26 @@ on:
           Wizard reads, so this costs one request per job.
         type: number
         default: 500
+      job_cost_report_id:
+        description: >-
+          Which ServiceTitan report the `reporting.jobCosts` tab is built from.
+          Blank (the default) resolves it by NAME, which is what almost every
+          tenant should do.
+
+          Set it only when a tenant has more than one report sharing the built-in
+          report's name and the exporter has refused to choose between them — the
+          refusal in the run log names the candidate ids. `tr-doorservpro` has
+          two called "Job Costing Summary Report" (21131704 and 21639096).
+
+          It is a recorded HUMAN decision, not a hint: no heuristic can tell two
+          identically named reports apart safely, and picking the wrong one means
+          a contractor's own report silently supplying their cost numbers. A
+          pinned report is still checked for the columns the tab is built from,
+          so a mistyped or stale id fails loudly rather than writing an empty
+          tab, and an id the tenant does not have is refused rather than falling
+          back to the name.
+        type: string
+        default: ""
       contacts_route:
         description: >-
           Where the jobs feed reads customer phone/email from: `per-customer`
@@ -446,6 +466,7 @@ jobs:
           EXPORTER_PRICEBOOK_CATEGORY_IDS: ${{ inputs.pricebook_category_ids }}
           EXPORTER_FINANCIAL_WINDOW_DAYS: ${{ inputs.financial_window }}
           EXPORTER_FINANCIAL_MAX_JOBS: ${{ inputs.financial_max_jobs }}
+          EXPORTER_JOB_COST_REPORT_ID: ${{ inputs.job_cost_report_id }}
           EXPORTER_CONTACTS_ROUTE: ${{ inputs.contacts_route }}
           EXPORTER_CONTACTS_MAX_CUSTOMERS: ${{ inputs.contacts_max_customers }}
           # The exporter is told the runner's own deadline so the image pass can
