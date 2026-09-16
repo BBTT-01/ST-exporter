@@ -292,6 +292,8 @@ def run_export(
             # image client here directly, which the tests do.
             image_deadline=monotonic() + exporter_settings.image_budget_seconds,
             image_max_assets=exporter_settings.image_max_assets,
+            image_concurrency=exporter_settings.image_concurrency,
+            image_requests_per_second=exporter_settings.image_requests_per_second,
             dry_run=dry_run,
         )
     finally:
@@ -378,6 +380,8 @@ def run_images(
             image_client=image_client,
             image_deadline=deadline,
             image_max_assets=max_assets,
+            image_concurrency=exporter_settings.image_concurrency,
+            image_requests_per_second=exporter_settings.image_requests_per_second,
             run_at=datetime.now(timezone.utc).isoformat(),
             dry_run=False,
             catalogue_complete=catalogue_complete,
@@ -474,6 +478,8 @@ def _run(
     # may leave it unset; `run_export` always sets one.
     image_deadline: float | None = None,
     image_max_assets: int = NO_ASSET_CAP,
+    image_concurrency: int | None = None,
+    image_requests_per_second: float | None = None,
     dry_run: bool,
 ) -> ExportSummary:
     now = datetime.now(timezone.utc)
@@ -675,6 +681,8 @@ def _run(
             image_client=image_client,
             image_deadline=image_deadline,
             image_max_assets=image_max_assets,
+            image_concurrency=image_concurrency,
+            image_requests_per_second=image_requests_per_second,
             run_at=run_at,
             dry_run=dry_run,
             # An item tab that did not produce a grid — failed, or refused with a
@@ -1403,6 +1411,8 @@ def _upload_pricebook_images(
     image_client: TrueQuoteImageClient | None,
     image_deadline: float | None,
     image_max_assets: int = NO_ASSET_CAP,
+    image_concurrency: int | None = None,
+    image_requests_per_second: float | None = None,
     run_at: str,
     dry_run: bool,
     catalogue_complete: bool = True,
@@ -1429,10 +1439,19 @@ def _upload_pricebook_images(
     than a SIGKILL. A pass that runs out of budget is ``stopped``, which already
     vetoes the prune for exactly the right reason: it did not see the catalogue.
 
-    ``image_max_assets`` is the second, independent bound — how many assets this
-    run may FETCH (``EXPORTER_IMAGE_MAX_ASSETS``, 0 = no cap). It sets its own
-    ``stopped`` reason, so the run's output says which dial to turn, and it
+    ``image_max_assets`` is the second, independent bound — how many DOWNLOADS
+    this run may make (``EXPORTER_IMAGE_MAX_ASSETS``, 0 = no cap). It sets its
+    own ``stopped`` reason, so the run's output says which dial to turn, and it
     vetoes the prune for the same reason the deadline does.
+
+    ``image_concurrency`` and ``image_requests_per_second`` are the two dials
+    that decide how long a first sync takes: how many assets are in flight, and
+    the ceiling the pass holds itself to against each service. Both default to
+    the exporter's own conservative numbers when the caller names none.
+
+    The LEDGER FLUSH is not a parameter here on purpose. The pass flushes on its
+    own timer (``LEDGER_FLUSH_SECONDS``) so a killed process loses at most that
+    much, and the ``finally`` below is the backstop, not the only write.
     """
     if image_client is None or dry_run:
         return None
@@ -1448,6 +1467,8 @@ def _upload_pricebook_images(
             now=run_at,
             deadline=image_deadline,
             max_assets=image_max_assets,
+            concurrency=image_concurrency,
+            requests_per_second=image_requests_per_second,
         )
         # Only prune on a pass that actually saw the whole catalogue — a run
         # stopped by a 403, a rate limit or a failed download has "not looked

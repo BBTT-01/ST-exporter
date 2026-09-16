@@ -17,7 +17,12 @@ from st_exporter.feeds.contacts import (
     ROUTES,
 )
 from st_exporter.feeds.financial import DEFAULT_MAX_TIMESHEET_JOBS
-from st_exporter.images.upload import NO_ASSET_CAP
+from st_exporter.images.upload import (
+    DEFAULT_IMAGE_CONCURRENCY,
+    DEFAULT_REQUESTS_PER_SECOND,
+    MAX_IMAGE_CONCURRENCY,
+    NO_ASSET_CAP,
+)
 from st_exporter.window import FINANCIAL_WINDOW_DAYS
 
 # The reusable workflow's own default `job_timeout_minutes`, repeated here so a
@@ -161,6 +166,39 @@ class ExporterSettings(BaseSettings):
         default=NO_ASSET_CAP,
         ge=0,
         validation_alias="EXPORTER_IMAGE_MAX_ASSETS",
+    )
+
+    # How many pricebook images ONE image run fetches-and-uploads at once.
+    #
+    # The image pass is ~100% network wait, so this is the dial that decides
+    # whether a first sync of a 16,000-asset tenant takes twenty hours or two.
+    # The default is deliberately modest rather than maximal — see
+    # `images/upload.DEFAULT_IMAGE_CONCURRENCY` for the memory, throughput and
+    # rate arithmetic — and it is CLAMPED rather than rejected at the far end,
+    # because this is a performance dial on a side lane and a silly number must
+    # slow a tenant's images down, never fail their export.
+    # Not GOOGLE_-prefixed; see window_days.
+    image_concurrency: int = Field(
+        default=DEFAULT_IMAGE_CONCURRENCY,
+        ge=1,
+        le=MAX_IMAGE_CONCURRENCY,
+        validation_alias="EXPORTER_IMAGE_CONCURRENCY",
+    )
+
+    # The client-side ceiling, in requests per second, that the image pass holds
+    # ITSELF to — applied separately to ServiceTitan downloads and to TrueQuote
+    # uploads. Nothing in this codebase enforced a rate before; what existed was
+    # a per-request retry backoff, which under concurrency synchronises into
+    # waves rather than converging (`images/pacing.py`).
+    #
+    # Lower it for a tenant whose ServiceTitan instance complains. Raising it
+    # past TrueQuote's documented 8.33/s has no effect on the upload side: that
+    # limit is theirs, and a 429 from them ends the pass.
+    image_requests_per_second: float = Field(
+        default=DEFAULT_REQUESTS_PER_SECOND,
+        gt=0,
+        le=100.0,
+        validation_alias="EXPORTER_IMAGE_REQUESTS_PER_SECOND",
     )
 
     @property

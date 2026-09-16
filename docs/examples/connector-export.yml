@@ -336,6 +336,27 @@ jobs:
       # Do not leave a cap set and forget it: the pass still converges (each run
       # starts on the assets the last one missed), but a catalogue that grows
       # faster than the cap sweeps never finishes.
+      #
+      # OPTIONAL, and left unset here on purpose: the defaults are right.
+      #
+      #   image_concurrency: 8              # how many images are in flight
+      #   image_requests_per_second: 6      # the ceiling per service
+      #
+      # The pass fetches and uploads several images at once and downloads each
+      # DISTINCT picture only once however many items share it, which is what
+      # makes a first sync of a large catalogue finish at all. Raise
+      # `image_concurrency` (to at most 32) only for a tenant whose first sync
+      # is still not converging with a large `job_timeout_minutes`; lower
+      # `image_requests_per_second` if the run starts reporting
+      # `images_rate_limited=` above zero.
+      #
+      # THE ONE-OFF ONBOARDING BACKFILL IS THIS JOB, RUN BY HAND. There is no
+      # separate script and there should not be: the ServiceTitan credentials
+      # live in this repository and nowhere else. Dispatch this workflow with
+      # `feed: images`, leave `image_max_assets` at 0, and raise
+      # `job_timeout_minutes` (GitHub allows up to 360). The pass flushes its
+      # ledger every minute, so if the job is killed the next one resumes
+      # within a minute of where it stopped rather than starting again.
     secrets:
       ST_CLIENT_ID: ${{ secrets.SERVICETITAN_CLIENT_ID }}
       ST_CLIENT_SECRET: ${{ secrets.SERVICETITAN_CLIENT_SECRET }}

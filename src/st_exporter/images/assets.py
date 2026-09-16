@@ -192,6 +192,26 @@ def sniff_content_type(payload: bytes) -> ContentType | None:
 # format is this", stays exactly as narrow as TrueQuote's, and must keep
 # answering it. This answers a different question — "is this a picture of
 # anything" — and its rejections are counted under their own name.
+#
+# KNOWN INSUFFICIENT, unchanged on purpose. Two things are now established that
+# were not when this number was chosen:
+#
+# 1. "the smallest real pricebook assets seen are 2-4 KiB" above is an
+#    ASSUMPTION, not a measurement. It was written alongside this constant and
+#    no live pricebook asset has ever been sized — the only payload anyone has
+#    measured is the 246-byte placeholder. `images/upload.py` now reports
+#    min/median/max over every upload, which is what will settle it.
+# 2. A BLANK placeholder can clear this floor easily. Measured 2026-09-16
+#    against ServiceTitan's web-app image proxy: `?size=1200&default=…` answers
+#    200 `image/webp` with 2,798 bytes of completely white 1200x1200 image.
+#    Its size scales with `size=`, so no CONSTANT can be both above every
+#    placeholder and below every photograph.
+#
+# The floor stays because it is the only thing standing between a contractor and
+# a catalogue of 246-byte grey squares, and because the replacement must be set
+# from evidence rather than guessed — see `image_dimensions` and
+# `BLANK_DENSITY_BYTES_PER_PIXEL` at the foot of this module, which MEASURE the
+# better signal without yet acting on it.
 MIN_PLAUSIBLE_IMAGE_BYTES = 1024
 
 
@@ -368,3 +388,152 @@ def describe_rejected_payload(payload: bytes) -> str:
         f"hex={payload_hex_prefix(payload)} "
         f"ascii={payload_ascii_preview(payload)!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# HOW BIG IS THIS PICTURE, AND IS IT A PICTURE OF ANYTHING?
+#
+# `MIN_PLAUSIBLE_IMAGE_BYTES` is a FIXED byte floor, and a fixed byte floor
+# cannot answer either question. Measured on 2026-09-16 against ServiceTitan's
+# web-app image proxy:
+#
+#     GET .../Image/<path>                                  -> 404, 272 bytes
+#     GET .../Image/<path>?size=1200&default=Default%2F1.png -> 200, image/webp,
+#                                                               2798 bytes
+#
+# The 2,798-byte answer is a COMPLETELY BLANK WHITE 1200x1200 image. It clears
+# the 1 KiB floor with room to spare, and the placeholder's size scales with the
+# `size=` parameter, so no constant can be both above every placeholder and
+# below every photograph. (We call the AUTHENTICATED endpoint, not that proxy —
+# see the module docstring in `images/upload.py` — so it is not known that this
+# exact body ever reaches us. What IS known is that the floor could not stop it.)
+#
+# The signal that does scale is DENSITY: compressed bytes per pixel. A blank
+# 1200x1200 WebP is 0.0019 bytes/pixel; a photograph, however aggressively
+# compressed, is one to two orders of magnitude denser. Density needs the
+# DIMENSIONS, and the dimensions are in the file header — no decoding, no
+# dependency, no allocation beyond the first few dozen bytes.
+#
+# Everything below is INFORMATION ONLY, deliberately. It changes nothing about
+# what is accepted: the byte sniff is unchanged and the floor is unchanged. The
+# reason is order of operations — nobody has yet measured a single real
+# pricebook asset from this tenant, so there is no evidence from which to set a
+# rejection threshold, and a rule guessed today could silently drop real images.
+# What these functions do is produce that evidence, on the next run, per upload.
+# ---------------------------------------------------------------------------
+
+# Below this many compressed bytes per pixel, a payload is almost certainly a
+# flat fill rather than a photograph. Reported, never enforced.
+#
+# 0.01 sits ~5x above the measured blank (0.0019) and ~5x below the least dense
+# real JPEG one would expect (~0.05 at low quality). It is a WIDE gap on purpose
+# because it decides a log line, not an upload: being wrong here costs a
+# misleading count, and being wrong in a rejection rule would cost a contractor
+# their catalogue.
+BLANK_DENSITY_BYTES_PER_PIXEL = 0.01
+
+
+def image_dimensions(payload: bytes) -> tuple[int, int] | None:
+    """``(width, height)`` read from the file HEADER, or None.
+
+    Header parsing only — no decode, no image library, no pixel ever touched.
+    Covers exactly the three formats ``sniff_content_type`` accepts, because
+    anything else is refused before it gets here. Returns None whenever it is
+    not certain, which is the harmless direction: an unknown size means no
+    density is reported, never a wrong one.
+    """
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        # IHDR is mandatory and first: 8 signature + 4 length + 4 type, then
+        # two big-endian uint32s.
+        if len(payload) < 24 or payload[12:16] != b"IHDR":
+            return None
+        return (
+            int.from_bytes(payload[16:20], "big"),
+            int.from_bytes(payload[20:24], "big"),
+        )
+    if payload.startswith(b"\xff\xd8\xff"):
+        return _jpeg_dimensions(payload)
+    if len(payload) >= 12 and payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
+        return _webp_dimensions(payload)
+    return None
+
+
+def _jpeg_dimensions(payload: bytes) -> tuple[int, int] | None:
+    """Walk JPEG segment headers to the first SOF marker.
+
+    Bounded by the payload itself and by a hard segment count: a malformed or
+    hostile file must cost a few dozen iterations, never a scan of 8 MiB.
+    """
+    index = 2
+    for _ in range(64):
+        if index + 9 > len(payload) or payload[index] != 0xFF:
+            return None
+        marker = payload[index + 1]
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            index += 2
+            continue
+        length = int.from_bytes(payload[index + 2 : index + 4], "big")
+        if length < 2:
+            return None
+        # SOF0..SOF15, excluding the four that are not frame headers.
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            height = int.from_bytes(payload[index + 5 : index + 7], "big")
+            width = int.from_bytes(payload[index + 7 : index + 9], "big")
+            return (width, height)
+        index += 2 + length
+    return None
+
+
+def _webp_dimensions(payload: bytes) -> tuple[int, int] | None:
+    """VP8, VP8L and VP8X, the three WebP chunk layouts."""
+    if len(payload) < 30:
+        return None
+    chunk = payload[12:16]
+    if chunk == b"VP8X":
+        # 24-bit little-endian, stored as (value - 1).
+        width = int.from_bytes(payload[24:27], "little") + 1
+        height = int.from_bytes(payload[27:30], "little") + 1
+        return (width, height)
+    if chunk == b"VP8L":
+        bits = int.from_bytes(payload[21:25], "little")
+        return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+    if chunk == b"VP8 ":
+        if payload[23:26] != b"\x9d\x01\x2a":
+            return None
+        return (
+            int.from_bytes(payload[26:28], "little") & 0x3FFF,
+            int.from_bytes(payload[28:30], "little") & 0x3FFF,
+        )
+    return None
+
+
+def describe_image_size(payload: bytes) -> str:
+    """``bytes=2798 (2.7K) 1200x1200 density=0.0019/px SUSPECTED-BLANK``.
+
+    One string carrying every fact needed to answer "is ServiceTitan serving us
+    photographs, thumbnails, or blanks", for a log line. ``SUSPECTED-BLANK`` is
+    a WARNING WORD, not a decision: the payload is uploaded either way.
+    """
+    size = len(payload)
+    dimensions = image_dimensions(payload)
+    if dimensions is None or dimensions[0] <= 0 or dimensions[1] <= 0:
+        return f"bytes={size} dimensions=unknown density=unknown"
+    width, height = dimensions
+    density = size / (width * height)
+    verdict = " SUSPECTED-BLANK" if density < BLANK_DENSITY_BYTES_PER_PIXEL else ""
+    return f"bytes={size} {width}x{height} density={density:.4f}/px{verdict}"
+
+
+def looks_blank(payload: bytes) -> bool:
+    """True when this payload's byte DENSITY says it is a flat fill.
+
+    Reported by the image pass under its own counter and never acted on — see
+    the note above this section on why a rejection rule is not being guessed
+    before a single real asset has been measured. Unknown dimensions answer
+    False: no evidence is not evidence.
+    """
+    dimensions = image_dimensions(payload)
+    if dimensions is None or dimensions[0] <= 0 or dimensions[1] <= 0:
+        return False
+    width, height = dimensions
+    return len(payload) / (width * height) < BLANK_DENSITY_BYTES_PER_PIXEL

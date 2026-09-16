@@ -6,6 +6,11 @@ import pydantic
 import pytest
 
 from st_exporter.config import ExporterSettings
+from st_exporter.images.upload import (
+    DEFAULT_IMAGE_CONCURRENCY,
+    DEFAULT_REQUESTS_PER_SECOND,
+    MAX_IMAGE_CONCURRENCY,
+)
 
 _REQUIRED_ENV = {
     "GOOGLE_SERVICE_ACCOUNT_JSON": "{}",
@@ -152,5 +157,55 @@ class TestThePerRunImageAssetCap:
 
     def test_a_negative_cap_is_refused(self, monkeypatch) -> None:
         _set_env(monkeypatch, EXPORTER_IMAGE_MAX_ASSETS="-1")
+        with pytest.raises(pydantic.ValidationError):
+            ExporterSettings()  # type: ignore[call-arg]
+
+
+class TestTheImageConcurrencyDials:
+    """The two numbers that decide whether a first sync takes hours or a day.
+
+    One bounds how much is IN FLIGHT (memory, and the speed-up); the other is a
+    ceiling on requests per second, which is a different thing entirely — see
+    `st_exporter/images/pacing.py`.
+    """
+
+    def test_concurrency_defaults_to_the_exporters_own_number(self, monkeypatch) -> None:
+        monkeypatch.delenv("EXPORTER_IMAGE_CONCURRENCY", raising=False)
+        _set_env(monkeypatch)
+        assert ExporterSettings().image_concurrency == DEFAULT_IMAGE_CONCURRENCY  # type: ignore[call-arg]
+
+    def test_concurrency_is_read_from_the_environment(self, monkeypatch) -> None:
+        _set_env(monkeypatch, EXPORTER_IMAGE_CONCURRENCY="16")
+        assert ExporterSettings().image_concurrency == 16  # type: ignore[call-arg]
+
+    def test_concurrency_of_zero_is_refused_rather_than_meaning_unlimited(
+        self, monkeypatch
+    ) -> None:
+        """Unlike the asset cap, 0 is not a sentinel here — it would mean "no
+        workers", which is the bug rather than a configuration of it."""
+        _set_env(monkeypatch, EXPORTER_IMAGE_CONCURRENCY="0")
+        with pytest.raises(pydantic.ValidationError):
+            ExporterSettings()  # type: ignore[call-arg]
+
+    def test_an_absurd_concurrency_is_refused_at_the_config_boundary(self, monkeypatch) -> None:
+        """256 x 8 MiB is 2 GiB of image bytes resident."""
+        _set_env(monkeypatch, EXPORTER_IMAGE_CONCURRENCY=str(MAX_IMAGE_CONCURRENCY + 1))
+        with pytest.raises(pydantic.ValidationError):
+            ExporterSettings()  # type: ignore[call-arg]
+
+    def test_the_rate_ceiling_defaults_conservatively(self, monkeypatch) -> None:
+        monkeypatch.delenv("EXPORTER_IMAGE_REQUESTS_PER_SECOND", raising=False)
+        _set_env(monkeypatch)
+        settings = ExporterSettings()  # type: ignore[call-arg]
+        assert settings.image_requests_per_second == DEFAULT_REQUESTS_PER_SECOND
+
+    def test_the_rate_ceiling_is_read_from_the_environment(self, monkeypatch) -> None:
+        _set_env(monkeypatch, EXPORTER_IMAGE_REQUESTS_PER_SECOND="2.5")
+        assert ExporterSettings().image_requests_per_second == 2.5  # type: ignore[call-arg]
+
+    def test_a_rate_of_zero_is_refused(self, monkeypatch) -> None:
+        """0 would disable the governor, and the governor is the thing that
+        stops a concurrent pass discovering limits by collecting 429s."""
+        _set_env(monkeypatch, EXPORTER_IMAGE_REQUESTS_PER_SECOND="0")
         with pytest.raises(pydantic.ValidationError):
             ExporterSettings()  # type: ignore[call-arg]

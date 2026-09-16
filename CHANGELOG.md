@@ -4,7 +4,105 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] · Conditional image fetches, and a per-run asset cap
+## [Unreleased] · A one-off image backfill that finishes
+
+### Fixed: the same picture was downloaded once per ITEM that used it
+
+`upload_pricebook_images` iterated per item-asset, and the download is keyed by
+URL. Run 35145303072 on `BBTT-01/tr-doorservpro` reported `fetched=5 uploaded=5`
+— and items 2141068, 2141069, 2141070, 2141071 and 2141078 all named ONE asset
+GUID. It fetched the same photograph five times.
+
+The two halves are keyed differently and are now treated so: each distinct
+`source_url` is fetched **once per run** and hashed once, and the bytes are
+fanned out to every item that references it. The upload stays per item, because
+TrueQuote's route takes one `external_item_id` per POST, hardcodes `is_primary`
+and has no batch endpoint.
+
+Ledger semantics are unchanged in shape. `asset_ref` is still
+`{external_item_id}:{identity}` and `idempotency_key` still hashes the item, the
+identity, the url and the payload — both per ITEM — so five items sharing one
+picture still hold five rows, five keys and five `seen_keys` entries. That is
+what keeps `ImageLedger.keep` honest: a member whose key never reached
+`seen_keys` because somebody else made its download would be pruned out and
+re-uploaded for ever.
+
+A shared image is fetched **conditionally only when every member agrees** on the
+stored validators. One member with none — because it has never been delivered —
+means an unconditional GET, since a 304 carries no bytes and would starve it.
+
+`fetched` now counts DOWNLOADS rather than item-assets, and so does
+`image_max_assets`. The cap bounds the expensive half: run 35145303072's cap of
+5 bought one picture; the same cap now buys five different ones.
+
+### Added: bounded concurrency, and a REAL rate limiter behind it
+
+The pass is ~100% network wait, so it now runs on a bounded pool
+(`EXPORTER_IMAGE_CONCURRENCY` / `image_concurrency`, default 8, max 32). A
+payload exists only inside a running task, so the worst-case resident set is
+`concurrency x 8 MiB`; the dispatcher is held behind a semaphore so submitted
+work cannot run away from completed work.
+
+**The deadline, the cap and the least-recently-verified order are still decided
+by one thread, in one loop, before a group is handed to a worker.** That is what
+makes a bounded run deterministic when downloads finish out of order: which
+assets it reaches is fixed by dispatch order, not by which response came back
+first. A dispatcher stop ("start nothing more") is deliberately distinct from a
+worker abort ("the receiver is refusing work") — a cap of 2 that paid for 2
+downloads delivers 2.
+
+There was no rate limiter in this codebase. What existed — and still exists,
+unchanged — is a per-request retry backoff in `st_cli/client.py`. That is not a
+governor: under concurrency N workers back off on their own clocks, wake
+together and hit the endpoint again as a wave. `images/pacing.py` adds a shared
+token bucket per service (`EXPORTER_IMAGE_REQUESTS_PER_SECOND`, default 6/s;
+TrueQuote's side clamped to their documented 5,000/10min = 8.33/s), and the
+reactive backoff now **cooperates** with it: a 429 anywhere penalises the shared
+limiter, so every worker is held back rather than only the one that earned it.
+`TokenManager` is now thread-safe, so eight workers meeting one expired token
+issue one refresh rather than eight.
+
+### Added: mid-pass ledger flushes, so a killed process resumes within a minute
+
+The ledger is a Google Sheet tab and `flush` rewrites the whole grid, so it can
+never be written per asset. It is now written on a timer (60s) from the
+dispatcher thread while it holds the pass's lock, so every flush is a consistent
+snapshot. A killed process loses at most a minute of delivered-upload knowledge
+— bytes re-sent, never correctness — instead of the entire run.
+
+### Added: progress, uploaded item ids, and the SIZE of what we upload
+
+A multi-hour run prints a progress line every 30s (processed / total / uploaded
+/ fetched / rate / ETA). A run with a cap set — a proving run, whose whole
+purpose is "go and look at these" — now names every SUCCESS with its item id and
+byte size, where it previously named only failures.
+
+The summary reports `bytes[min/median/max/total]` over everything uploaded, plus
+`item_assets`, `distinct_assets` and `dedupe=Nx`. Nobody has ever measured a
+real pricebook asset from a live tenant; `MIN_PLAUSIBLE_IMAGE_BYTES`'s "real
+assets run 2-4 KiB" is an assumption written alongside the floor, not a
+measurement. These numbers settle it on the next run.
+
+### Known, unfixed: the 1 KiB floor cannot catch a blank placeholder
+
+Measured 2026-09-16 against ServiceTitan's web-app image proxy: a missing asset
+requested with `?size=1200&default=Default%2F1.png` answers **200 image/webp,
+2,798 bytes**, and the bytes are a completely blank white 1200x1200 image. It
+clears the 1 KiB floor, and the placeholder's size scales with `size=`, so no
+fixed byte threshold can work.
+
+`assets.image_dimensions` now reads width and height from the file header
+(PNG/JPEG/WebP, no decode, no dependency) and the pass reports compressed BYTES
+PER PIXEL. The measured blank is 0.0019/px; a photograph is one to two orders of
+magnitude denser. Uploads below `BLANK_DENSITY_BYTES_PER_PIXEL` are counted as
+`images_suspected_blank` and **still uploaded**: no real asset has been measured,
+so there is no evidence from which to set a rejection threshold, and a rule
+guessed today could silently drop real images. The count is how that evidence
+gets collected. Note the scope: we call the AUTHENTICATED
+`pricebook/v2/tenant/{id}/images` endpoint and never that proxy, and we send no
+`default=`, so it is NOT known that this body ever reaches us.
+
+## [Previously unreleased] · Conditional image fetches, and a per-run asset cap
 
 ### Changed: the weekly full re-download of every image is now a conditional request
 

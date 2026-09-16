@@ -396,7 +396,7 @@ class TestServiceTitanUnreachable:
             side_effect=httpx.ReadTimeout("servicetitan never answered")
         )
         respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=PNG))
-        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        uploads = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
 
         import st_cli.client as client_module
 
@@ -406,9 +406,19 @@ class TestServiceTitanUnreachable:
         assert summary.stopped is not None
         assert summary.complete is False
         # The second storage asset was never even attempted: one retry budget,
-        # not one per asset.
+        # not one per asset. (The two STORAGE_ITEMs share a url, so they are one
+        # DOWNLOAD — which is the same guarantee, now enforced twice over.)
         assert images.call_count == 4
-        assert summary.uploaded == 0
+        # NOTHING from the unreachable endpoint reached TrueQuote, which is the
+        # promise. The public asset may or may not have completed: it was
+        # already in flight when the stop was raised, and `stopped` means "start
+        # nothing more", never "throw away a download already paid for". Under
+        # the old serial pass it happened to be strictly after, which made
+        # `uploaded == 0` true by accident of ordering rather than by design.
+        assert [call.request.url.params["source_url"] for call in uploads.calls] in (
+            [],
+            [PUBLIC_URL],
+        )
 
     @respx.mock
     def test_a_broken_public_link_still_only_costs_that_one_asset(
@@ -1547,3 +1557,134 @@ class TestBlankPlaceholdersAreRefusedUnderTheirOwnName:
         """The floor is a separate rule. A tiny PNG is still a PNG."""
         assert sniff_content_type(b"\x89PNG\r\n\x1a\n") == "image/png"
         assert is_placeholder_image(b"\x89PNG\r\n\x1a\n")
+
+
+# ---------------------------------------------------------------------------
+# WHAT SIZE ARE THESE IMAGES, ACTUALLY?
+#
+# Nobody has ever confirmed that what ServiceTitan serves this exporter is a
+# usable photograph rather than a thumbnail, and it cannot be checked by hand:
+# the assets need the authenticated endpoint, whose credentials live only in a
+# connector repo. `MIN_PLAUSIBLE_IMAGE_BYTES`'s "real pricebook assets run
+# 2-4 KiB" is an ASSUMPTION written alongside the floor, not a measurement —
+# the only payload anyone has sized is the 246-byte placeholder.
+#
+# So the run measures it and says so. A median in the low single-digit KB means
+# thumbnails; a median in the hundreds means photographs. These tests pin that
+# the numbers reach the log rather than staying inside the pass.
+# ---------------------------------------------------------------------------
+
+
+class TestTheRunReportsTheSizeOfWhatItUploaded:
+    @staticmethod
+    def _png(size: int) -> bytes:
+        head = b"\x89PNG\r\n\x1a\n"
+        return head + b"\x00" * (size - len(head))
+
+    @respx.mock
+    def test_min_median_max_and_total_are_on_the_summary_line(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        sizes = {1: 2048, 2: 40960, 3: 400_000}
+        for item_id, size in sizes.items():
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=self._png(size))
+            )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [_item(i) for i in sizes])
+
+        assert summary.uploaded == 3
+        assert sorted(summary.upload_sizes) == [2048, 40960, 400_000]
+        line = summary.as_log_fields()
+        assert "bytes[min=2.0K median=40K max=391K total=433K]" in line
+        print("\nIMAGE SIZE LINE:", line)
+
+    def test_an_upload_free_run_says_so_rather_than_reporting_a_zero(self) -> None:
+        """`min=0` would read as "we uploaded a zero-byte image"."""
+        assert ImageUploadSummary().bytes_field == "min=- median=- max=- total=0"
+
+    @respx.mock
+    def test_a_capped_run_names_every_successful_upload_with_its_size(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        """A cap is somebody saying "bound this so I can go and LOOK at it".
+
+        Naming only the failures — which is what this lane did — answers the
+        wrong question. A capped run names each success, its item id and its
+        byte size, which is the whole point of a proving run.
+        """
+        mock_auth_token(st_settings.auth_url)
+        for item_id in (1, 2, 3):
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=self._png(12_345))
+            )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        with caplog.at_level(logging.INFO):
+            summary = _run_at(
+                st_client,
+                image_client,
+                [_item(i) for i in (1, 2, 3)],
+                InMemorySheetsStore(),
+                NOW,
+                max_assets=2,
+            )
+
+        named = [line for line in caplog.text.splitlines() if "pricebook image UPLOADED" in line]
+        assert len(named) == 2, "a capped proving run must name what it delivered"
+        assert all("bytes=12345" in line for line in named)
+        assert {"item=1", "item=2"} <= {part for line in named for part in line.split()}
+        assert summary.upload_detail_logged == 2
+        print("\nCAPPED UPLOAD LINES:\n" + "\n".join(named))
+
+    @respx.mock
+    def test_an_uncapped_run_does_not_name_sixteen_thousand_uploads(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        """The per-upload line is for a bounded proving run. An uncapped sweep
+        keeps the statistics, which are O(1) and always complete."""
+        mock_auth_token(st_settings.auth_url)
+        for item_id in (1, 2, 3):
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=self._png(12_345))
+            )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        with caplog.at_level(logging.INFO):
+            summary = _run(st_client, image_client, [_item(i) for i in (1, 2, 3)])
+
+        assert "pricebook image UPLOADED" not in caplog.text
+        assert summary.uploaded == 3
+        assert "bytes[min=12K" in summary.as_log_fields()
+
+    @respx.mock
+    def test_the_sharing_ratio_is_measured_and_logged_before_anything_is_fetched(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        """The measurement the whole dedupe change rests on, produced by the run
+        itself: the listing is already in memory, so it costs nothing."""
+        mock_auth_token(st_settings.auth_url)
+        shared = "https://cdn.example.com/shared.jpg"
+        respx.get(shared).mock(return_value=httpx.Response(200, content=PNG))
+        respx.get("https://cdn.example.com/1.jpg").mock(
+            return_value=httpx.Response(200, content=PNG)
+        )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        records = [
+            {"id": 1, "assets": [{"id": "a1", "url": "https://cdn.example.com/1.jpg"}]},
+            {"id": 2, "assets": [{"id": "s", "url": shared}]},
+            {"id": 3, "assets": [{"id": "s", "url": shared}]},
+            {"id": 4, "assets": [{"id": "s", "url": shared}]},
+            {"id": 5, "assets": []},
+        ]
+
+        with caplog.at_level(logging.INFO):
+            summary = _run(st_client, image_client, records)
+
+        assert (summary.item_assets, summary.distinct_assets, summary.no_image) == (4, 2, 1)
+        assert summary.dedupe_ratio == 2.0
+        assert "image asset sharing: 4 uploadable item-asset(s) reference 2 distinct" in caplog.text
+        assert "2 download(s) this pass does not have to make" in caplog.text
+        assert "1 item(s) have no image at all" in caplog.text
