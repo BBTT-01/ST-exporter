@@ -32,6 +32,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from st_exporter.format import to_cell_text
 
@@ -207,3 +208,123 @@ def _is_default(asset: dict[str, Any]) -> bool:
 def _text_or_none(value: Any) -> str | None:
     text = to_cell_text(value).strip()
     return text or None
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics for a payload the sniff REFUSED.
+#
+# `sniff_content_type` returning None is the single most opaque outcome the
+# image pass has: the bytes arrived, they were discarded, and the run said
+# `unsupported=N` and nothing else. Run 35142282102 on `BBTT-01/tr-doorservpro`
+# rejected all five assets it fetched that way, and the counter alone cannot
+# tell "ServiceTitan handed us an HTML error page" from "this tenant's images
+# are GIFs".
+#
+# Everything below is INFORMATION ONLY. Nothing here widens what is accepted:
+# the sniff is unchanged, the declared `Content-Type` is still never trusted,
+# and a payload these functions can name is still refused.
+# ---------------------------------------------------------------------------
+
+# How many leading bytes are ever rendered. Both caps are small on purpose: a
+# rejected payload may be an HTML body containing anything at all, so the line
+# shows a fingerprint, never a document.
+HEX_PREVIEW_BYTES = 16
+ASCII_PREVIEW_CHARS = 32
+
+_MAGIC_SHAPES: tuple[tuple[bytes, str], ...] = (
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+    (b"BM", "bmp"),
+    (b"II*\x00", "tiff"),
+    (b"MM\x00*", "tiff"),
+    (b"%PDF", "pdf"),
+    (b"\x00\x00\x01\x00", "ico"),
+    (b"PK\x03\x04", "zip"),
+)
+
+_TEXT_SHAPES: tuple[tuple[str, str], ...] = (
+    ("<!doctype html", "html"),
+    ("<html", "html"),
+    ("<svg", "svg"),
+    ("<?xml", "xml"),
+    ("{", "json"),
+    ("[", "json"),
+)
+
+
+def payload_shape(payload: bytes) -> str:
+    """A one-word guess at what a rejected payload actually is.
+
+    A PREFIX CHECK, not a parser: it never decodes the body, never allocates
+    more than the first few dozen bytes, and is wrong in the harmless direction
+    (``unknown``) whenever it is not sure. The point is that one summary line
+    can say ``html:5`` — "we are not downloading images at all" — or ``gif:5``
+    — "a format we do not accept" — which are opposite diagnoses.
+    """
+    if not payload:
+        return "empty"
+    head = payload[:64].lstrip(b"\xef\xbb\xbf").lstrip()
+    for magic, shape in _MAGIC_SHAPES:
+        if payload.startswith(magic):
+            return shape
+    if payload[4:8] == b"ftyp":
+        return "heic"
+    lowered = head[:32].lower()
+    for prefix, shape in _TEXT_SHAPES:
+        if lowered.startswith(prefix.encode()):
+            return shape
+    if head and all(0x20 <= byte < 0x7F or byte in (0x09, 0x0A, 0x0D) for byte in head):
+        return "text"
+    return "unknown"
+
+
+def payload_hex_prefix(payload: bytes, limit: int = HEX_PREVIEW_BYTES) -> str:
+    """The first ``limit`` bytes as spaced hex. Empty payload renders as ``-``."""
+    return payload[:limit].hex(" ") or "-"
+
+
+def payload_ascii_preview(payload: bytes, limit: int = ASCII_PREVIEW_CHARS) -> str:
+    """A bounded, control-free rendering of the leading bytes.
+
+    Every byte outside printable ASCII becomes ``.`` — including newline and
+    tab, so the result can never break a log line or smuggle a terminal escape
+    — and at most ``limit`` characters are produced whatever arrives.
+    """
+    return "".join(chr(byte) if 0x20 <= byte < 0x7F else "." for byte in payload[:limit])
+
+
+def redact_source_url(url: str) -> str:
+    """The asset url as it may be logged: no credentials, no query, no fragment.
+
+    An asset url can be presigned (see ``images/conditional.py``), so its query
+    string IS a credential. The path is kept because it is what identifies the
+    asset to a human reading the log; everything that could carry a secret is
+    replaced by a marker that still says one was there.
+    """
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # pragma: no cover - urlsplit is extremely permissive
+        return "<unparseable-url>"
+    if not parts.scheme and not parts.netloc:
+        # A ServiceTitan storage path like `Images/Pricebook/x.jpg`. No
+        # credential can hide in one — `is_storage_path` forbids `?` and `@`.
+        return url.split("?", 1)[0]
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    userinfo = "<redacted>@" if parts.username or parts.password else ""
+    rendered = f"{parts.scheme}://{userinfo}{host}{parts.path}"
+    if parts.query:
+        rendered += "?<redacted>"
+    return rendered
+
+
+def describe_rejected_payload(payload: bytes) -> str:
+    """``shape=… bytes=… hex=… ascii=…`` for one payload the sniff refused."""
+    return (
+        f"shape={payload_shape(payload)} bytes={len(payload)} "
+        f"hex={payload_hex_prefix(payload)} "
+        f"ascii={payload_ascii_preview(payload)!r}"
+    )

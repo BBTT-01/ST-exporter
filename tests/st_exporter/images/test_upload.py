@@ -7,6 +7,7 @@ is the actual download-and-POST path, not a mock of it.
 
 from __future__ import annotations
 
+import logging
 from typing import Generator
 from unittest.mock import patch
 
@@ -20,6 +21,8 @@ from st_exporter.images.ledger import ImageLedger
 from st_exporter.images.upload import (
     ASSET_CAP_REACHED,
     BUDGET_SPENT,
+    UNSUPPORTED_DETAIL_LIMIT,
+    ImageUploadSummary,
     upload_pricebook_images,
 )
 from st_exporter.sheets import InMemorySheetsStore
@@ -1184,3 +1187,177 @@ class TestTheSummaryLineAnswersWhyItStopped:
         assert summary.cap_hit is False
         assert f"stopped={BUDGET_SPENT}" in summary.as_log_fields()
         assert "max_assets=1000" in summary.as_log_fields()
+
+
+HTML_BODY = (
+    b"<!DOCTYPE html><html><head><title>Sign in</title></head><body>session expired</body></html>"
+)
+GIF_BODY = b"GIF89a" + b"\x01\x00\x01\x00" + b"gif-body"
+
+SIGNED_URL = "https://cdn.example.com/a1.jpg?X-Amz-Signature=deadbeefsecret&Expires=99"
+SIGNED_ITEM = {"id": 100, "assets": [{"id": "a1", "url": SIGNED_URL, "isDefault": True}]}
+
+
+class TestARejectedPayloadSaysWhatItActuallyWas:
+    """Run 35142282102 (`BBTT-01/tr-doorservpro`, 0.2.17) reported
+    ``unsupported=5 fetched=5`` and nothing else, which cannot distinguish "we
+    are not downloading images at all" from "a format we do not accept". These
+    tests pin the information that tells them apart. Nothing here changes what
+    is ACCEPTED — every payload below is still refused."""
+
+    @respx.mock
+    def test_an_html_body_is_logged_as_html_with_the_content_type_it_claimed(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(
+            return_value=httpx.Response(
+                200, content=HTML_BODY, headers={"content-type": "text/html; charset=utf-8"}
+            )
+        )
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        with caplog.at_level(logging.WARNING):
+            summary = _run(st_client, image_client, [PUBLIC_ITEM])
+
+        assert summary.unsupported == 1
+        assert not upload.called
+        assert summary.unsupported_shapes == {"html": 1}
+        assert "unsupported_shapes=html:1" in summary.as_log_fields()
+
+        line = _rejection_line(caplog)
+        print("\nHTML REJECTION WARNING:", line)
+        assert "item=100" in line
+        assert "http_status=200" in line
+        assert "declared_content_type=text/html; charset=utf-8" in line
+        assert "shape=html" in line
+        assert f"bytes={len(HTML_BODY)}" in line
+        assert "hex=3c 21 44 4f 43 54 59 50 45 20 68 74 6d 6c 3e 3c" in line
+        assert "<!DOCTYPE html><html><head><ti" in line
+
+    @respx.mock
+    def test_a_gif_is_logged_as_gif_shaped(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(
+            return_value=httpx.Response(
+                200, content=GIF_BODY, headers={"content-type": "image/gif"}
+            )
+        )
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        with caplog.at_level(logging.WARNING):
+            summary = _run(st_client, image_client, [PUBLIC_ITEM])
+
+        assert summary.unsupported == 1
+        assert not upload.called
+        assert summary.unsupported_shapes == {"gif": 1}
+
+        line = _rejection_line(caplog)
+        print("\nGIF REJECTION WARNING:", line)
+        assert "shape=gif" in line
+        assert "declared_content_type=image/gif" in line
+        assert "GIF89a" in line
+
+    @respx.mock
+    def test_a_server_that_declares_nothing_says_none_rather_than_guessing(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=b'{"error":"nope"}'))
+
+        with caplog.at_level(logging.WARNING):
+            summary = _run(st_client, image_client, [PUBLIC_ITEM])
+
+        line = _rejection_line(caplog)
+        assert summary.unsupported_shapes == {"json": 1}
+        # httpx supplies no content-type of its own when the mock omits it.
+        assert "declared_content_type=" in line
+        assert "shape=json" in line
+
+    @respx.mock
+    def test_an_empty_payload_does_not_crash_the_pass(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=b""))
+
+        with caplog.at_level(logging.WARNING):
+            summary = _run(st_client, image_client, [PUBLIC_ITEM])
+
+        assert summary.unsupported == 1
+        assert summary.unsupported_shapes == {"empty": 1}
+        assert "bytes=0" in _rejection_line(caplog)
+
+    @respx.mock
+    def test_a_truncated_png_header_is_described_without_crashing(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=b"\x89PN"))
+
+        with caplog.at_level(logging.WARNING):
+            summary = _run(st_client, image_client, [PUBLIC_ITEM])
+
+        assert summary.unsupported == 1
+        assert "bytes=3" in _rejection_line(caplog)
+
+    @respx.mock
+    def test_a_signed_source_url_is_never_logged_with_its_query_string(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(SIGNED_URL).mock(return_value=httpx.Response(200, content=HTML_BODY))
+
+        with caplog.at_level(logging.WARNING):
+            _run(st_client, image_client, [SIGNED_ITEM])
+
+        line = _rejection_line(caplog)
+        assert "deadbeefsecret" not in line
+        assert "X-Amz-Signature" not in line
+        assert "source=https://cdn.example.com/a1.jpg?<redacted>" in line
+
+    @respx.mock
+    def test_many_rejections_produce_a_capped_detail_and_a_complete_count(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        records = [_item(i) for i in range(1, 13)]
+        for item_id in range(1, 13):
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=HTML_BODY)
+            )
+
+        with caplog.at_level(logging.WARNING):
+            summary = _run(st_client, image_client, records)
+
+        assert summary.unsupported == 12
+        # Counting is complete; only the DESCRIBING is bounded.
+        assert summary.unsupported_shapes == {"html": 12}
+        assert summary.unsupported_detail_logged == UNSUPPORTED_DETAIL_LIMIT
+        assert len(_rejection_lines(caplog)) == UNSUPPORTED_DETAIL_LIMIT
+        assert any("will not be described individually" in m for m in caplog.messages)
+
+    def test_the_summary_breakdown_orders_the_commonest_shape_first(self) -> None:
+        summary = ImageUploadSummary()
+        summary.unsupported_shapes = {"gif": 1, "html": 4, "json": 4}
+        assert summary.unsupported_shapes_field == "html:4,json:4,gif:1"
+
+    def test_a_run_with_no_rejections_says_none(self) -> None:
+        assert ImageUploadSummary().unsupported_shapes_field == "none"
+        assert "unsupported_shapes=none" in ImageUploadSummary().as_log_fields()
+
+
+def _rejection_lines(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "REJECTED by the byte sniff" in record.getMessage()
+    ]
+
+
+def _rejection_line(caplog) -> str:
+    lines = _rejection_lines(caplog)
+    assert len(lines) == 1, lines
+    return lines[0]
