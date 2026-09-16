@@ -106,8 +106,11 @@ from st_cli.exceptions import APIError, STCLIError, TransportError
 from st_exporter.images.assets import (
     MAX_IMAGE_BYTES,
     PricebookAsset,
+    describe_rejected_payload,
     idempotency_key,
     is_storage_path,
+    payload_shape,
+    redact_source_url,
     select_uploadable_asset,
     sniff_content_type,
 )
@@ -145,6 +148,14 @@ ASSET_CAP_REACHED = "per-run asset cap reached"
 # clean-looking run. Unlimited is the honest default; a caller that wants the
 # pass bounded says so, and the run then says so back (see ASSET_CAP_REACHED).
 NO_ASSET_CAP = 0
+
+# How many REJECTED payloads get a full WARNING line describing what arrived.
+#
+# The detail exists to answer one question per run — "are these HTML error
+# pages or are they GIFs" — and a handful of examples answers it as well as
+# 16,112 would. Past the cap the pass says so once and keeps only the counts
+# (`ImageUploadSummary.unsupported_shapes`), which are O(1) and always complete.
+UNSUPPORTED_DETAIL_LIMIT = 5
 
 # However fresh `modifiedOn` says an asset is, RE-VERIFY it after this long.
 #
@@ -213,7 +224,23 @@ class ImageUploadSummary:
     # converges, and a run that leaves it high with `stopped=budget` is asking
     # for a larger `job_timeout_minutes`, not for a bug report.
     pending: int = 0
+    # What the payloads counted in `unsupported` LOOKED like, by cheap prefix
+    # check: `{"html": 5}` and `{"gif": 5}` are the same counter and opposite
+    # diagnoses. Carried on the summary so one line answers the question even
+    # when the per-asset detail lines have hit `UNSUPPORTED_DETAIL_LIMIT`.
+    unsupported_shapes: dict[str, int] = field(default_factory=dict)
+    # How many rejections have already been described in full. Bounds the log,
+    # never the counting.
+    unsupported_detail_logged: int = 0
     seen_keys: set[str] = field(default_factory=set)
+
+    @property
+    def unsupported_shapes_field(self) -> str:
+        """``html:5,gif:1`` — commonest first — or ``none``."""
+        if not self.unsupported_shapes:
+            return "none"
+        ordered = sorted(self.unsupported_shapes.items(), key=lambda kv: (-kv[1], kv[0]))
+        return ",".join(f"{shape}:{count}" for shape, count in ordered)
 
     @property
     def cap_hit(self) -> bool:
@@ -238,7 +265,9 @@ class ImageUploadSummary:
             f"considered={self.considered} uploaded={self.uploaded} "
             f"already={self.already_uploaded} no_image={self.no_image} "
             f"download_failed={self.download_failed} rejected={self.upload_rejected} "
-            f"unsupported={self.unsupported} too_large={self.too_large} "
+            f"unsupported={self.unsupported} "
+            f"unsupported_shapes={self.unsupported_shapes_field} "
+            f"too_large={self.too_large} "
             f"revalidated={self.revalidated} not_modified={self.not_modified} "
             f"fetched={self.fetched} "
             f"max_assets={self.max_assets or 'none'} "
@@ -467,7 +496,9 @@ def _upload_one(
     content_type = sniff_content_type(payload)
     if content_type is None:
         # TrueQuote would 422 these (`image_content_mismatch`); no point sending.
-        summary.unsupported += 1
+        # What ARRIVED is recorded, because "unsupported" alone cannot tell an
+        # HTML login page from a GIF and those ask for opposite fixes.
+        _record_unsupported(summary, asset, payload, fetched)
         return True
 
     key = idempotency_key(asset, payload)
@@ -488,6 +519,7 @@ def _upload_one(
 
     if len(asset.identity) > _MAX_TEXT_FIELD:
         summary.unsupported += 1
+        _count_shape(summary, "identity_too_long")
         return True
 
     result = image_client.upload(
@@ -537,6 +569,61 @@ def _upload_one(
     return True
 
 
+def _count_shape(summary: ImageUploadSummary, shape: str) -> None:
+    summary.unsupported_shapes[shape] = summary.unsupported_shapes.get(shape, 0) + 1
+
+
+def _record_unsupported(
+    summary: ImageUploadSummary,
+    asset: PricebookAsset,
+    payload: bytes,
+    fetched: _Fetched,
+) -> None:
+    """Count the rejection, and describe it while the detail budget allows.
+
+    INFORMATION ONLY. Nothing here decides anything: the asset is refused
+    either way, and the declared `Content-Type` is recorded precisely because
+    it is NOT trusted — a server claiming `image/jpeg` over `<!DOCTYPE html` is
+    the finding, not a reason to accept the bytes.
+
+    Everything printed is bounded and sanitised: the url loses any query string
+    (it may be presigned) and any userinfo, the body shows at most
+    ``HEX_PREVIEW_BYTES`` bytes of hex and ``ASCII_PREVIEW_CHARS`` characters
+    with every control byte replaced, and the declared content type is capped.
+    No whole body ever reaches a log.
+    """
+    summary.unsupported += 1
+    _count_shape(summary, payload_shape(payload))
+    if summary.unsupported_detail_logged >= UNSUPPORTED_DETAIL_LIMIT:
+        return
+    summary.unsupported_detail_logged += 1
+    logger.warning(
+        "pricebook image REJECTED by the byte sniff (not PNG/JPEG/WEBP): "
+        "item=%s asset=%s source=%s http_status=%s declared_content_type=%s %s",
+        asset.external_item_id,
+        redact_source_url(asset.identity),
+        redact_source_url(asset.source_url),
+        fetched.status_code or "?",
+        _capped_declared(fetched.content_type),
+        describe_rejected_payload(payload),
+    )
+    if summary.unsupported_detail_logged == UNSUPPORTED_DETAIL_LIMIT:
+        logger.warning(
+            "further rejected pricebook images will not be described individually "
+            "(cap %d per run); the run summary's `unsupported_shapes` keeps counting "
+            "every one of them.",
+            UNSUPPORTED_DETAIL_LIMIT,
+        )
+
+
+def _capped_declared(value: str) -> str:
+    """The response's own `Content-Type`, bounded and control-free, or `none`."""
+    if not value:
+        return "none"
+    cleaned = "".join(ch if 0x20 <= ord(ch) < 0x7F else "." for ch in value[:80])
+    return cleaned
+
+
 @dataclass(frozen=True)
 class _Fetched:
     """The outcome of one asset fetch that reached a status.
@@ -548,6 +635,11 @@ class _Fetched:
     payload: bytes | None
     etag: str = ""
     last_modified: str = ""
+    # What the server CLAIMED the body was, and the status it came back on.
+    # Carried for diagnostics only — the upload's content type is still sniffed
+    # from the bytes (`assets.sniff_content_type`), never read from here.
+    content_type: str = ""
+    status_code: int = 0
 
 
 def _fetch(
@@ -580,6 +672,7 @@ def _fetch(
             )
             status, body = file.status_code, file.content
             etag, last_modified = file.etag, file.last_modified
+            declared = file.content_type
         else:
             resp = public.get(asset.source_url, headers=conditional_headers)
             # 304 is a success, and `raise_for_status` agrees (it raises only on
@@ -591,6 +684,7 @@ def _fetch(
             status, body = resp.status_code, resp.content
             etag = resp.headers.get("etag")
             last_modified = resp.headers.get("last-modified")
+            declared = resp.headers.get("content-type")
         summary.conditional.observe_response(
             conditional=bool(conditional_headers),
             status_code=status,
@@ -599,7 +693,13 @@ def _fetch(
         )
         if status == 304:
             return _Fetched(payload=None)
-        return _Fetched(payload=body, etag=etag or "", last_modified=last_modified or "")
+        return _Fetched(
+            payload=body,
+            etag=etag or "",
+            last_modified=last_modified or "",
+            content_type=declared or "",
+            status_code=status,
+        )
     except APIError as exc:
         if exc.status_code == 403:
             summary.permission_denied = True

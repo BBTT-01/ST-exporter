@@ -546,7 +546,10 @@ def _image_fields(images: ImageUploadSummary) -> str:
         f"images_no_validator={images.conditional.validators_absent} "
         f"images_signed_urls={images.conditional.signed_urls} "
         f"images_too_large={images.too_large} "
-        f"images_unsupported={images.unsupported}"
+        f"images_unsupported={images.unsupported} "
+        # WHAT the unsupported payloads looked like. `html:5` and `gif:5` are
+        # the same `images_unsupported=5` and opposite diagnoses.
+        f"images_unsupported_shapes={images.unsupported_shapes_field}"
     )
 
 
