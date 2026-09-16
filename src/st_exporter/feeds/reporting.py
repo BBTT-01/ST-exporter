@@ -90,6 +90,11 @@ _PAGE_SIZE = 200
 #: of per-job costs over the financial window is thousands of rows, not millions.
 _MAX_DATA_PAGES = 50
 
+#: How many name-matching-but-custom reports the refusal will quote. A tenant
+#: cannot have many reports sharing one exact name, so this is a flood stop
+#: rather than a real limit.
+_CUSTOM_SKIP_CAP = 8
+
 
 class ReportUnavailableError(STCLIError):
     """Base: the Job Costing Summary report could not be read this run.
@@ -430,7 +435,7 @@ def find_builtin_report(
     matches_by_name: list[dict[tuple[str, str], ReportRef]] = [{} for _ in accepted]
     #: every report seen, by id — populated only to resolve ``pinned_report_id``
     by_report_id: dict[str, ReportRef] = {}
-    skipped_custom = 0
+    skipped_custom: list[str] = []
     census = _Census(wanted)
 
     for category in _iter_categories(client):
@@ -449,9 +454,16 @@ def find_builtin_report(
                 index = wanted.index(normalized)
             except ValueError:
                 continue
-            if _looks_custom(report):
+            marker = custom_marker(report)
+            if marker is not None:
                 # A contractor can name their own report anything, including this.
-                skipped_custom += 1
+                # Keep the EVIDENCE, not just a tally: these spellings are
+                # unverified, and a false positive here refuses the real report.
+                if len(skipped_custom) < _CUSTOM_SKIP_CAP:
+                    skipped_custom.append(
+                        f"category {category_id}/report {report.get('id')} "
+                        f"({str(report.get('name'))!r}) — {marker}"
+                    )
                 continue
             report_id = report.get("id")
             if report_id is None:
@@ -519,8 +531,13 @@ def find_builtin_report(
         if not skipped_custom
         else (
             f"the only report(s) named {quoted} visible to this tenant "
-            f"({skipped_custom}) are custom reports, which are never used — "
-            "a contractor-authored report would produce wrong cost numbers silently"
+            f"({len(skipped_custom)}) are marked as custom reports, which are never "
+            "used — a contractor-authored report would produce wrong cost numbers "
+            f"silently. Skipped: {'; '.join(skipped_custom)}. The marker each was "
+            "judged on is quoted above and the spellings this exporter looks for are "
+            "NOT confirmed against a real tenant (KNOWN_UNVERIFIED.md): if one of "
+            "those reports is in fact ServiceTitan's own built-in, this is a false "
+            "positive in that guess and not a missing report"
         )
     )
     raise JobCostingReportNotFoundError(f"{detail}. {census.diagnosis()}")
@@ -699,14 +716,28 @@ _CUSTOM_KIND_FIELDS: tuple[str, ...] = ("type", "reportType", "kind", "source")
 _CUSTOM_KIND_VALUES: frozenset[str] = frozenset({"custom", "userdefined", "user-defined", "tenant"})
 
 
-def _looks_custom(report: dict[str, Any]) -> bool:
-    """True when the report record says, in any spelling, that it is user-authored."""
+def custom_marker(report: dict[str, Any]) -> str | None:
+    """WHICH field and value say this report is user-authored, or ``None``.
+
+    The selection rule is unchanged — a non-``None`` answer is exactly the old
+    ``_looks_custom`` True — but it now carries its evidence, because the
+    spellings it looks for are unverified (see ``KNOWN_UNVERIFIED.md``) and a
+    FALSE POSITIVE here refuses the genuine built-in report. When that happens
+    the refusal used to say only that the matching reports were custom, which
+    sends the contractor to look for a report they can already see and tells
+    whoever is debugging nothing about which guess fired.
+    """
     for field in _CUSTOM_BOOLEAN_FIELDS:
         value = report.get(field)
         if isinstance(value, bool) and value:
-            return True
+            return f"{field}=true"
     for field in _CUSTOM_KIND_FIELDS:
         value = report.get(field)
         if isinstance(value, str) and value.strip().casefold() in _CUSTOM_KIND_VALUES:
-            return True
-    return False
+            return f"{field}={value.strip()!r}"
+    return None
+
+
+def _looks_custom(report: dict[str, Any]) -> bool:
+    """True when the report record says, in any spelling, that it is user-authored."""
+    return custom_marker(report) is not None

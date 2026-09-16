@@ -172,6 +172,16 @@ columns. That check does not depend on any unverified spelling, and it is what
 turns "wrong report, blank money, reported as success" into a loud refusal.
 Confirm on a tenant that has custom reports.
 
+The refusal now carries its own evidence, so one live run is enough to tell a
+missing report from a false positive in these guesses: a name-matching report
+skipped as custom is quoted by category id, report id, name **and the marker it
+was judged on** (`isCustom=true`, `reportType='Custom'`, ...), and the message
+says outright that the spellings are unconfirmed. The asymmetry above only holds
+if the loud half is actionable, and "the only reports with that name are custom"
+was not — it points the contractor at a report they can already see.
+`reporting.custom_marker` is that rule; `_looks_custom` is now a thin wrapper on
+it, so selection is unchanged.
+
 ## ~~Financial feed: why `reporting.jobCosts` is absent on tr-doorservpro~~ — DIAGNOSED
 
 `src/st_exporter/feeds/reporting.py`; `src/st_exporter/config.py`,
