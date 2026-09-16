@@ -64,6 +64,18 @@ class PricebookAsset:
     alias: str | None
     asset_type: str | None
     is_default: bool
+    # The owning ITEM's ``modifiedOn``, carried here because it is the only
+    # cheap validator the pass has: it is known from the catalogue listing,
+    # before a single byte is downloaded. See ``upload._is_still_fresh`` — an
+    # asset whose item has not been modified since the ledger last confirmed it
+    # is skipped without a download, which is the difference between a pass that
+    # converges and one that re-downloads 7,000 images on every run to
+    # rediscover they were already sent.
+    #
+    # Blank when ServiceTitan omits it, and blank means "cannot prove
+    # freshness", never "fresh": the skip requires a non-empty value. Defaulted
+    # so every existing construction of this dataclass keeps working.
+    modified_on: str = ""
 
     @property
     def identity(self) -> str:
@@ -134,6 +146,7 @@ def select_uploadable_asset(record: dict[str, Any]) -> PricebookAsset | None:
         alias=_text_or_none(chosen.get("alias")),
         asset_type=_text_or_none(chosen.get("type")),
         is_default=_is_default(chosen),
+        modified_on=to_cell_text(record.get("modifiedOn")).strip(),
     )
 
 

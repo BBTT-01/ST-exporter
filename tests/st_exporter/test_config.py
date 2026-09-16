@@ -98,3 +98,37 @@ def test_financial_max_jobs_defaults_and_rejects_zero(monkeypatch) -> None:
     _set_env(monkeypatch, EXPORTER_FINANCIAL_MAX_JOBS="0")
     with pytest.raises(pydantic.ValidationError):
         ExporterSettings()  # type: ignore[call-arg]
+
+
+class TestTheJobTimeoutTheExporterIsTold:
+    """The runner does not warn before it SIGKILLs a job, and a killed process
+    writes no image ledger — so the exporter is TOLD the deadline rather than
+    left to discover it."""
+
+    def test_defaults_to_the_reusable_workflows_own_default(self, monkeypatch) -> None:
+        """10, unset, so every existing caller and every non-images feed keeps
+        exactly the behaviour it had before this setting existed."""
+        monkeypatch.delenv("EXPORTER_JOB_TIMEOUT_MINUTES", raising=False)
+        _set_env(monkeypatch)
+        assert ExporterSettings().job_timeout_minutes == 10  # type: ignore[call-arg]
+
+    def test_the_image_budget_stops_short_of_the_job_timeout(self, monkeypatch) -> None:
+        """Short by the reserve, because checkout, setup-python and
+        `pip install -e .` all spend runner time before the exporter exists, and
+        the ledger flush spends more after the pass."""
+        _set_env(monkeypatch, EXPORTER_JOB_TIMEOUT_MINUTES="30")
+        settings = ExporterSettings()  # type: ignore[call-arg]
+        assert settings.job_timeout_minutes == 30
+        assert settings.image_budget_seconds == 28 * 60
+
+    def test_a_tiny_timeout_still_buys_a_real_budget(self, monkeypatch) -> None:
+        """A budget of zero is not "run briefly", it is "upload nothing ever" —
+        the bug rather than a configuration of it."""
+        _set_env(monkeypatch, EXPORTER_JOB_TIMEOUT_MINUTES="1")
+        assert ExporterSettings().image_budget_seconds == 60.0  # type: ignore[call-arg]
+
+    def test_zero_is_refused(self, monkeypatch) -> None:
+        """GitHub does not accept a `timeout-minutes: 0` either."""
+        _set_env(monkeypatch, EXPORTER_JOB_TIMEOUT_MINUTES="0")
+        with pytest.raises(pydantic.ValidationError):
+            ExporterSettings()  # type: ignore[call-arg]
