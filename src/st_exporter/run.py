@@ -68,7 +68,11 @@ from st_exporter.format import (
 )
 from st_exporter.images.client import TrueQuoteImageClient
 from st_exporter.images.ledger import ImageLedger
-from st_exporter.images.upload import ImageUploadSummary, upload_pricebook_images
+from st_exporter.images.upload import (
+    NO_ASSET_CAP,
+    ImageUploadSummary,
+    upload_pricebook_images,
+)
 from st_exporter.logging_setup import announce_to_actions, configure_logging, logger
 from st_exporter.meta import (
     CursorBundle,
@@ -287,6 +291,7 @@ def run_export(
             # so the in-process lane stays bounded for any caller that injects an
             # image client here directly, which the tests do.
             image_deadline=monotonic() + exporter_settings.image_budget_seconds,
+            image_max_assets=exporter_settings.image_max_assets,
             dry_run=dry_run,
         )
     finally:
@@ -302,6 +307,7 @@ def run_images(
     client: ServiceTitanClient | None = None,
     raw_cache_store: SheetsPort | None = None,
     deadline: float | None = None,
+    max_assets: int | None = None,
 ) -> ImageUploadSummary:
     """Run the `images` feed: upload pricebook image bytes, and nothing else.
 
@@ -352,6 +358,8 @@ def run_images(
 
     if deadline is None:
         deadline = monotonic() + exporter_settings.image_budget_seconds
+    if max_assets is None:
+        max_assets = exporter_settings.image_max_assets
 
     owns_client = client is None
     active_client = client or ServiceTitanClient(st_settings)
@@ -369,6 +377,7 @@ def run_images(
             records,
             image_client=image_client,
             image_deadline=deadline,
+            image_max_assets=max_assets,
             run_at=datetime.now(timezone.utc).isoformat(),
             dry_run=False,
             catalogue_complete=catalogue_complete,
@@ -464,6 +473,7 @@ def _run(
     # None = no budget. Only a caller that knows nothing will kill the process
     # may leave it unset; `run_export` always sets one.
     image_deadline: float | None = None,
+    image_max_assets: int = NO_ASSET_CAP,
     dry_run: bool,
 ) -> ExportSummary:
     now = datetime.now(timezone.utc)
@@ -664,6 +674,7 @@ def _run(
             pricebook_item_records,
             image_client=image_client,
             image_deadline=image_deadline,
+            image_max_assets=image_max_assets,
             run_at=run_at,
             dry_run=dry_run,
             # An item tab that did not produce a grid — failed, or refused with a
@@ -1391,6 +1402,7 @@ def _upload_pricebook_images(
     *,
     image_client: TrueQuoteImageClient | None,
     image_deadline: float | None,
+    image_max_assets: int = NO_ASSET_CAP,
     run_at: str,
     dry_run: bool,
     catalogue_complete: bool = True,
@@ -1416,6 +1428,11 @@ def _upload_pricebook_images(
     ``image_deadline`` bounds the pass so it ends with a FLUSHED ledger rather
     than a SIGKILL. A pass that runs out of budget is ``stopped``, which already
     vetoes the prune for exactly the right reason: it did not see the catalogue.
+
+    ``image_max_assets`` is the second, independent bound — how many assets this
+    run may FETCH (``EXPORTER_IMAGE_MAX_ASSETS``, 0 = no cap). It sets its own
+    ``stopped`` reason, so the run's output says which dial to turn, and it
+    vetoes the prune for the same reason the deadline does.
     """
     if image_client is None or dry_run:
         return None
@@ -1424,7 +1441,13 @@ def _upload_pricebook_images(
     summary = ImageUploadSummary()
     try:
         summary = upload_pricebook_images(
-            client, image_client, ledger, item_records, now=run_at, deadline=image_deadline
+            client,
+            image_client,
+            ledger,
+            item_records,
+            now=run_at,
+            deadline=image_deadline,
+            max_assets=image_max_assets,
         )
         # Only prune on a pass that actually saw the whole catalogue — a run
         # stopped by a 403, a rate limit or a failed download has "not looked

@@ -135,3 +135,81 @@ def test_keys_for_answers_every_key_recorded_for_one_asset() -> None:
     # The LATEST of an asset's keys is what orders the pass.
     assert ledger.last_verified(ENTRY.asset_ref) == ENTRY.verified_at
     assert ledger.keys_for("nothing-here") == set()
+
+
+class TestCacheValidators:
+    """The ledger is where an `ETag` survives between runs, so a weekly
+    re-verification can be a 304 instead of a re-download."""
+
+    def test_validators_round_trip_through_a_flush(self) -> None:
+        store = InMemorySheetsStore()
+        ledger = ImageLedger(store)
+        ledger.record(
+            ImageLedgerEntry(
+                idempotency_key="key-1",
+                asset_ref="100:a1",
+                storage_path="p",
+                verified_at="2026-09-14T12:00:00+00:00",
+                etag='"v1"',
+                last_modified="Mon, 14 Sep 2026 00:00:00 GMT",
+            )
+        )
+        ledger.flush()
+
+        assert ImageLedger(store).validators_for("100:a1") == (
+            '"v1"',
+            "Mon, 14 Sep 2026 00:00:00 GMT",
+        )
+
+    def test_an_asset_with_no_entry_offers_nothing_to_quote_back(self) -> None:
+        assert ImageLedger(InMemorySheetsStore()).validators_for("100:a1") == ("", "")
+
+    def test_the_newest_entry_wins(self) -> None:
+        """One asset can hold several keys — a replaced image leaves its
+        predecessor behind until `keep` prunes it — and only the newest
+        describes the bytes TrueQuote currently holds."""
+        ledger = ImageLedger(InMemorySheetsStore())
+        ledger.record(
+            ImageLedgerEntry("old", "100:a1", "p", "2026-09-01T00:00:00+00:00", '"old"', "")
+        )
+        ledger.record(
+            ImageLedgerEntry("new", "100:a1", "p", "2026-09-14T00:00:00+00:00", '"new"', "")
+        )
+        assert ledger.validators_for("100:a1")[0] == '"new"'
+
+    def test_a_four_column_row_still_loads(self) -> None:
+        """Every ledger written before this feature is four columns wide.
+        Rejecting it as malformed would forget a whole catalogue's uploads and
+        re-send every byte on the upgrade run."""
+        store = InMemorySheetsStore()
+        store.replace_grid(
+            "_image_ledger",
+            [
+                ["idempotency_key", "asset_ref", "storage_path", "verified_at"],
+                ["key-1", "100:a1", "p", "2026-09-14T12:00:00+00:00"],
+            ],
+        )
+        ledger = ImageLedger(store)
+        assert ledger.has("key-1")
+        assert ledger.last_verified("100:a1") == "2026-09-14T12:00:00+00:00"
+        assert ledger.validators_for("100:a1") == ("", "")
+
+    def test_verify_ref_restamps_every_key_and_stores_the_validator(self) -> None:
+        """A 304 carries no body, so no content hash, so no key — the asset
+        reference is the only handle the pass has."""
+        ledger = ImageLedger(InMemorySheetsStore())
+        ledger.record(ImageLedgerEntry("a", "100:a1", "p", "2026-01-01T00:00:00+00:00"))
+        ledger.record(ImageLedgerEntry("b", "100:a1", "p", "2026-01-02T00:00:00+00:00"))
+
+        ledger.verify_ref("100:a1", "2026-09-14T12:00:00+00:00", etag='"v2"')
+
+        assert ledger.last_verified("100:a1") == "2026-09-14T12:00:00+00:00"
+        assert ledger.validators_for("100:a1") == ('"v2"', "")
+
+    def test_a_re_check_with_no_new_validator_keeps_the_old_one(self) -> None:
+        """Erasing a validator because one response omitted it would silently
+        put that asset back on the full-re-download schedule."""
+        ledger = ImageLedger(InMemorySheetsStore())
+        ledger.record(ImageLedgerEntry("a", "100:a1", "p", "2026-01-01T00:00:00+00:00", '"v1"', ""))
+        ledger.verify("a", "2026-09-14T12:00:00+00:00")
+        assert ledger.validators_for("100:a1") == ('"v1"', "")

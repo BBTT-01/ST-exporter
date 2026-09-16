@@ -4,6 +4,60 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Conditional image fetches, and a per-run asset cap
+
+### Changed: the weekly full re-download of every image is now a conditional request
+
+The image pass skips the download of any asset whose ITEM has a `modifiedOn` no
+later than the moment the ledger last confirmed it. That timestamp is a proxy:
+`modifiedOn` is on the item, not on the image, and **no live tenant has ever
+been used to confirm that replacing an image moves it** (`KNOWN_UNVERIFIED.md`).
+The insurance against that was `REVERIFY_AFTER_DAYS = 7` — a full re-download of
+every asset every week, for ever, ~7,191 of them on one tenant.
+
+The interval is unchanged; its **price** is not. A successful download now
+stores the server's `ETag` / `Last-Modified` in `_image_ledger`, and the weekly
+re-verification quotes them back as `If-None-Match` / `If-Modified-Since`. A
+**304** is a verification that moved no bytes and sent no upload.
+
+The decision order, cheapest first:
+
+1. `modifiedOn` unchanged since the last verification — skip, **no request**.
+2. Otherwise a conditional GET. **304** → verified, no bytes, no upload.
+   **200** → new bytes, exactly as before.
+
+**Nothing assumes ServiceTitan honours any of this.** A response with no
+validator to store means the next check is a plain GET and a full download —
+today's behaviour, unchanged — and a validator the server ignores comes back as
+a 200, also unchanged. What the pass insists on is MEASURING which is happening:
+`images_not_modified=`, `images_conditional_sent=`, `images_no_validator=` and
+`images_signed_urls=` on the run's summary line, plus one `image conditional
+requests: … -- <verdict>` log line per run that says in English whether 304s are
+being returned, whether any validator is offered at all, and whether the asset
+urls look signed (which would make the whole mechanism unusable and is not
+fixable from this side). Read that line after the first live run.
+
+`_image_ledger` gains two trailing columns, `etag` and `last_modified`. A
+pre-upgrade four-column ledger loads unchanged — rows are padded, not rejected,
+because discarding them would re-upload a whole catalogue on the upgrade run.
+
+### Added: `EXPORTER_IMAGE_MAX_ASSETS` — a per-run cap on assets fetched
+
+A second stopping condition beside the time budget, and a separate one: the
+deadline bounds the CLOCK, this bounds the WORK. **The default is 0, meaning no
+cap** — a number would silently truncate a large catalogue for ever on any
+caller that never chose one, and a tenant permanently missing its last N images
+looks exactly like a clean run. Exposed as the reusable workflow's
+`image_max_assets` input.
+
+Free `modifiedOn` skips do not count against it: the cap bounds fetches, so a
+converged catalogue still sweeps end to end. Hitting it is announced as
+`images_stopped=per-run asset cap reached`, deliberately distinguishable from
+`images_stopped=time budget for the image pass spent` — the two ask for
+different dials. Both flush the ledger, both veto the prune, and both compose
+with least-recently-verified-first ordering, so successive capped runs sweep
+disjoint slices and the union converges.
+
 ## [Unreleased] · The image upload is its own feed and its own job
 
 ### Fixed: the pricebook image pass could never finish, and failed the pricebook feed while it tried

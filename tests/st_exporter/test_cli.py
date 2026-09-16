@@ -866,3 +866,29 @@ class TestTheImagesFeedIsRoutedOnItsOwn:
             main()
 
         mock_images.assert_not_called()
+
+
+class TestTheCapOnTheRunsOwnOutputLine:
+    """A connector runs a bounded proving pass by passing `image_max_assets`.
+    The run's output has to say what the cap was and whether it bit, or the
+    operator cannot tell a cap stop from a clock stop."""
+
+    def _line(self, images: ImageUploadSummary) -> str:
+        from st_exporter.cli import _image_fields
+
+        return _image_fields(images)
+
+    def test_a_capped_run_names_the_cap_and_the_hit(self) -> None:
+        from st_exporter.images.upload import ASSET_CAP_REACHED
+
+        line = self._line(
+            ImageUploadSummary(uploaded=500, fetched=500, max_assets=500, stopped=ASSET_CAP_REACHED)
+        )
+        assert "images_max_assets=500" in line
+        assert "images_cap_hit=true" in line
+        assert f"images_stopped={ASSET_CAP_REACHED}" in line
+
+    def test_an_uncapped_run_says_none_not_zero(self) -> None:
+        line = self._line(ImageUploadSummary(uploaded=3))
+        assert "images_max_assets=none" in line
+        assert "images_cap_hit=false" in line

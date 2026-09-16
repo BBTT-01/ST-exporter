@@ -132,3 +132,25 @@ class TestTheJobTimeoutTheExporterIsTold:
         _set_env(monkeypatch, EXPORTER_JOB_TIMEOUT_MINUTES="0")
         with pytest.raises(pydantic.ValidationError):
             ExporterSettings()  # type: ignore[call-arg]
+
+
+class TestThePerRunImageAssetCap:
+    """Two stopping conditions for the image pass, two knobs. This one bounds
+    WORK; `job_timeout_minutes` bounds the clock."""
+
+    def test_the_default_is_no_cap_at_all(self, monkeypatch) -> None:
+        """A number here would silently truncate a large catalogue for ever on
+        every caller that never chose one, and the symptom looks like a clean
+        run. Unlimited is the honest default."""
+        monkeypatch.delenv("EXPORTER_IMAGE_MAX_ASSETS", raising=False)
+        _set_env(monkeypatch)
+        assert ExporterSettings().image_max_assets == 0  # type: ignore[call-arg]
+
+    def test_a_cap_is_read_from_the_environment(self, monkeypatch) -> None:
+        _set_env(monkeypatch, EXPORTER_IMAGE_MAX_ASSETS="1000")
+        assert ExporterSettings().image_max_assets == 1000  # type: ignore[call-arg]
+
+    def test_a_negative_cap_is_refused(self, monkeypatch) -> None:
+        _set_env(monkeypatch, EXPORTER_IMAGE_MAX_ASSETS="-1")
+        with pytest.raises(pydantic.ValidationError):
+            ExporterSettings()  # type: ignore[call-arg]

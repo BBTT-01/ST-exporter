@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -13,6 +14,40 @@ from st_cli.exceptions import APIError, NotFoundError, RateLimitError, Transport
 
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.0  # seconds
+
+
+@dataclass(frozen=True)
+class FetchedFile:
+    """One file response, WITH the two headers a conditional re-fetch needs.
+
+    ``get_bytes`` throws the response headers away, which is fine for a caller
+    that always wants the bytes. A caller that wants to ask "have these bytes
+    changed?" needs three more facts: the status (304 means "no", and carries no
+    body at all), and the ``ETag`` / ``Last-Modified`` validators to quote back
+    next time. Those are the only headers kept, deliberately — this is not a
+    general response object.
+    """
+
+    status_code: int
+    content: bytes
+    content_type: str | None
+    etag: str | None
+    last_modified: str | None
+
+    @property
+    def not_modified(self) -> bool:
+        """True for a 304: the server confirmed our copy without sending bytes."""
+        return self.status_code == 304
+
+    @property
+    def has_validator(self) -> bool:
+        """True when the server offered something to quote back next time.
+
+        False means conditional requests are inert for this asset and the caller
+        must fall back to re-downloading it on whatever schedule it would have
+        used before validators existed.
+        """
+        return bool(self.etag or self.last_modified)
 
 
 def _is_retriable_transport(method: str, exc: httpx.HTTPError, *, idempotent: bool = False) -> bool:
@@ -121,8 +156,33 @@ class ServiceTitanClient:
         auth header, 401 refresh, 429 backoff, error mapping — is identical;
         only the decoding differs.
         """
-        resp = self._send("GET", module, resource, params=params)
-        return resp.content, resp.headers.get("content-type")
+        fetched = self.get_file(module, resource, params=params)
+        return fetched.content, fetched.content_type
+
+    def get_file(
+        self,
+        module: str,
+        resource: str,
+        params: dict[str, Any] | None = None,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> FetchedFile:
+        """``get_bytes`` plus the status and the two cache validators.
+
+        ``headers`` is merged OVER the auth headers, which is what lets a caller
+        send ``If-None-Match`` / ``If-Modified-Since``. A 304 is NOT an error —
+        it is the cheapest possible success — so it travels back as a
+        ``FetchedFile`` with an empty body rather than raising; only >= 400 maps
+        onto the exception hierarchy, exactly as before.
+        """
+        resp = self._send("GET", module, resource, params=params, headers=headers)
+        return FetchedFile(
+            status_code=resp.status_code,
+            content=resp.content,
+            content_type=resp.headers.get("content-type"),
+            etag=resp.headers.get("etag"),
+            last_modified=resp.headers.get("last-modified"),
+        )
 
     def _request(
         self,
@@ -148,6 +208,7 @@ class ServiceTitanClient:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
         idempotent: bool = False,
+        headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         """Issue one API call and map failures onto the exception hierarchy.
 
@@ -164,11 +225,19 @@ class ServiceTitanClient:
         url = self._url(module, resource)
         retries = 0
         refreshed = False
+        extra = dict(headers or {})
 
         while True:
             try:
                 resp = self._http.request(
-                    method, url, headers=self._headers(), params=params, json=json_body
+                    method,
+                    url,
+                    # Rebuilt each pass, because a 401 refresh replaces the token
+                    # mid-loop. `extra` is merged over it so a caller-supplied
+                    # header wins, and so it survives the refresh.
+                    headers={**self._headers(), **extra},
+                    params=params,
+                    json=json_body,
                 )
             except httpx.HTTPError as exc:
                 # No status came back at all — DNS, connect, TLS, read timeout.

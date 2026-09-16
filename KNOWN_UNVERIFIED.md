@@ -676,9 +676,75 @@ is the behaviour the `pricebook.*` tabs' own full-replace-every-run design makes
 moot, so nothing in this repo has ever had to depend on it before.
 
 If the assumption is wrong, the failure is a DELAY, not a wrong picture, and it
-is bounded on purpose: `REVERIFY_AFTER_DAYS` (7) re-downloads every asset at
+is bounded on purpose: `REVERIFY_AFTER_DAYS` (7) re-verifies every asset at
 least that often whatever the timestamps say, so a swapped image reaches
 TrueQuote within a week at worst. Check on a real tenant by replacing one item's
 image and watching whether the next `images-feed` run re-uploads it or reports
 it in `images_revalidated`. If it does not, lower `REVERIFY_AFTER_DAYS`; do not
 remove the check, or the pass stops converging.
+
+**This entry is NOT resolved by conditional requests** (below), and the two are
+easy to conflate. A conditional fetch only happens once the `modifiedOn`
+shortcut has already declined to skip the asset — so if `modifiedOn` never moves
+when an image is replaced, the thing that still catches it is the weekly
+re-verification, not the `ETag`. What conditional requests changed is what that
+weekly re-verification COSTS, not whether it happens.
+
+## Images feed: does ServiceTitan (or its CDN) honour conditional requests?
+
+`src/st_exporter/images/conditional.py`, `src/st_exporter/images/upload.py`
+(`_fetch`), `src/st_exporter/images/ledger.py` (`etag` / `last_modified`)
+
+The weekly re-verification above used to be a full re-download of every asset.
+It now sends `If-None-Match` / `If-Modified-Since` built from whatever the
+server returned last time, and treats a **304** as a verification that moved no
+bytes. **Nobody has measured whether that works against a real tenant.** Three
+separate things are unknown, and they can have different answers on the
+authenticated `pricebook/v2/tenant/{id}/images` endpoint and on the public CDN
+urls ServiceTitan hands out:
+
+1. Do responses carry an `ETag` or a `Last-Modified` at all?
+2. If we quote one back, does anything answer 304, or is the header ignored?
+3. Are the asset urls **signed** (`?X-Amz-Signature=…`, `?sig=…`)? A signed url
+   defeats the mechanism twice over: the validator belongs to a url we will
+   never request again, and for an asset with no ServiceTitan `id` the ledger's
+   own `asset_ref` is built from the url, so the previous run's entry is not
+   even found. This one cannot be worked around from this side.
+
+**The code does not depend on any of the three answers.** No stored validator
+means a plain GET and a full download — exactly the behaviour that existed
+before — and an ignored validator means a 200, also exactly that behaviour. The
+feature can only make the pass cheaper, never wrong.
+
+**How to read the answer off one live run.** Every `images` run logs
+
+```
+image conditional requests: fetches=… conditional_sent=… not_modified=…
+conditional_missed=… validators_present=… validators_absent=… weak_etags=…
+signed_urls=… unstable_refs=… -- <one English sentence>
+```
+
+and the run's own summary line carries `images_not_modified=`,
+`images_conditional_sent=`, `images_no_validator=` and `images_signed_urls=`.
+
+**What a good result looks like**, on the second run after this ships (the first
+run only STORES validators; it cannot yet test them):
+
+- `validators_absent=0` — every response offers something to quote back;
+- `conditional_sent` ≈ the number of assets due for re-verification, and
+  `not_modified` equal or close to it, so the verdict reads
+  `conditional requests WORK: N/N (100%)`;
+- `signed_urls=0`, and `unstable_refs=0` above all.
+
+**What each bad result means.**
+
+- `validators_absent` high, `conditional_sent=0` → the server offers nothing;
+  conditional requests are inert on this tenant and the weekly sweep still costs
+  a full re-download. Nothing here is broken; the ticket simply did not buy
+  anything, and the next lever is a longer interval or an asset-level `modifiedOn`
+  if ServiceTitan ever exposes one.
+- `conditional_sent` high, `not_modified=0` → the headers are being ignored (or
+  the urls rotate). Check `signed_urls` before concluding anything.
+- `unstable_refs > 0` → those assets can never be deduplicated at all, by any
+  mechanism in this repo, because their ledger identity changes every listing.
+  That is a much bigger finding than this ticket and should be raised on its own.

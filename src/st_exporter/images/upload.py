@@ -59,6 +59,34 @@ for ever, with no way for it to ever converge.
   dissolves it: an item ServiceTitan has not modified since the ledger last
   confirmed its asset cannot have new bytes, so the download is skipped outright.
 
+THE DECISION ORDER, THREE STEPS, CHEAPEST FIRST
+===============================================
+
+1. ``modifiedOn`` unchanged since the ledger's last verification, and that
+   verification is younger than ``REVERIFY_AFTER_DAYS`` — skip entirely. **No
+   request at all.** Counted as ``revalidated``.
+2. Otherwise fetch it, quoting back whatever ``ETag``/``Last-Modified`` the
+   ledger stored for it (``images/conditional.py``). A **304** means the server
+   checked and there are no new bytes: verification refreshed, nothing
+   downloaded, nothing uploaded. Counted as ``not_modified``.
+3. A **200** is new bytes and proceeds exactly as it always did — hash, dedupe,
+   upload — and the response's validators are stored so step 2 can be cheap next
+   time.
+
+Step 2 is what replaced a blanket weekly RE-DOWNLOAD of the whole catalogue. The
+weekly sweep still happens, at the same interval, for the same reason (the
+``modifiedOn`` in step 1 is an ITEM-level timestamp standing in for an
+ASSET-level change, and nobody has confirmed on a live tenant that replacing an
+image moves it — KNOWN_UNVERIFIED.md). What changed is its price: a request and
+a 304 instead of an image.
+
+**Nothing here assumes ServiceTitan honours conditional requests.** With no
+stored validator the fetch is a plain GET and the behaviour is identical to
+before; with a validator that the server ignores, the answer is a 200 and the
+behaviour is identical to before. The one thing the pass insists on is measuring
+which of those is happening — ``ConditionalReport`` counts it and the pass logs
+one line per run saying so in English.
+
 Neither the order nor the ledger is a queue. The catalogue is still the queue,
 and the ledger still only ever says what has already been delivered: losing it
 costs bandwidth, never correctness.
@@ -88,6 +116,7 @@ from st_exporter.images.client import (
     ImageUploadRejected,
     TrueQuoteImageClient,
 )
+from st_exporter.images.conditional import ConditionalReport, Validators
 from st_exporter.images.ledger import ImageLedger, ImageLedgerEntry
 from st_exporter.logging_setup import logger
 
@@ -103,12 +132,38 @@ _MAX_TEXT_FIELD = 300
 # The one `stopped` reason a larger `job_timeout_minutes` fixes.
 BUDGET_SPENT = "time budget for the image pass spent"
 
-# However fresh `modifiedOn` says an asset is, re-download it after this long.
+# The other `stopped` reason, and a DIFFERENT knob: `EXPORTER_IMAGE_MAX_ASSETS`.
+# Deliberately distinguishable from BUDGET_SPENT in the run's own output,
+# because the two ask for opposite fixes — one for more minutes, one for a
+# larger (or no) cap — and a single "stopped" would send an operator to the
+# wrong dial.
+ASSET_CAP_REACHED = "per-run asset cap reached"
+
+# No cap at all, and the DEFAULT. A number here would silently truncate a large
+# catalogue for ever on any caller that never thought about it, and the failure
+# mode would be invisible: a tenant permanently missing its last N images with a
+# clean-looking run. Unlimited is the honest default; a caller that wants the
+# pass bounded says so, and the run then says so back (see ASSET_CAP_REACHED).
+NO_ASSET_CAP = 0
+
+# However fresh `modifiedOn` says an asset is, RE-VERIFY it after this long.
+#
 # `_is_still_fresh` rests on ServiceTitan bumping an item's `modifiedOn` when
 # its image is replaced, which no live tenant has been used to confirm (see
 # KNOWN_UNVERIFIED.md). If that assumption is ever wrong the cost must be a
-# delay, not a permanently wrong image — so every asset is re-verified from the
-# bytes at least this often, whatever the timestamps say.
+# delay, not a permanently wrong image — so every asset is re-verified against
+# the SERVER at least this often, whatever the timestamps say.
+#
+# What changed with conditional requests is the PRICE of that insurance, not the
+# interval. It used to mean a full re-download of every asset every week — on
+# ~7,191 assets, for ever. It now means a conditional GET: for any asset whose
+# server returned an `ETag` or a `Last-Modified`, the answer is a 304 with no
+# body, and the weekly sweep costs one request instead of one image. Only assets
+# whose server offered NO validator still pay the full download here, which is
+# precisely the old behaviour preserved for the case the new mechanism cannot
+# cover. The interval stays at 7 because the staleness bound it buys is
+# unchanged and it is now nearly free; lifting it would only trade away
+# freshness for nothing.
 REVERIFY_AFTER_DAYS = 7
 
 
@@ -137,12 +192,33 @@ class ImageUploadSummary:
     # counter that makes a converged sweep legible: on a steady-state catalogue
     # almost everything lands here and the pass costs almost nothing.
     revalidated: int = 0
+    # Assets the SERVER confirmed unchanged with a 304: a request was made, no
+    # bytes came back, nothing was uploaded, and the verification timestamp was
+    # refreshed. Distinct from `revalidated`, which cost no request at all.
+    not_modified: int = 0
+    # Assets this run actually fetched over the network, 304s included. This is
+    # what `max_assets` caps — a `modifiedOn` skip is free and must not consume
+    # a budget that exists to bound WORK.
+    fetched: int = 0
+    # The cap this run was given (`NO_ASSET_CAP` = uncapped). Carried on the
+    # summary, not just read from config, so ONE log line answers both halves of
+    # "why did it stop": the number that was in force, and whether it bit.
+    max_assets: int = NO_ASSET_CAP
+    # What the wire said about conditional-request support. The measurement half
+    # of this feature: nobody has confirmed ServiceTitan honours `If-None-Match`,
+    # so the pass counts rather than assumes. See `images/conditional.py`.
+    conditional: ConditionalReport = field(default_factory=ConditionalReport)
     # Assets this pass never reached. Zero on a pass that saw the catalogue out.
     # The number an operator watches: it falls run over run while a first sweep
     # converges, and a run that leaves it high with `stopped=budget` is asking
     # for a larger `job_timeout_minutes`, not for a bug report.
     pending: int = 0
     seen_keys: set[str] = field(default_factory=set)
+
+    @property
+    def cap_hit(self) -> bool:
+        """True when this run stopped because of the asset cap, not the clock."""
+        return self.stopped == ASSET_CAP_REACHED
 
     @property
     def complete(self) -> bool:
@@ -163,7 +239,10 @@ class ImageUploadSummary:
             f"already={self.already_uploaded} no_image={self.no_image} "
             f"download_failed={self.download_failed} rejected={self.upload_rejected} "
             f"unsupported={self.unsupported} too_large={self.too_large} "
-            f"revalidated={self.revalidated} pending={self.pending} "
+            f"revalidated={self.revalidated} not_modified={self.not_modified} "
+            f"fetched={self.fetched} "
+            f"max_assets={self.max_assets or 'none'} "
+            f"cap_hit={str(self.cap_hit).lower()} pending={self.pending} "
             f"permission_denied={str(self.permission_denied).lower()} "
             f"stopped={self.stopped or 'no'}"
         )
@@ -177,6 +256,7 @@ def upload_pricebook_images(
     *,
     now: str,
     deadline: float | None = None,
+    max_assets: int = NO_ASSET_CAP,
     http: httpx.Client | None = None,
 ) -> ImageUploadSummary:
     """Upload one image per pricebook item. Never raises for a single bad asset.
@@ -184,8 +264,21 @@ def upload_pricebook_images(
     ``deadline`` is a ``time.monotonic()`` reading past which no further asset is
     started. None means no budget, which is only safe where nothing will kill the
     process — in tests, and in a local run.
+
+    ``max_assets`` caps how many assets this run FETCHES — how many reach the
+    network at all. ``NO_ASSET_CAP`` (0, the default) means no cap. Two stopping
+    conditions, not one, because they bound different things: the deadline bounds
+    the CLOCK (and the thing it protects is the ledger flush), the cap bounds the
+    WORK (and the thing it protects is a tenant's rate limit and bandwidth while
+    a strategy settles). They set different ``stopped`` reasons and both flush,
+    because both leave the pass at the end of a whole asset.
+
+    A `modifiedOn` skip never consumes the cap. It costs no request, and a cap
+    that counted it would stop a converged catalogue part-way through a sweep it
+    could have finished for free — and, worse, would make every run report
+    ``stopped`` and so never prune the ledger.
     """
-    summary = ImageUploadSummary()
+    summary = ImageUploadSummary(max_assets=max_assets)
     owns_http = http is None
     public = http or httpx.Client(timeout=_PUBLIC_TIMEOUT, follow_redirects=True)
 
@@ -193,10 +286,14 @@ def upload_pricebook_images(
     attempted = 0
     try:
         for asset in assets:
-            # Checked BEFORE the asset is started, never in the middle of one:
-            # the point is to end on a whole asset with a flushable ledger.
+            # Both checks happen BEFORE the asset is started, never in the
+            # middle of one: the point is to end on a whole asset with a
+            # flushable ledger.
             if deadline is not None and monotonic() >= deadline:
                 summary.stopped = BUDGET_SPENT
+                break
+            if max_assets != NO_ASSET_CAP and summary.fetched >= max_assets:
+                summary.stopped = ASSET_CAP_REACHED
                 break
             attempted += 1
             summary.considered += 1
@@ -214,6 +311,21 @@ def upload_pricebook_images(
             "Raise the caller job's `job_timeout_minutes` to converge sooner.",
             summary.pending,
         )
+    elif summary.stopped == ASSET_CAP_REACHED:
+        logger.warning(
+            "image pass stopped on its per-run asset cap (EXPORTER_IMAGE_MAX_ASSETS=%d) "
+            "after fetching %d asset(s), with %d still to visit; the next run starts "
+            "with them, because they are the least recently verified. Raise or remove "
+            "the cap (0 = no cap) to converge sooner.",
+            max_assets,
+            summary.fetched,
+            summary.pending,
+        )
+    logger.info(
+        "image conditional requests: %s -- %s",
+        summary.conditional.as_log_fields(),
+        summary.conditional.verdict(),
+    )
     return summary
 
 
@@ -264,7 +376,9 @@ def _is_still_fresh(asset: PricebookAsset, ledger: ImageLedger, *, now: str) -> 
     - that modification is no LATER than our confirmation, so no new bytes can
       have appeared since;
     - and the confirmation is recent enough that we are still willing to trust
-      the ``modifiedOn`` contract at all (``REVERIFY_AFTER_DAYS``).
+      the ``modifiedOn`` contract at all (``REVERIFY_AFTER_DAYS``). Failing THIS
+      one no longer means a download: it means a conditional fetch, which on a
+      server that offers validators costs a request and a 304.
 
     Both timestamps are ISO-8601 UTC — ours is ``datetime.now(timezone.utc)``,
     ServiceTitan's is the same shape — so a string compare is a time compare. A
@@ -318,14 +432,33 @@ def _upload_one(
         # Already told, once, that this tenant will not serve image bytes.
         return True
 
-    payload = _download(client, public, asset, summary)
-    if payload is None:
-        # `_download` sets `stopped` when the failure is about the CONNECTION to
+    ref = asset_ref(asset)
+    stored = Validators(*ledger.validators_for(ref))
+    summary.conditional.observe_asset(
+        source_url=asset.source_url, has_asset_id=bool(asset.asset_id)
+    )
+    summary.fetched += 1
+    fetched = _fetch(client, public, asset, summary, stored)
+    if fetched is None:
+        # `_fetch` sets `stopped` when the failure is about the CONNECTION to
         # ServiceTitan rather than about this one asset; carrying on would spend
         # the same doomed retry budget on every remaining asset and can run the
         # whole workflow past its `timeout-minutes`.
         return summary.stopped is None
 
+    if fetched.payload is None:
+        # 304 NOT MODIFIED. The server checked our validator against the live
+        # bytes and said "nothing new" — which is the same conclusion the old
+        # weekly re-download reached, after moving the whole image to reach it.
+        # No bytes, no content hash, no upload; just a fresh verification, keyed
+        # on the ASSET rather than on a content hash we did not compute.
+        summary.not_modified += 1
+        summary.already_uploaded += 1
+        summary.seen_keys |= ledger.keys_for(ref)
+        ledger.verify_ref(ref, now)
+        return True
+
+    payload = fetched.payload
     if len(payload) > MAX_IMAGE_BYTES:
         summary.too_large += 1
         logger.info("pricebook image over the %d byte cap; skipped", MAX_IMAGE_BYTES)
@@ -345,7 +478,12 @@ def _upload_one(
         # timestamp and this asset is re-downloaded first on every run for ever,
         # and the assets behind it are never reached — which is precisely the
         # shape run 35130164187 was stuck in.
-        ledger.verify(key, now)
+        #
+        # The validators are stored on the way past even though these bytes were
+        # already delivered: this is the run that TEACHES the ledger what to
+        # quote back, so the NEXT weekly re-verification of this asset can be a
+        # 304 instead of a download.
+        ledger.verify(key, now, etag=fetched.etag, last_modified=fetched.last_modified)
         return True
 
     if len(asset.identity) > _MAX_TEXT_FIELD:
@@ -370,9 +508,11 @@ def _upload_one(
         ledger.record(
             ImageLedgerEntry(
                 idempotency_key=key,
-                asset_ref=asset_ref(asset),
+                asset_ref=ref,
                 storage_path=result.storage_path,
                 verified_at=now,
+                etag=fetched.etag,
+                last_modified=fetched.last_modified,
             )
         )
         return True
@@ -397,22 +537,69 @@ def _upload_one(
     return True
 
 
-def _download(
+@dataclass(frozen=True)
+class _Fetched:
+    """The outcome of one asset fetch that reached a status.
+
+    ``payload is None`` means 304 Not Modified: the server confirmed our copy
+    and sent no body. Anything else is bytes.
+    """
+
+    payload: bytes | None
+    etag: str = ""
+    last_modified: str = ""
+
+
+def _fetch(
     client: ServiceTitanClient,
     public: httpx.Client,
     asset: PricebookAsset,
     summary: ImageUploadSummary,
-) -> bytes | None:
-    """Bytes for one asset, or None when it could not be fetched (already counted)."""
+    stored: Validators,
+) -> _Fetched | None:
+    """One asset, fetched CONDITIONALLY where we have something to quote back.
+
+    Returns None when it could not be fetched at all (already counted).
+
+    ``stored`` carries the ``ETag``/``Last-Modified`` the ledger kept from the
+    last successful fetch of this asset. When it is empty — a first fetch, a
+    pre-upgrade ledger row, or a server that offers no validators — the headers
+    are empty too and this is precisely the unconditional GET it has always
+    been. That is the fallback, and it is the default: nothing here assumes
+    ServiceTitan implements conditional requests, and the one thing the pass
+    insists on is COUNTING what came back (``summary.conditional``).
+    """
+    conditional_headers = stored.headers()
     try:
         if is_storage_path(asset.source_url):
-            payload, _ = client.get_bytes(
-                _IMAGES_MODULE, _IMAGES_RESOURCE, params={"path": asset.source_url}
+            file = client.get_file(
+                _IMAGES_MODULE,
+                _IMAGES_RESOURCE,
+                params={"path": asset.source_url},
+                headers=conditional_headers or None,
             )
-            return payload
-        resp = public.get(asset.source_url)
-        resp.raise_for_status()
-        return resp.content
+            status, body = file.status_code, file.content
+            etag, last_modified = file.etag, file.last_modified
+        else:
+            resp = public.get(asset.source_url, headers=conditional_headers)
+            # 304 is a success, and `raise_for_status` agrees (it raises only on
+            # 4xx/5xx) — but say so explicitly, because a future httpx that
+            # treated 3xx as an error here would silently turn every cheap
+            # verification into a `download_failed`.
+            if resp.status_code != 304:
+                resp.raise_for_status()
+            status, body = resp.status_code, resp.content
+            etag = resp.headers.get("etag")
+            last_modified = resp.headers.get("last-modified")
+        summary.conditional.observe_response(
+            conditional=bool(conditional_headers),
+            status_code=status,
+            etag=etag,
+            last_modified=last_modified,
+        )
+        if status == 304:
+            return _Fetched(payload=None)
+        return _Fetched(payload=body, etag=etag or "", last_modified=last_modified or "")
     except APIError as exc:
         if exc.status_code == 403:
             summary.permission_denied = True

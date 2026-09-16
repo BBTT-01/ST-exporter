@@ -30,7 +30,26 @@ _TAB_NAME = "_image_ledger"
 # positionally identical, so an existing ledger loads unchanged. The name is the
 # honest one: the value is refreshed every time a later run confirms the same
 # bytes are still delivered, not only when bytes are sent.
-_COLUMNS = ("idempotency_key", "asset_ref", "storage_path", "verified_at")
+#
+# `etag` / `last_modified` are the HTTP cache validators the SERVER gave us for
+# these bytes, quoted back on the next check as `If-None-Match` /
+# `If-Modified-Since` so an unchanged asset answers 304 and costs no bytes. Both
+# blank is the ordinary, supported state — it means that server offered no
+# validator (or that this row predates the columns), and the pass then falls
+# back to downloading the asset outright, which is what it always did.
+_COLUMNS = (
+    "idempotency_key",
+    "asset_ref",
+    "storage_path",
+    "verified_at",
+    "etag",
+    "last_modified",
+)
+# How many leading columns a row MUST have to be usable. Every ledger written
+# before conditional requests existed has exactly these four and nothing else;
+# requiring all six would silently discard the whole existing ledger on the
+# upgrade run and re-upload a 7,000-image catalogue from scratch.
+_REQUIRED_COLUMNS = 4
 
 
 @dataclass(frozen=True)
@@ -39,6 +58,11 @@ class ImageLedgerEntry:
     asset_ref: str
     storage_path: str
     verified_at: str
+    # The server's own validators for these exact bytes. Blank when it offered
+    # none — never invented, because a fabricated `If-None-Match` would get a
+    # 200 at best and a wrong 304 at worst.
+    etag: str = ""
+    last_modified: str = ""
 
 
 class ImageLedger:
@@ -72,9 +96,14 @@ class ImageLedger:
             return
         grid = self._store.read_grid(_TAB_NAME)
         for row in grid[1:]:  # skip header
-            if len(row) < len(_COLUMNS):
+            if len(row) < _REQUIRED_COLUMNS:
                 continue  # malformed row; never crash a run over ledger corruption
-            self._remember(ImageLedgerEntry(*row[: len(_COLUMNS)]))
+            # Pad rather than reject: a four-column row is a PRE-VALIDATOR row,
+            # not a corrupt one, and it must keep its `verified_at` — that is
+            # what stops the upgrade run re-downloading the whole catalogue.
+            padded = list(row[: len(_COLUMNS)])
+            padded += [""] * (len(_COLUMNS) - len(padded))
+            self._remember(ImageLedgerEntry(*padded))
         self._loaded = True
 
     def _remember(self, entry: ImageLedgerEntry) -> None:
@@ -102,6 +131,28 @@ class ImageLedger:
         self._ensure_loaded()
         return self._by_ref.get(asset_ref)
 
+    def validators_for(self, asset_ref: str) -> tuple[str, str]:
+        """``(etag, last_modified)`` from this asset's most recent entry.
+
+        Empty strings mean "nothing to quote back" — either the server never
+        offered a validator or this row predates the columns — and the caller
+        then issues a plain, unconditional GET. Picking the most recently
+        verified entry matters because one asset can hold several keys (a
+        replaced image leaves its predecessor behind until ``keep`` prunes it)
+        and only the newest one describes the bytes TrueQuote currently holds.
+        """
+        self._ensure_loaded()
+        newest: ImageLedgerEntry | None = None
+        for key in self._keys_by_ref.get(asset_ref, ()):
+            entry = self._entries.get(key)
+            if entry is None:
+                continue
+            if newest is None or entry.verified_at > newest.verified_at:
+                newest = entry
+        if newest is None:
+            return ("", "")
+        return (newest.etag, newest.last_modified)
+
     def keys_for(self, asset_ref: str) -> set[str]:
         """Every key this ledger holds for one asset.
 
@@ -117,18 +168,59 @@ class ImageLedger:
         self._ensure_loaded()
         self._remember(entry)
 
-    def verify(self, idempotency_key: str, now: str) -> None:
+    def verify(
+        self,
+        idempotency_key: str,
+        now: str,
+        *,
+        etag: str | None = None,
+        last_modified: str | None = None,
+    ) -> None:
         """Note that these exact bytes were re-checked and are still delivered.
 
         Without this an already-uploaded asset would keep its original timestamp
         for ever, sort to the front of every later pass, and be re-examined on
         every run while the assets behind it were never reached.
+
+        ``etag``/``last_modified`` are stored when the server supplied them.
+        None leaves whatever is already there — a re-check that produced no new
+        validator must not erase the one that made the check cheap.
         """
         self._ensure_loaded()
         entry = self._entries.get(idempotency_key)
         if entry is None:
             return
-        self._remember(replace(entry, verified_at=now))
+        self._remember(
+            replace(
+                entry,
+                verified_at=now,
+                etag=entry.etag if etag is None else etag,
+                last_modified=entry.last_modified if last_modified is None else last_modified,
+            )
+        )
+
+    def verify_ref(
+        self,
+        asset_ref: str,
+        now: str,
+        *,
+        etag: str | None = None,
+        last_modified: str | None = None,
+    ) -> None:
+        """Re-stamp EVERY key this asset holds. The 304 door.
+
+        A 304 proves the bytes behind this asset are unchanged, but it carries
+        no body — so no content hash, so no idempotency key to look up. The
+        asset reference is the only handle the pass has, and every key filed
+        under it describes bytes that were delivered at some point, so all of
+        them are re-verified together. Without this a 304 would leave the asset
+        with its old timestamp, sorting it to the front of the next pass for
+        ever: the same non-convergence the deadline and the ordering exist to
+        prevent.
+        """
+        self._ensure_loaded()
+        for key in tuple(self._keys_by_ref.get(asset_ref, ())):
+            self.verify(key, now, etag=etag, last_modified=last_modified)
 
     def keep(self, idempotency_keys: set[str]) -> None:
         """Drop entries for assets this run no longer sees.
@@ -152,7 +244,14 @@ class ImageLedger:
             return
         grid: list[list[str]] = [list(_COLUMNS)]
         grid.extend(
-            [e.idempotency_key, e.asset_ref, e.storage_path, e.verified_at]
+            [
+                e.idempotency_key,
+                e.asset_ref,
+                e.storage_path,
+                e.verified_at,
+                e.etag,
+                e.last_modified,
+            ]
             for e in self._entries.values()
         )
         self._store.replace_grid(_TAB_NAME, grid)
