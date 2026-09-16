@@ -49,6 +49,7 @@ JOB_COLUMNS: tuple[str, ...] = (
     # additive under `docs/export-contract.md` — consumers look columns up by
     # name and ignore the rest — so `jobs.v2` does not become `jobs.v3`.
     "completed_on",
+    "total_revenue",
 )
 
 TECHNICIAN_COLUMNS: tuple[str, ...] = ("st_technician_id", "name", "email", "active")

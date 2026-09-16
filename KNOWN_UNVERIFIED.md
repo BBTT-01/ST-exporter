@@ -103,6 +103,55 @@ checked rather than exempted anyway — an exemption would silence the exact sig
 this entry exists to produce, and "no completed jobs at all in 90 days" is itself
 worth a look.
 
+## Jobs feed: WHERE a job's billed revenue lives
+
+`src/st_exporter/denormalize.py`, `_TOTAL_REVENUE_KEYS`
+
+The `jobs` tab's `total_revenue` column reads `total`, falling back to
+`invoiceTotal`.
+
+**Why these two and in this order.** It is the DIRECT path's own expression.
+Profit Wizard fills `jobs.total_revenue` from
+`(job.total || job.invoiceTotal) ?? undefined`
+(`profitwizard/lib/crm/servicetitan.ts:856`), and that is the ONLY code path in
+Profit Wizard that writes the column. Reading the same two fields in the same
+order is what makes hosted numbers comparable to the direct baseline: the QA
+sweep that found this gap is a direct-vs-hosted comparison, so a different source
+would produce a different figure for the same job and break the comparison even
+when it was arguably a better number.
+
+**What is inferred.** That these fields exist on the JPM job record at all. The
+inference is not weak — the direct baseline carries revenue on 446 jobs and line
+856 is the only thing that could have put it there, so at least one of the two is
+real and populated on ~446 of that tenant's jobs. But Profit Wizard's `STJob`
+interface is a statement of belief about the API, not proof, and it has been
+wrong before in exactly this way: the comment above `jobTypeId` in that same file
+records that its `type`/`jobType` fields are "near-always undefined in practice",
+which silently sent all 2894/2896 production job rows down a `custom` fallback.
+And as with `completed_on`, the EXPORT change-feed has not been inspected for
+either field.
+
+**There is a second, larger source already in the export if this one is empty.**
+`accounting.invoices` carries `ItemTotal` per invoice LINE — 2817 rows live on
+`tr-doorservpro` — which is billed revenue at a finer grain and covers more jobs
+than 446. It is not used here because summing it would produce numbers that
+disagree with the direct baseline, and because Profit Wizard already parses
+`ItemTotal` into `itemTotal` and then discards it: `aggregateInvoiceLines`
+(`lib/hosted/sync.ts:173`) uses it only to detect negative price-modifier lines
+for `discount_total`, accumulates only `itemTotalCost` into material/equipment,
+and returns `{material, equipment, discount}` with no revenue field at all. So
+the hosted path never writes `total_revenue` from any source. **That is a Profit
+Wizard-side gap and it is not fixed by this column** — it is simply a different,
+already-available route to the same fact, worth taking if `total`/`invoiceTotal`
+turn out to be absent.
+
+**How the first live run answers it.** `total_revenue` is deliberately NOT in
+`blank_columns.ALL_BLANK_OK`, so if neither field exists the next `jobs` run
+emits `BLANK COLUMN: jobs.total_revenue is empty on all N rows` as a WARNING and
+an Actions annotation. The baseline to check against: the direct pull has revenue
+on 446 of ~999 jobs, so a correct reading is a few hundred populated cells, not
+zero — and notably not all of them either.
+
 ## Financial feed: how ServiceTitan marks a report as custom
 
 `src/st_exporter/feeds/reporting.py`, `_CUSTOM_BOOLEAN_FIELDS`, `_CUSTOM_KIND_FIELDS`

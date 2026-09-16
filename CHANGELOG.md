@@ -4,6 +4,40 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Billed revenue on the `jobs` tab
+
+### Added: `jobs.total_revenue`, appended (NOT a contract bump)
+
+`total_revenue` is 0 on all 1701 hosted jobs while the direct baseline carries it
+on 446, so every margin and profitability surface in Profit Wizard is empty. PW
+refuses to compute a margin from half an input rather than show a wrong one, so
+the product is hollow rather than wrong — but hollow is most of what a product
+called Profit Wizard is for.
+
+Read from the job's `total`, falling back to `invoiceTotal` — **the direct path's
+own expression**, `(job.total || job.invoiceTotal)`
+(`profitwizard/lib/crm/servicetitan.ts:856`), which is the only code in PW that
+writes the column. Using the same source in the same order is what makes hosted
+numbers comparable to the baseline the QA sweep measures against; a different
+source would produce a different figure for the same job.
+
+One deliberate difference: PW's `||` lets a genuine `0` total fall through to
+`invoiceTotal`. This treats `0` as a value, because a zero-dollar job is a real
+fact and this contract is explicit that blank is not zero.
+
+Appended last; the feed stays at `jobs.v2` for the same reason `completed_on` did.
+
+**A Profit Wizard-side gap found while sourcing this, which this column does not
+fix.** The hosted sync never writes `total_revenue` from any source.
+`aggregateInvoiceLines` (`lib/hosted/sync.ts:173`) already parses `ItemTotal`
+off the exported `accounting.invoices` tab — 2817 rows live — but uses it only to
+detect negative price-modifier lines for `discount_total`, accumulates only
+`itemTotalCost` into material/equipment, and returns no revenue field. So the
+premise that there is "no revenue feed anywhere in the export" was not right:
+billed revenue has been in the Sheet all along and is being discarded on read.
+`KNOWN_UNVERIFIED.md` records it as the fallback source if `total`/`invoiceTotal`
+turn out to be absent on the export change-feed.
+
 ## [Unreleased] · Two reports, one name: the job-cost tab can be unblocked
 
 ### Fixed: `reporting.jobCosts` on a tenant with duplicate report names
@@ -49,6 +83,7 @@ Unset, everything behaves exactly as before.
 declare the frozen column set — likely, if one is a copy — somebody still has to
 say which is genuine, either by deleting/renaming the duplicate in ServiceTitan
 or by setting the pin.
+
 
 ## [Unreleased] · A real completion timestamp on the `jobs` tab
 
