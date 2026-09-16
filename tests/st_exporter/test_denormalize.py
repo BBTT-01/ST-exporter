@@ -881,3 +881,90 @@ def test_job_number_is_derived_from_the_job_number_not_copied_from_the_id() -> N
     assert row["st_job_id"] == 4821
     assert row["job_number"] == "1007"
     assert str(row["job_number"]) != str(row["st_job_id"])
+
+
+# --- total_revenue -------------------------------------------------------------
+#
+# `total_revenue` is 0 on all 1701 hosted jobs while the direct baseline carries
+# it on 446, so every margin and profitability surface in Profit Wizard is empty.
+# The source here is the DIRECT path's own — PW fills the column from
+# `(job.total || job.invoiceTotal)` (lib/crm/servicetitan.ts:856) and that is the
+# only thing in PW that writes it — so the two paths produce the same figure for
+# the same job, which is what makes the QA comparison meaningful.
+
+
+def test_total_revenue_comes_from_the_job_total() -> None:
+    jobs = _cache({"id": 1, "jobStatus": "Completed", "total": 1250.50})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["total_revenue"] == 1250.50
+
+
+def test_total_revenue_falls_back_to_invoice_total() -> None:
+    """The second half of the direct path's `job.total || job.invoiceTotal`."""
+    jobs = _cache({"id": 1, "jobStatus": "Completed", "invoiceTotal": 980})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["total_revenue"] == 980
+
+
+def test_total_revenue_prefers_total_over_invoice_total() -> None:
+    jobs = _cache({"id": 1, "total": 1250.50, "invoiceTotal": 999})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["total_revenue"] == 1250.50
+
+
+def test_a_zero_dollar_job_exports_zero_not_blank() -> None:
+    """Blank is not zero, and this is where the two part company with Profit
+    Wizard's own expression.
+
+    PW uses `job.total || job.invoiceTotal`, so a genuine `0` total is falsy and
+    falls through to `invoiceTotal`. This exporter treats `0` as a value, because
+    a zero-dollar job — a warranty callback, a goodwill visit — is a real fact
+    and the contract is explicit that a blank money cell means ABSENT. Collapsing
+    the two is the same error as turning missing cost into free work.
+    """
+    jobs = _cache({"id": 1, "jobStatus": "Completed", "total": 0, "invoiceTotal": 500})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["total_revenue"] == 0
+
+
+def test_total_revenue_is_blank_when_servicetitan_records_none() -> None:
+    jobs = _cache({"id": 1, "jobStatus": "Scheduled"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["total_revenue"] is None
+
+
+def test_zero_revenue_and_absent_revenue_format_to_different_cells() -> None:
+    """The distinction has to survive into the SHEET, not just the row dict —
+    `""` and `"0"` are what a consumer actually sees, and PW's `toNum` maps the
+    first to null and the second to 0."""
+    from st_exporter.format import JOB_COLUMNS, build_job_grid
+
+    jobs = _cache(
+        {"id": 1, "total": 0, "jobStatus": "Completed"},
+        {"id": 2, "jobStatus": "Scheduled"},
+    )
+    appointments = _cache(
+        {"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"},
+        {"id": 200, "jobId": 2, "start": "2026-09-03T09:00:00-05:00"},
+    )
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+    grid = build_job_grid(result.rows)
+    column = JOB_COLUMNS.index("total_revenue")
+
+    assert [row[column] for row in grid[1:]] == ["0", ""]

@@ -100,6 +100,36 @@ _EXCLUDED_JOB_STATUSES = {"canceled", "cancelled"}
 #: BLANK COLUMN warning and an Actions annotation rather than passing silently.
 _COMPLETED_ON_KEYS: tuple[str, ...] = ("completedOn", "completedOnUtc")
 
+#: Where a JPM job record carries what the customer was billed, in priority order.
+#:
+#: **This is the DIRECT path's own source, deliberately.** Profit Wizard fills
+#: `jobs.total_revenue` from exactly this expression in production —
+#: ``profitwizard/lib/crm/servicetitan.ts:856``,
+#: ``total_revenue: (job.total || job.invoiceTotal) ?? undefined`` — and that is
+#: the only code path in Profit Wizard that writes the column at all. Reading the
+#: same two fields in the same order is what makes the hosted numbers COMPARABLE
+#: to the direct baseline rather than merely plausible: a different source would
+#: produce a different figure for the same job, and the QA sweep that found this
+#: gap is a direct-vs-hosted comparison.
+#:
+#: That the fields exist is inferred, but not weakly: the direct baseline carries
+#: revenue on 446 jobs, and line 856 is the only thing that could have put it
+#: there, so at least one of the two is real and populated on ~446 of that
+#: tenant's jobs.
+#:
+#: The order is Profit Wizard's. One difference, and it is deliberate: PW uses
+#: ``||``, so a genuine ``0`` total falls through to ``invoiceTotal``. This uses
+#: ``_first_present``, which treats ``0`` as a value. A zero-dollar job is a real
+#: fact and this repo's contract is explicit that blank is not zero — collapsing
+#: them is the same error as turning missing cost into free work.
+#:
+#: If neither field exists on the export change-feed's job record, the next run
+#: says so: ``total_revenue`` is not in ``blank_columns.ALL_BLANK_OK``, so a
+#: whole-column blank is reported loudly. See ``KNOWN_UNVERIFIED.md`` — there is
+#: a second, larger source (invoice line ``ItemTotal``) already in the export if
+#: this one turns out to be empty.
+_TOTAL_REVENUE_KEYS: tuple[str, ...] = ("total", "invoiceTotal")
+
 
 def _first_present(*sources: dict[str, Any] | None, keys: tuple[str, ...]) -> Any:
     """Return the first non-``None`` value for any of ``keys`` across ``sources``,
@@ -436,6 +466,13 @@ def build_job_rows(
                     # Blank for a job ServiceTitan has not completed, which is
                     # correct and is what "blank is not zero" means here.
                     "completed_on": _first_present(job, keys=_COMPLETED_ON_KEYS),
+                    # What the customer was billed. Without it every margin and
+                    # profitability surface in Profit Wizard is empty: it
+                    # correctly refuses to compute a margin from half an input
+                    # rather than show a wrong one, so the product is hollow
+                    # rather than wrong. Blank means "no revenue recorded", and
+                    # blank is not zero — a zero-dollar job is its own fact.
+                    "total_revenue": _first_present(job, keys=_TOTAL_REVENUE_KEYS),
                     # Not a contract column; used by run.py to sort deterministically
                     # without re-deriving ints from formatted text.
                     "_sort_key": _sort_key(job.get("id"), appointment_id),
