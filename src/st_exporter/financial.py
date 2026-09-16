@@ -247,6 +247,15 @@ def build_business_unit_row(record: dict[str, Any]) -> dict[str, str]:
     ``Address`` is the same single-line join the `jobs` tab's ``service_address``
     uses, so a business unit's address and a job's address are formatted the same
     way in the same Sheet.
+
+    ``Code`` is **permanently blank, and that is not a bug in this mapping**:
+    ``TenantSettings.V2.BusinessUnitResponse`` has no ``code`` field, nor does its
+    export twin. Do not repoint it at ``accountCode`` or ``conceptCode`` — those
+    belong to the TENANT and are the same string on every unit, so the column
+    would look populated and mean nothing. The reason, and the plan to drop the
+    column at `financial.v2`, are in ``blank_columns.ALL_BLANK_OK`` and
+    KNOWN_UNVERIFIED.md. The read stays so the column fills itself in if
+    ServiceTitan ever adds the field.
     """
     return {
         "BusinessUnitId": _text(record.get("id")),

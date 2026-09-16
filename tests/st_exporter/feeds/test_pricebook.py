@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
 
-from st_exporter.feeds.pricebook import fetch_pricebook_categories, fetch_pricebook_items
+from st_cli.exceptions import APIError
+from st_exporter.feeds.pricebook import (
+    category_name_index,
+    fetch_pricebook_categories,
+    fetch_pricebook_items,
+)
+from st_exporter.pricebook import build_item_row
 
 
 @pytest.fixture()
@@ -96,3 +103,117 @@ def test_categories_endpoint_is_unfiltered(mock_client) -> None:
     mock_client.get.assert_called_once_with(
         "pricebook", "categories", params={"active": "Any", "page": 1, "pageSize": 200}
     )
+
+
+class TestTheTwoCategoryShapes:
+    """`categories` is objects on `services` and bare int ids on `equipment`/`materials`.
+
+    Source: `tenant-pricebook-v2`'s OpenAPI —
+    ``Pricebook.V2.ServiceResponse.categories`` is an array of
+    ``Pricebook.V2.SkuCategoryResponse`` (``id``/``name``/``active``), while
+    ``Pricebook.V2.EquipmentResponse.categories`` and
+    ``Pricebook.V2.MaterialResponse.categories`` are
+    ``{"type": "array", "items": {"type": "integer", "format": "int64"}}``.
+
+    That is exactly what run ``35134016237`` (tenant ``tr-doorservpro``, exporter
+    0.2.11) showed: `pricebook.services` exported its two category columns while
+    `pricebook.equipment` (10041 rows) and `pricebook.materials` (4990 rows) were
+    blank in both — on a tenant whose same run exported 61 categories.
+
+    The responses below are shaped like the real ones, not like the reader.
+    """
+
+    #: One page of `equipment` exactly as ServiceTitan sends it: bare int ids.
+    LIVE_EQUIPMENT = {
+        "id": 100,
+        "code": "DOOR-16x7",
+        "displayName": "16x7 Steel Door",
+        "active": True,
+        "price": 1299.5,
+        "categories": [10, 11],
+        "assets": [],
+        "modifiedOn": "2026-09-03T00:00:00Z",
+    }
+    #: One page of `categories`, the endpoint the names come from.
+    LIVE_CATEGORIES = [
+        {"id": 10, "name": "Service", "active": True, "parentId": None},
+        {"id": 11, "name": "Doors", "active": True, "parentId": 10},
+    ]
+
+    def test_bare_ids_are_named_from_the_categories_endpoint(self, mock_client) -> None:
+        mock_client.get.side_effect = [
+            _envelope([self.LIVE_EQUIPMENT]),
+            _envelope(self.LIVE_CATEGORIES),
+        ]
+        items = fetch_pricebook_items(mock_client, "equipment")
+
+        # BEFORE this fix the reader saw ints where it expected objects, skipped
+        # every one, and produced ("", "") — the blank columns the live run found.
+        assert build_item_row(items[0])["category_ids"] == "10,11"
+        assert build_item_row(items[0])["category_names"] == "Service,Doors"
+
+    def test_the_object_shape_costs_no_extra_request(self, mock_client) -> None:
+        # `services` already carries names, so the categories endpoint is never hit.
+        mock_client.get.side_effect = [
+            _envelope([{"id": 1, "categories": [{"id": 10, "name": "Service"}]}]),
+        ]
+        items = fetch_pricebook_items(mock_client, "services")
+        assert mock_client.get.call_count == 1
+        assert build_item_row(items[0])["category_names"] == "Service"
+
+    def test_an_unknown_id_keeps_its_slot_with_a_blank_name(self, mock_client) -> None:
+        mock_client.get.side_effect = [
+            _envelope([{**self.LIVE_EQUIPMENT, "categories": [10, 999]}]),
+            _envelope(self.LIVE_CATEGORIES),
+        ]
+        row = build_item_row(fetch_pricebook_items(mock_client, "equipment")[0])
+        assert row["category_ids"].split(",") == ["10", "999"]
+        assert row["category_names"].split(",") == ["Service", ""]
+
+    def test_unreadable_categories_still_export_the_ids(self, mock_client) -> None:
+        # Losing the names is not worth losing the tab: category_ids is a usable
+        # join key on its own, and the blank-column detector then reports
+        # category_names truthfully rather than the exporter inventing one.
+        mock_client.get.side_effect = [
+            _envelope([self.LIVE_EQUIPMENT]),
+            APIError(500, "boom"),
+        ]
+        row = build_item_row(fetch_pricebook_items(mock_client, "equipment")[0])
+        assert row["category_ids"] == "10,11"
+        assert row["category_names"] == ","
+
+    def test_an_ungranted_categories_permission_is_not_a_warning(self, mock_client, caplog) -> None:
+        # A 403 is "the contractor never bought Pricebook -> Categories", which
+        # scopes.py keeps at INFO for the tab; warning once per item resource on
+        # every run forever would be noise, not signal.
+        mock_client.get.side_effect = [
+            _envelope([self.LIVE_EQUIPMENT]),
+            APIError(403, "Scope validation failed"),
+        ]
+        with caplog.at_level(logging.INFO, logger="st_exporter"):
+            fetch_pricebook_items(mock_client, "equipment")
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_bare_ids_merge_across_the_serial_category_requests(self, mock_client) -> None:
+        # Quirks 1+3 together: one item returned by two one-id requests, in the
+        # nameless shape. The union must key on the id inside the normalised entry.
+        mock_client.get.side_effect = [
+            _envelope([{"id": 1, "categories": [10]}]),
+            _envelope([{"id": 1, "categories": [11]}]),
+            _envelope(self.LIVE_CATEGORIES),
+        ]
+        items = fetch_pricebook_items(mock_client, "equipment", category_ids=[10, 11])
+        assert len(items) == 1
+        assert build_item_row(items[0])["category_names"] == "Service,Doors"
+
+    def test_the_name_index_walks_nested_subcategories(self) -> None:
+        # Pricebook.V2.CategoryResponse nests `subcategories`, and an item may
+        # reference a nested id, so a top-level-only index would blank those names.
+        index = category_name_index(
+            [{"id": 10, "name": "Service", "subcategories": [{"id": 11, "name": "Doors"}]}]
+        )
+        assert index == {"10": "Service", "11": "Doors"}
+
+    def test_a_record_without_categories_is_untouched(self, mock_client) -> None:
+        mock_client.get.return_value = _envelope([{"id": 1, "code": "A"}])
+        assert fetch_pricebook_items(mock_client, "equipment") == [{"id": 1, "code": "A"}]

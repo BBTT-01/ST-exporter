@@ -72,6 +72,27 @@ ALL_BLANK_OK: dict[str, dict[str, str]] = {
     "pricebook.categories": {
         "parent_id": "Blank at the top level by contract; a flat tree is all blanks.",
     },
+    "settings.businessUnits": {
+        # NOT a tenant that left a field empty: `code` does not exist on this
+        # endpoint at all. `TenantSettings.V2.BusinessUnitResponse` (and its
+        # export twin) in `tenant-settings-v2`'s OpenAPI carries no `code`
+        # property — the only code-ish fields are `accountCode`/`conceptCode`,
+        # which are the franchise account and concept of the TENANT, identical on
+        # every business unit, and `certifiedSentriconSpecialistCode`. So no
+        # tenant can ever populate this column, which is why run 35132986620
+        # (tr-doorservpro) found it blank on all 189 rows.
+        #
+        # It is exempted rather than repointed because there is nothing correct to
+        # point it at, and rather than removed because the column is part of the
+        # released `financial.v1` contract. Profit Wizard's reader
+        # (`lib/hosted/tabs.ts`, BUSINESS_UNIT_COLUMNS) reads only BusinessUnitId,
+        # Name, Address and Active, so nothing downstream is waiting on it:
+        # DROP THIS COLUMN at the next `financial.v2` bump.
+        "Code": (
+            "Absent from the ServiceTitan settings API: BusinessUnitResponse has no "
+            "`code` field, so no tenant can populate it. Drop at financial.v2."
+        ),
+    },
     "payroll.timesheets": {
         "CanceledOn": "Blank unless a job was cancelled; a clean window has none.",
     },

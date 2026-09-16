@@ -5,6 +5,12 @@ null price, a withdrawn item, an item in two categories, a repeated asset, an
 asset that is an authenticated storage path instead of an HTTPS URL, and a child
 category. Ticket 04's recorded fixtures can be taken straight off the grid this
 produces.
+
+**The two `categories` shapes are modelled exactly as ServiceTitan sends them**:
+objects on `services` (`SkuCategoryResponse`), bare int64 ids on `equipment` and
+`materials` — see `tenant-pricebook-v2`'s OpenAPI and run `35134016237`. Pinning
+only the object form here is what let the exporter's object-only reader look
+correct while blanking `category_ids`/`category_names` on 15031 live rows.
 """
 
 from __future__ import annotations
@@ -46,7 +52,8 @@ EQUIPMENT_1 = {
     "description": "Insulated",
     "price": 1299.5,
     "active": True,
-    "categories": [{"id": 10, "name": "Service"}, {"id": 11, "name": "Doors"}],
+    # Bare ids, no names: the real `EquipmentResponse.categories` shape.
+    "categories": [10, 11],
     "manufacturer": "Acme",
     "model": "A-16",
     "assets": [
@@ -63,7 +70,8 @@ MATERIAL_1 = {
     "description": "",
     "price": 0,
     "active": True,
-    "categories": [{"id": 11, "name": "Doors"}],
+    # Bare ids, no names: the real `MaterialResponse.categories` shape.
+    "categories": [11],
     "manufacturer": "Acme",
     "model": "TS-1",
     "assets": [],

@@ -130,6 +130,22 @@ class TestCategories:
         assert row["category_ids"] == "11"
         assert row["category_names"] == "B"
 
+    def test_bare_ids_still_fill_category_ids(self) -> None:
+        # The REAL `equipment`/`materials` shape: `categories` is an array of bare
+        # int64 ids (tenant-pricebook-v2: Pricebook.V2.{Equipment,Material}Response).
+        # Reading only the object form is what blanked BOTH columns on all 10041
+        # equipment and 4990 material rows of run 35134016237 (tr-doorservpro).
+        # `feeds.pricebook` resolves the names before records reach here; this
+        # pins that the ids survive even when it could not.
+        row = build_item_row(_item(categories=[10, 11]))
+        assert row["category_ids"] == "10,11"
+        assert row["category_names"] == ","
+
+    def test_bare_ids_and_objects_mix_without_losing_alignment(self) -> None:
+        row = build_item_row(_item(categories=[10, {"id": 11, "name": "Steel"}]))
+        assert row["category_ids"].split(",") == ["10", "11"]
+        assert row["category_names"].split(",") == ["", "Steel"]
+
 
 class TestImageRefs:
     def test_identifiers_only_never_bytes(self) -> None:
