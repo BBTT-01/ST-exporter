@@ -90,6 +90,24 @@ _PAGE_SIZE = 200
 #: of per-job costs over the financial window is thousands of rows, not millions.
 _MAX_DATA_PAGES = 50
 
+#: Ceiling on how long ONE report pull may spend parked on rate limits, summed
+#: across its pages.
+#:
+#: Reporting allows roughly one run of the same report per minute per tenant and
+#: **each page counts as a run**, so a paginated report is throttled by its own
+#: previous page and a multi-page pull legitimately takes minutes. The client now
+#: honours the server's `Retry-After` instead of giving up after seven seconds
+#: (see `st_cli.client._MAX_RATE_LIMIT_WAIT`), which is what makes this tab
+#: reachable at all — and also what makes a bound necessary, because "wait as
+#: long as you are told, every page, forever" is how a run gets SIGKILLed by the
+#: runner with nothing written and nothing learned.
+#:
+#: Five pages at a ~60s ask is ~5 minutes, comfortably inside a default
+#: `EXPORTER_JOB_TIMEOUT_MINUTES`. Past this the tab is skipped the way every
+#: other reporting failure is skipped: loudly, per-tab, non-fatally, with the
+#: other three financial tabs already written.
+_MAX_RATE_LIMIT_SECONDS_PER_REPORT = 420.0
+
 #: How many name-matching-but-custom reports the refusal will quote. A tenant
 #: cannot have many reports sharing one exact name, so this is a flood stop
 #: rather than a real limit.
@@ -613,7 +631,58 @@ def fetch_report_rows(
     rows: list[dict[str, Any]] = []
     names: list[str] = []
     page = 1
+    # Time this pull has spent parked on 429s, summed across pages. The client
+    # sleeps; this only observes, via the governor hook the client already calls
+    # before every rate-limit sleep.
+    throttled_for = 0.0
+    previous_observer = client.on_rate_limited
+
+    def _observe(wait: float) -> None:
+        nonlocal throttled_for
+        throttled_for += wait
+        if previous_observer is not None:
+            previous_observer(wait)
+
+    client.on_rate_limited = _observe
+    try:
+        return _fetch_report_pages(
+            client,
+            ref,
+            body=body,
+            resource=resource,
+            page_size=page_size,
+            required_columns=required_columns,
+            rows=rows,
+            names=names,
+            page=page,
+            budget=lambda: throttled_for,
+        )
+    finally:
+        client.on_rate_limited = previous_observer
+
+
+def _fetch_report_pages(
+    client: ServiceTitanClient,
+    ref: ReportRef,
+    *,
+    body: dict[str, Any],
+    resource: str,
+    page_size: int,
+    required_columns: Sequence[str],
+    rows: list[dict[str, Any]],
+    names: list[str],
+    page: int,
+    budget: Any,
+) -> list[dict[str, Any]]:
     while True:
+        if budget() > _MAX_RATE_LIMIT_SECONDS_PER_REPORT:
+            raise ReportRateLimitedError(
+                f"the {ref.name!r} report spent {budget():.0f}s waiting on ServiceTitan's "
+                f"rate limiter, past the {_MAX_RATE_LIMIT_SECONDS_PER_REPORT:.0f}s ceiling "
+                f"for one pull (reached on page {page}). Stopping rather than risking the "
+                "whole job being killed for one tab. The other financial tabs are "
+                "unaffected; the next run starts over."
+            )
         try:
             # A read, despite the verb — the parameters simply don't fit a query
             # string. Never gate this behind a mutation guard or a dry-run check.

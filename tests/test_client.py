@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from unittest.mock import patch
 
 import httpx
@@ -376,3 +377,82 @@ class TestConditionalFileFetch:
 
         assert (fetched.etag, fetched.last_modified) == (None, None)
         assert fetched.has_validator is False
+
+
+class TestItWaitsAsLongAsTheServerAsks:
+    """A 429 says how long to wait. Believing it is the difference between
+    `reporting.jobCosts` being writable and being unreachable for ever.
+
+    The exponential curve is 1s + 2s + 4s = SEVEN seconds of total patience.
+    ServiceTitan's reporting endpoint allows roughly one run of the same report
+    per minute per tenant and counts each PAGE as a run, so page 2 of any
+    multi-page report is throttled by page 1 and asks for ~50 seconds. Seven
+    seconds against a fifty-second ask fails 100% of the time — run 35158215902
+    on `BBTT-01/tr-doorservpro`, twice, identically.
+    """
+
+    @respx.mock
+    def test_it_reads_the_wait_out_of_servicetitans_problem_body(self, client, monkeypatch):
+        """ServiceTitan puts the number in the BODY, not the header. Reading only
+        the header is the same as reading nothing on the one endpoint that needs
+        this."""
+        slept = []
+        monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+        route = respx.get(url__regex=r".*/jpm/v2/tenant/.*").mock(
+            side_effect=[
+                httpx.Response(
+                    429,
+                    json={
+                        "status": 429,
+                        "title": "Rate limit is exceeded. Try again in 50 seconds.",
+                    },
+                ),
+                httpx.Response(200, json={"data": [], "hasMore": False}),
+            ]
+        )
+        client.get("jpm", "jobs")
+        assert slept == [50.0]
+        assert route.call_count == 2
+
+    @respx.mock
+    def test_the_retry_after_header_is_preferred_when_present(self, client, monkeypatch):
+        slept = []
+        monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+        respx.get(url__regex=r".*/jpm/v2/tenant/.*").mock(
+            side_effect=[
+                httpx.Response(429, headers={"Retry-After": "12"}, text="Try again in 50 seconds"),
+                httpx.Response(200, json={"data": [], "hasMore": False}),
+            ]
+        )
+        client.get("jpm", "jobs")
+        assert slept == [12.0]
+
+    @respx.mock
+    def test_a_429_with_no_stated_wait_still_uses_the_old_curve(self, client, monkeypatch):
+        """Nothing regresses for an endpoint that says nothing."""
+        slept = []
+        monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+        respx.get(url__regex=r".*/jpm/v2/tenant/.*").mock(
+            side_effect=[
+                httpx.Response(429, text="slow down"),
+                httpx.Response(200, json={"data": [], "hasMore": False}),
+            ]
+        )
+        client.get("jpm", "jobs")
+        assert slept == [1.0]
+
+    @respx.mock
+    def test_an_absurd_ask_is_refused_rather_than_parking_the_run(self, client, monkeypatch):
+        """A job killed by the runner loses everything it had already done; a
+        caller that skips one tab is recoverable. So there is a ceiling."""
+        slept = []
+        monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+        respx.get(url__regex=r".*/jpm/v2/tenant/.*").mock(
+            return_value=httpx.Response(
+                429, json={"title": "Rate limit is exceeded. Try again in 3600 seconds."}
+            )
+        )
+        with pytest.raises(RateLimitError) as excinfo:
+            client.get("jpm", "jobs")
+        assert slept == []
+        assert "3600" in str(excinfo.value)

@@ -4,6 +4,44 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Wait as long as ServiceTitan asks
+
+### Fixed: a 429 that says "try again in 50 seconds" was retried after 7
+
+`reporting.jobCosts` could never have been written on a tenant whose Job Costing
+Summary report is long enough to paginate — not on a manual dispatch, not on the
+six-hourly schedule. Reporting allows roughly one run of the same report per
+minute per tenant, and **each PAGE counts as another run**, so page 2 is always
+throttled by page 1:
+
+> `HTTP 429 {"status":429,"title":"Rate limit is exceeded. Try again in 50
+> seconds."}` — page 2, 11 seconds into the report
+
+The client's 429 backoff is `1s + 2s + 4s`: **seven seconds of total patience**
+against a fifty-second ask. It failed identically on both runs of
+35157864073 / 35158215902 (`BBTT-01/tr-doorservpro`), and would have failed the
+same way for ever. The report was resolved correctly by then — the duplicate-name
+work picked report 21639096 — so this was the last thing standing between the
+tenant and a populated cost tab.
+
+The server states the wait; the client now believes it. `retry_after_seconds`
+reads the RFC 7231 `Retry-After` header (seconds **or** HTTP-date) and falls back
+to ServiceTitan's problem BODY, which is where this API actually puts the number
+and is why reading the header alone would have fixed nothing. With no stated wait
+the old exponential curve is unchanged, so no other endpoint's behaviour moves.
+
+Two ceilings, because "wait as long as you are told" is how a run gets SIGKILLed
+by the runner with nothing written:
+
+- `_MAX_RATE_LIMIT_WAIT` (90s) — the longest ONE request will park. A longer ask
+  is refused as a rate-limit failure rather than slept through.
+- `_MAX_RATE_LIMIT_SECONDS_PER_REPORT` (420s) — the total one report pull may
+  spend throttled, summed across its pages, measured through the governor hook
+  the client already calls. Past it the tab is skipped the way every other
+  reporting failure is skipped: loudly, per-tab, non-fatally, with the other
+  three financial tabs already written. The hook is borrowed and restored, so a
+  caller that holds a real shared governor (the image pass) keeps it.
+
 ## [Unreleased] · The job-cost report refusal says which marker skipped a report
 
 ### Changed: a name-matching report skipped as CUSTOM now names its evidence
