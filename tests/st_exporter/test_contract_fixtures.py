@@ -92,11 +92,22 @@ def _what_to_do(tab_name: str, contract: contracts.FeedContract) -> str:
 
 @pytest.mark.parametrize("tab_name", _TAB_NAMES)
 def test_tab_columns_match_the_committed_fixture(tab_name: str) -> None:
-    """A renamed, removed, added or re-ordered column fails here, by name."""
+    """A renamed, removed or re-ordered column fails here, by name.
+
+    An APPENDED column does not, and that is the one difference between this and
+    plain equality. Appending is additive by ``docs/export-contract.md`` —
+    consumers look columns up by name and ignore the rest — so failing here
+    would force the version bump that rule exists to avoid, and a bump makes
+    every consumer pinned to the old version stop parsing the tab entirely.
+    ``contracts.appended_columns`` is the single definition of "append" that the
+    generator asks too, so the two can never disagree.
+    """
     contract, tab = _TAB_CONTRACTS[tab_name]
     committed = _load(tab_name)["columns"]
     current = list(tab.columns)
     if current == committed:
+        return
+    if contracts.appended_columns(committed, current):
         return
 
     renamed = [
@@ -133,8 +144,16 @@ def test_tab_rows_match_the_committed_fixture(tab_name: str) -> None:
     committed = _load(tab_name)
     produced = tab.build(SOURCE_RECORDS[tab_name])[1:]
     expected = [list(row) for row in committed["rows"]]
-    if produced == expected:
+    # Compare at the RELEASED width. An appended column adds a cell to every row,
+    # and those cells have no committed counterpart to compare against — that is
+    # the acknowledged cost of not bumping (see `contracts`' module docstring).
+    # Every cell the fixture DOES pin is still checked, so the failure this test
+    # exists for — a released cell quietly changing meaning, blank starting to
+    # mean 0 — is untouched by the truncation.
+    width = len(committed["columns"])
+    if [row[:width] for row in produced] == expected:
         return
+    produced = [row[:width] for row in produced]
 
     columns = committed["columns"]
     differences: list[str] = []
@@ -234,8 +253,20 @@ def test_manifest_checksums_match_the_committed_fixtures() -> None:
 
 
 def test_committed_suite_is_exactly_what_the_generator_produces() -> None:
-    """Belt and braces over the per-tab checks: nothing in the suite is stale."""
-    files = _generator().build_files()
+    """Belt and braces over the per-tab checks: nothing in the suite is stale.
+
+    "Produces" means what the generator would WRITE, which is why the additive
+    freeze is applied here exactly as ``main`` applies it. A released fixture
+    whose only difference is an appended column is deliberately left at its
+    released bytes, so comparing against the raw ``build_files`` payload would
+    report the suite as stale for doing precisely what it is supposed to do.
+    Every non-additive difference still lands here, unchanged.
+    """
+    generator = _generator()
+    files = generator.build_files()
+    appends = generator.additive_appends(files, generator.load_register())
+    if appends:
+        generator.freeze_released_entries(files, appends)
     stale = [
         relative
         for relative, text in sorted(files.items())
@@ -421,6 +452,71 @@ def _tamper_with_the_released_jobs_sha(root: Path) -> None:
     document = json.loads(path.read_text(encoding="utf-8"))
     document["versions"]["jobs.v2"]["jobs.json"] = "0" * 64
     path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+
+def _append_a_column_to_the_generated_grid(module: Any) -> None:
+    """Stand in for the additive edit: `jobs.v2` grows one column at the END.
+
+    Built by rewriting the payload rather than by string surgery, because an
+    append has to touch the header AND every row — a header-only edit would be a
+    malformed grid, which is a different thing and is refused.
+    """
+    real = module.build_files
+
+    def patched() -> dict[str, str]:
+        files = real()
+        key = f"{contracts.FIXTURE_ROOT}/jobs.v2/jobs.json"
+        payload = json.loads(files[key])
+        payload["columns"] = list(payload["columns"]) + ["newly_appended"]
+        payload["rows"] = [list(row) + ["x"] for row in payload["rows"]]
+        files[key] = module.render(payload)
+        return files
+
+    module.build_files = patched
+
+
+def _reorder_columns_in_the_generated_grid(module: Any) -> None:
+    """Stand in for a RE-ORDER: same set of names, different order.
+
+    The one a set-based notion of "append" would wave through, and the one a
+    consumer reading by position misreads silently.
+    """
+    real = module.build_files
+
+    def patched() -> dict[str, str]:
+        files = real()
+        key = f"{contracts.FIXTURE_ROOT}/jobs.v2/jobs.json"
+        payload = json.loads(files[key])
+        columns = list(payload["columns"])
+        columns[0], columns[1] = columns[1], columns[0]
+        payload["columns"] = columns
+        payload["rows"] = [[row[1], row[0], *row[2:]] for row in (list(r) for r in payload["rows"])]
+        files[key] = module.render(payload)
+        return files
+
+    module.build_files = patched
+
+
+def _append_a_column_and_retype_a_released_cell(module: Any) -> None:
+    """An append riding along with a changed cell in a RELEASED column.
+
+    The combination is the one worth pinning: the append is legitimate on its
+    own, so a guard that stopped at the header would let the cell change through
+    beside it.
+    """
+    real = module.build_files
+
+    def patched() -> dict[str, str]:
+        files = real()
+        key = f"{contracts.FIXTURE_ROOT}/jobs.v2/jobs.json"
+        payload = json.loads(files[key])
+        payload["columns"] = list(payload["columns"]) + ["newly_appended"]
+        payload["rows"] = [list(row) + ["x"] for row in payload["rows"]]
+        payload["rows"][0][0] = "999999"
+        files[key] = module.render(payload)
+        return files
+
+    module.build_files = patched
 
 
 def _rename_a_column_in_the_generated_grid(module: Any) -> None:
@@ -673,6 +769,104 @@ class TestTheGeneratorRefusesToRewriteAPublishedVersion:
         committed = (root / contracts.FIXTURE_ROOT / "jobs.v2" / "jobs.json").read_text("utf-8")
         assert '"job_no"' not in committed
         assert '"job_number"' in committed
+
+    # --- the additive case ----------------------------------------------------
+    #
+    # Appending a column is the one change `docs/export-contract.md` calls
+    # additive and tells you NOT to bump for. The generator used to refuse it
+    # anyway — it refused every byte change alike — so the only route it offered
+    # was the bump the rule forbids, and that bump is not a harmless over-signal:
+    # a consumer pinned to the old version must answer `unsupported_contract` and
+    # stop parsing, so bumping for an appended column takes the tab from "missing
+    # one cell" to "dark" for every consumer until each widens and deploys.
+    #
+    # What must NOT move with it: the released file's bytes, its sha in the
+    # register, its row_count in the manifest. So these pin both halves — the
+    # append is accepted, and accepting it changes nothing on disk.
+
+    def test_an_appended_column_is_accepted_without_a_version_bump(
+        self, sandbox: tuple[Any, Path], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        module, root = sandbox
+        _append_a_column_to_the_generated_grid(module)
+
+        assert _run(module) == 0
+        assert "newly_appended" in capsys.readouterr().out
+
+    def test_an_appended_column_leaves_the_released_fixture_byte_identical(
+        self, sandbox: tuple[Any, Path]
+    ) -> None:
+        """The whole safety of not bumping. A consumer pinned to `jobs.v2` tests
+        itself against these exact bytes, so they must survive the append."""
+        module, root = sandbox
+        fixture = root / contracts.FIXTURE_ROOT / "jobs.v2" / "jobs.json"
+        before = fixture.read_bytes()
+        _append_a_column_to_the_generated_grid(module)
+
+        assert _run(module) == 0
+        assert fixture.read_bytes() == before
+
+    def test_an_appended_column_moves_neither_the_register_nor_the_manifest(
+        self, sandbox: tuple[Any, Path]
+    ) -> None:
+        """`published.json` is the trust anchor and is judged against the BASE
+        branch, so an append that moved a recorded sha would fail
+        `check_register_append_only.py` even though nothing breaking happened.
+        The manifest carries the same sha and must stay describing the file that
+        is really on disk."""
+        module, root = sandbox
+        register = root / contracts.PUBLISHED_PATH
+        manifest = root / contracts.MANIFEST_PATH
+        register_before = register.read_text(encoding="utf-8")
+        manifest_before = manifest.read_text(encoding="utf-8")
+        _append_a_column_to_the_generated_grid(module)
+
+        assert _run(module) == 0
+        assert register.read_text(encoding="utf-8") == register_before
+        assert manifest.read_text(encoding="utf-8") == manifest_before
+
+    def test_check_mode_is_clean_for_an_appended_column(self, sandbox: tuple[Any, Path]) -> None:
+        """CI runs --check. An append must not report the suite as STALE: there
+        is nothing to regenerate, which is the point."""
+        module, _ = sandbox
+        _append_a_column_to_the_generated_grid(module)
+
+        assert _run(module, "--check") == 0
+
+    def test_a_reordered_column_is_still_refused(self, sandbox: tuple[Any, Path]) -> None:
+        """Same names, different order — what a SET-based notion of "append"
+        would wave through, and what a consumer reading by position misreads
+        silently. `contracts.appended_columns` is positional for this reason."""
+        module, _ = sandbox
+        _reorder_columns_in_the_generated_grid(module)
+
+        assert _run(module) == 2
+
+    def test_an_append_may_not_carry_a_changed_released_cell(
+        self, sandbox: tuple[Any, Path], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The append is legitimate on its own, so a guard that stopped at the
+        header would let the cell change ride in beside it. 'Blank started
+        meaning 0' is the failure the row-level check exists for, and an append
+        must not become the way it lands."""
+        module, _ = sandbox
+        _append_a_column_and_retype_a_released_cell(module)
+
+        assert _run(module) == 2
+        assert "jobs.v2" in capsys.readouterr().out
+
+    def test_an_append_is_not_judged_against_a_tampered_released_file(
+        self, sandbox: tuple[Any, Path]
+    ) -> None:
+        """The released file is read from DISK, so the register's sha has to be
+        checked against it first. Without that, editing the register turned any
+        rewrite into "additive, nothing to see here" — laundering the exact
+        bypass `published.json` exists to prevent."""
+        module, root = sandbox
+        _append_a_column_to_the_generated_grid(module)
+        _tamper_with_the_released_jobs_sha(root)
+
+        assert _run(module) == 2
 
     def test_an_untouched_suite_regenerates_cleanly(self, sandbox: tuple[Any, Path]) -> None:
         """The guard must be invisible when nothing changed — a check that cries

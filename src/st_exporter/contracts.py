@@ -36,10 +36,39 @@ a deliberate regeneration go red.
 **What does NOT force a bump**: APPENDING a new column at the end. Consumers look
 columns up by name and ignore the rest, so an appended column is additive. Say so
 in the CHANGELOG; do not bump.
+
+**How an append survives contact with the published register.** That last rule and
+the register used to contradict each other, and the register won: appending a
+column changes the bytes of the released version's fixture, and
+``scripts/gen_contract_fixtures.py`` refused every byte change alike, so the only
+way out it offered was the bump the rule above says not to make. Taking that bump
+is not a neutral over-signal — a consumer pinned to the old version MUST answer
+``unsupported_contract`` and stop parsing (``docs/export-contract.md``), so
+bumping for an appended column takes a tab from "missing one cell" to "dark",
+for every consumer, until each of them widens and deploys.
+
+The additive case is therefore recognised rather than refused, and
+:func:`appended_columns` is the one place that decides what "additive" means. A
+released fixture is **frozen either way**: its bytes on disk, its sha in
+``published.json`` and its row_count in the manifest never move, so the register
+stays append-only against the base branch and a consumer pinned to that version
+keeps testing against exactly the file it was released with. What changes is only
+the verdict on a DIFFERENCE — a pure append leaves the released file alone and
+says so; a rename, a removal, a re-order, a changed cell or a changed row count
+is refused exactly as before.
+
+The consequence worth stating plainly: **an appended column has no committed
+fixture** until the next version bump gives the tab a fresh directory. That is
+the honest cost of not bumping, and it is bounded by what an appended column IS —
+one no consumer of the current version reads, because the current version never
+promised it. The producer side is pinned instead by this repo's own unit tests
+and, on a live tenant, by ``blank_columns``, which reports a column that is empty
+on every row.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -239,6 +268,117 @@ REGENERATE_COMMAND = "python scripts/gen_contract_fixtures.py"
 #: name, and with a CHANGELOG line, because it rewrites bytes a consumer may
 #: already have pinned. It is not a way to land a contract change.
 REPUBLISH_FLAG = "--republish"
+
+
+#: Everything a released fixture payload promises that an APPEND may not move.
+#: ``columns`` is absent on purpose — appending to it is the whole point — and is
+#: checked by :func:`appended_columns` instead, which is stricter than equality in
+#: the direction that matters: the released names must still be the leading
+#: columns, in their released order.
+_APPEND_FROZEN_KEYS = ("feed", "contract_version", "tab", "grain", "row_key")
+
+
+def appended_columns(released: Sequence[str], current: Sequence[str]) -> list[str] | None:
+    """The columns ``current`` adds to the END of ``released``, or ``None``.
+
+    ``None`` means this is **not** a pure append and must be refused: the released
+    names are no longer the leading columns in their released order, which covers
+    every renamed, removed and re-ordered column in one test. An empty list means
+    the columns are identical.
+
+    Prefix equality is the whole definition, and it is deliberately positional
+    rather than set-based. A set comparison would call
+    ``(a, b, c) -> (b, a, c, d)`` an append, and a consumer reading by POSITION
+    (which ``docs/export-contract.md`` allows for, which is why a re-order is
+    breaking) would then read column ``a``'s cells as ``b``.
+    """
+    released_names = list(released)
+    current_names = list(current)
+    if current_names[: len(released_names)] != released_names:
+        return None
+    return current_names[len(released_names) :]
+
+
+def additive_refusals(released: dict[str, Any], current: dict[str, Any]) -> list[str]:
+    """Why ``current`` is not a pure APPEND over the released payload ``released``.
+
+    Empty means it is one, and the released file may be left frozen rather than
+    rewritten or bumped. This is the single definition of "additive" that both
+    ``scripts/gen_contract_fixtures.py`` and
+    ``tests/st_exporter/test_contract_fixtures.py`` ask, so the generator can
+    never accept something the suite would reject, or the other way round.
+
+    Every row must be unchanged in its released columns and must have grown by
+    exactly the appended ones. A changed CELL is therefore still refused — the
+    "blank started meaning 0" failure the row-level fixture check exists for is
+    not smuggled in under an append — and so is a changed row COUNT, which would
+    mean the records behind the fixture moved rather than the schema.
+    """
+    refusals: list[str] = []
+    for key in _APPEND_FROZEN_KEYS:
+        if released.get(key) != current.get(key):
+            refusals.append(
+                f"{key} moved: released {released.get(key)!r}, now {current.get(key)!r} "
+                f"— an append may not change it"
+            )
+
+    added = appended_columns(released.get("columns") or [], current.get("columns") or [])
+    if added is None:
+        refusals.append(
+            f"the released columns are no longer the leading columns, in order: released "
+            f"{list(released.get('columns') or [])}, now {list(current.get('columns') or [])} "
+            f"— that is a rename, a removal or a re-order, not an append"
+        )
+        return refusals
+    if not added:
+        return refusals
+
+    released_rows = [list(row) for row in released.get("rows") or []]
+    current_rows = [list(row) for row in current.get("rows") or []]
+    if len(released_rows) != len(current_rows):
+        refusals.append(
+            f"the row count moved: released {len(released_rows)}, now {len(current_rows)} "
+            f"— an append adds columns, never rows"
+        )
+        return refusals
+
+    width = len(list(released.get("columns") or []))
+    for index, (was, now) in enumerate(zip(released_rows, current_rows, strict=False)):
+        if now[:width] != was:
+            refusals.append(
+                f"row {index} changed in its RELEASED columns: {was} -> {now[:width]} "
+                f"— an append may add cells, never alter one"
+            )
+        if len(now) != width + len(added):
+            refusals.append(
+                f"row {index} is {len(now)} cells wide but the header is "
+                f"{width + len(added)} — the grid is malformed"
+            )
+    return refusals
+
+
+def narrowed_to_released(released: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """``current`` cut back to the columns ``released`` actually shipped.
+
+    A released fixture describes ONE contract version, and an appended column is
+    not part of it. Anything that rewrites released bytes — today that is
+    ``--republish`` — must therefore work on this narrowed payload, or the
+    appended column rides into a released file under a version stamp that never
+    promised it, which is the precise outcome freezing the file exists to
+    prevent. Narrowing also keeps the republish guard honest: it compares like
+    with like, so an append can neither be mistaken for a structural change nor
+    used to smuggle one past a check looking only at cell text.
+
+    Returns ``current`` unchanged when nothing was appended.
+    """
+    added = appended_columns(released.get("columns") or [], current.get("columns") or [])
+    if not added:
+        return current
+    width = len(list(released.get("columns") or []))
+    narrowed = dict(current)
+    narrowed["columns"] = list(current.get("columns") or [])[:width]
+    narrowed["rows"] = [list(row)[:width] for row in current.get("rows") or []]
+    return narrowed
 
 
 def bump_version(version: str) -> str:

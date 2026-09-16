@@ -68,6 +68,31 @@ _REMOVED_ASSIGNMENT_STATUSES = {"unassigned", "removed", "cancelled", "canceled"
 # nothing else in this pipeline ever removes a record once seen.
 _EXCLUDED_JOB_STATUSES = {"canceled", "cancelled"}
 
+#: Where a JPM job record carries its completion instant, in priority order.
+#:
+#: ``completedOn`` is the documented spelling and is the one expected to match.
+#: It is well-evidenced rather than guessed: the sibling query parameter
+#: ``completedOnOrAfter`` on ``GET /jpm/v2/tenant/{tenant}/jobs`` is CONFIRMED
+#: against the published ``tenant-jpm-v2`` OpenAPI description (see
+#: ``feeds/financial.JOB_COMPLETED_PARAM`` and ``KNOWN_UNVERIFIED.md``), a
+#: parameter that filters on a field of that name, and
+#: ``financial.warn_if_older_than_window`` already reads ``completedOn`` off
+#: live job records from that same endpoint.
+#:
+#: What is NOT confirmed is that the **export** change-feed
+#: (``/jpm/v2/tenant/{tenant}/export/jobs``, which is what actually fills
+#: ``_raw_jobs`` and therefore this tab) spells it identically to the list
+#: endpoint. The alternate is carried for the same reason ``job_number`` now
+#: reads ``jobNumber`` before ``number``: a single guessed key is exactly how
+#: that column stayed blank on all 2431 rows of a live Sheet for the life of the
+#: feature. Both names mean the same fact, so trying both cannot pick up a
+#: DIFFERENT one — the failure mode that makes widening dangerous elsewhere.
+#:
+#: If neither matches, the tenant's next run says so by itself: ``completed_on``
+#: is not in ``blank_columns.ALL_BLANK_OK``, so a whole-column blank raises the
+#: BLANK COLUMN warning and an Actions annotation rather than passing silently.
+_COMPLETED_ON_KEYS: tuple[str, ...] = ("completedOn", "completedOnUtc")
+
 
 def _first_present(*sources: dict[str, Any] | None, keys: tuple[str, ...]) -> Any:
     """Return the first non-``None`` value for any of ``keys`` across ``sources``,
@@ -381,6 +406,29 @@ def build_job_rows(
                     "summary": job.get("summary"),
                     "business_unit": _business_unit_name(job, business_units),
                     "modified_on": appointment.get("modifiedOn") or job.get("modifiedOn"),
+                    # The JOB's own completion instant, never derived from the
+                    # appointment. Profit Wizard's `jobs.completed_date` was null
+                    # on all 864 completed jobs of the live tenant because this
+                    # tab carried no completion timestamp at all, so every
+                    # jobs-backed analytic that filters on it read the tenant as
+                    # having done no work: the technicians roster showed named
+                    # techs a 0% close rate and $0, and the Safety System
+                    # reported "no completed jobs in the last 90 days".
+                    #
+                    # Deliberately NOT synthesised from `appointment_end`. A
+                    # consumer can already do that fallback itself and several
+                    # do; what none of them can do is tell a real completion
+                    # apart from a guess. An appointment that ended is not a job
+                    # that completed — a technician can finish a visit on a job
+                    # that stays open for parts, a second visit or an approval,
+                    # and the last appointment on a cancelled job ends too.
+                    # Writing a guess into this column would make the guess
+                    # indistinguishable from the fact for every consumer,
+                    # permanently.
+                    #
+                    # Blank for a job ServiceTitan has not completed, which is
+                    # correct and is what "blank is not zero" means here.
+                    "completed_on": _first_present(job, keys=_COMPLETED_ON_KEYS),
                     # Not a contract column; used by run.py to sort deterministically
                     # without re-deriving ints from formatted text.
                     "_sort_key": _sort_key(job.get("id"), appointment_id),

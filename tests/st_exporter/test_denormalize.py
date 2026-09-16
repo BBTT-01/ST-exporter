@@ -737,3 +737,120 @@ class TestCustomerContactsArray:
             {"id": 10, "name": "Jane", "contacts": ["not-a-dict", None, {"type": "Phone"}]}
         )
         assert row["customer_phone"] is None
+
+
+# --- completed_on --------------------------------------------------------------
+#
+# Profit Wizard's `jobs.completed_date` was null on all 864 completed jobs of the
+# live tenant because the tab carried no completion timestamp at all. Everything
+# that filters on it read the tenant as having done no work: named technicians
+# shown a 0% close rate and $0, and "no completed jobs in the last 90 days" while
+# 864 sat inside the window. These pin the column at the producer end, which is
+# the only end this repo owns — and, because an APPENDED column has no committed
+# contract fixture (see `st_exporter.contracts`), they are the only fixture-like
+# cover it has here. The live end is covered by `blank_columns`, which reports a
+# column empty on every row.
+
+
+def test_completed_on_comes_from_the_servicetitan_completion_timestamp() -> None:
+    jobs = _cache(
+        {
+            "id": 1,
+            "jobNumber": "J-1",
+            "jobStatus": "Completed",
+            "completedOn": "2026-09-03T16:30:00-05:00",
+        }
+    )
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["completed_on"] == "2026-09-03T16:30:00-05:00"
+
+
+def test_completed_on_accepts_the_alternate_spelling() -> None:
+    """The contract only ever widens — the same reason `job_number` still reads
+    `number`. Both names mean the same fact, so accepting both cannot pick up a
+    different one."""
+    jobs = _cache({"id": 1, "jobStatus": "Completed", "completedOnUtc": "2026-09-03T21:30:00Z"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["completed_on"] == "2026-09-03T21:30:00Z"
+
+
+def test_completed_on_prefers_the_documented_spelling_when_both_are_present() -> None:
+    jobs = _cache(
+        {
+            "id": 1,
+            "completedOn": "2026-09-03T16:30:00-05:00",
+            "completedOnUtc": "1999-01-01T00:00:00Z",
+        }
+    )
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["completed_on"] == "2026-09-03T16:30:00-05:00"
+
+
+def test_completed_on_is_blank_for_a_job_servicetitan_has_not_completed() -> None:
+    """Blank means "not completed", and blank is not zero. A scheduled job must
+    not acquire a completion date."""
+    jobs = _cache({"id": 1, "jobNumber": "J-1", "jobStatus": "Scheduled"})
+    appointments = _cache(
+        {
+            "id": 100,
+            "jobId": 1,
+            "start": "2026-09-03T09:00:00-05:00",
+            "end": "2026-09-03T11:00:00-05:00",
+        }
+    )
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    assert result.rows[0]["completed_on"] is None
+
+
+def test_completed_on_is_never_synthesised_from_the_appointment_end() -> None:
+    """The point of the column is a TRUE completion instant.
+
+    A consumer can already fall back to `appointment_end` itself, and several do;
+    what none of them can do is tell a real completion apart from a guess once
+    the guess has been written into the column. An appointment that ended is not
+    a job that completed — a visit can finish on a job that stays open for parts,
+    a second visit or an approval.
+    """
+    jobs = _cache({"id": 1, "jobStatus": "InProgress"})
+    appointments = _cache(
+        {
+            "id": 100,
+            "jobId": 1,
+            "start": "2026-09-03T09:00:00-05:00",
+            "end": "2026-09-03T11:00:00-05:00",
+        }
+    )
+
+    result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+
+    row = result.rows[0]
+    assert row["appointment_end"] == "2026-09-03T11:00:00-05:00"
+    assert row["completed_on"] is None
+
+
+def test_completed_on_is_a_job_fact_repeated_on_every_technician_row() -> None:
+    """The tab's grain is one row per (appointment, technician); completion is a
+    property of the JOB, so a crew of two gets the same instant on both rows —
+    like `job_status` and `business_unit` beside it."""
+    jobs = _cache({"id": 1, "jobStatus": "Completed", "completedOn": "2026-09-03T16:30:00-05:00"})
+    appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+    assignments = _cache(
+        {"id": 1, "appointmentId": 100, "technicianId": 900, "status": "Active"},
+        {"id": 2, "appointmentId": 100, "technicianId": 901, "status": "Active"},
+    )
+
+    result = build_job_rows(jobs, appointments, assignments, _cache(), _cache())
+
+    assert len(result.rows) == 2
+    assert {row["completed_on"] for row in result.rows} == {"2026-09-03T16:30:00-05:00"}

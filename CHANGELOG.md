@@ -4,6 +4,69 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · A real completion timestamp on the `jobs` tab
+
+### Added: `jobs.completed_on`, appended (NOT a contract bump)
+
+The `jobs` tab carried no completion timestamp at all, so Profit Wizard's
+`jobs.completed_date` was null on **all 864** jobs whose `jobStatus` is completed
+on the `tr-doorservpro` tenant. Everything that filters on that column therefore
+read a working contractor as having done nothing: the technicians roster showed
+named technicians a fabricated **0% close rate** and **$0** (close rate is
+completed/total, counted off `completed_date`), and the Safety System reported
+"no completed jobs in the last 90 days" while 864 sat inside the window.
+
+`completed_on` is read from the job's own `completedOn` (falling back to
+`completedOnUtc`). It is **not** synthesised from `appointment_end`: a consumer
+can already make that fallback itself, and once a guess is written into the
+column no consumer can tell it from a fact. An appointment that ended is not a
+job that completed. Blank keeps meaning "not completed".
+
+The column is **appended last and the `jobs` feed stays at `jobs.v2`** — additive
+per `docs/export-contract.md`, so no consumer has to widen anything or deploy in
+any particular order, and nothing goes dark in the meantime. Profit Wizard picks
+the column up whenever it is ready to read it.
+
+Whether `completedOn` is the right spelling on the EXPORT change-feed (as opposed
+to the list endpoint, where it is evidenced) is not yet confirmed against a live
+response — see `KNOWN_UNVERIFIED.md`. If it is wrong the next run says so by
+itself: `completed_on` is not exempted in `blank_columns`, so a whole-column
+blank raises a `BLANK COLUMN` warning and an Actions annotation.
+
+### Changed: the fixture generator now recognises an APPENDED column
+
+`docs/export-contract.md` has always said appending a column is additive and must
+not bump the contract version. `scripts/gen_contract_fixtures.py` did not agree:
+it refused every byte change to a released fixture alike, so the only route it
+offered was the bump the rule forbids — and that bump is not a harmless
+over-signal, because a consumer pinned to the old version must answer
+`unsupported_contract` and **stop parsing the tab entirely** until it widens and
+deploys. Appending `completed_on` was the first time the two rules met.
+
+A pure append is now accepted, and `contracts.appended_columns` /
+`contracts.additive_refusals` are the single definition of "pure" that both the
+generator and the test suite ask. The released fixture is **left exactly as
+published** — bytes, `published.json` sha and `manifest.json` row_count all
+unmoved — so `check_register_append_only.py` is untouched and a consumer pinned
+to that version keeps testing against the file it was released with. The
+generator prints an `APPENDED COLUMN(S)` notice and writes nothing.
+
+The acknowledged cost: an appended column has **no committed fixture** until the
+next version bump. Needing fixture coverage for a new column is now the stated
+reason to bump.
+
+Everything else is refused exactly as before, each pinned by a new test: a
+rename, a removal, a **re-order** (the check is positional, not set-based, so
+`(a, b, c) -> (b, a, c, d)` is not an append), a changed cell in a released
+column **including one riding along beside a legitimate append**, a changed row
+count, and — the hole found and closed while building this — an append judged
+against a released file whose sha no longer matches the register, which would
+otherwise have laundered a tampered register into "additive, nothing to see
+here". `--republish` now compares and writes at the released width for the same
+reason, so an append can neither break the typo-fix hatch nor ride in on one.
+
+## [Unreleased] · Conditional image fetches, and a per-run asset cap
+
 ## [Unreleased] · A one-off image backfill that finishes
 
 ### Fixed: the same picture was downloaded once per ITEM that used it

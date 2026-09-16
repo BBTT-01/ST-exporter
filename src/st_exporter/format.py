@@ -45,6 +45,10 @@ JOB_COLUMNS: tuple[str, ...] = (
     "summary",
     "business_unit",
     "modified_on",
+    # APPENDED, deliberately last. Appending is the one column change that is
+    # additive under `docs/export-contract.md` — consumers look columns up by
+    # name and ignore the rest — so `jobs.v2` does not become `jobs.v3`.
+    "completed_on",
 )
 
 TECHNICIAN_COLUMNS: tuple[str, ...] = ("st_technician_id", "name", "email", "active")
