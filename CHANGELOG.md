@@ -4,6 +4,51 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Pricebook `cost` and `hours`
+
+### Added: `cost` and `hours` on the three `pricebook.*` item tabs — `pricebook.v2`
+
+`pricebook.services`, `pricebook.equipment` and `pricebook.materials` carried
+`price` and nothing else a pricing formula can use. Profit Wizard's hosted reader
+imported 35,138 items for the pilot tenant and every one landed unusable: with no
+cost and no hours there is nothing to price off.
+
+Both values were already in the JSON the exporter parses — they were simply not
+emitted. They come from ServiceTitan's own fields of those names on
+`pricebook/v2/tenant/{id}/{services|equipment|materials}`:
+
+| Column | Source | Present on |
+|---|---|---|
+| `cost` | `item.cost` | `equipment`, `materials` — **not `services`** |
+| `hours` | `item.hours` | all three |
+
+`Pricebook.V2.ServiceResponse` has no cost field of any spelling, so
+`pricebook.services.cost` is blank on every row of every tenant by construction;
+`blank_columns` exempts it by name rather than warning about it forever.
+
+Both follow the tabs' existing blank-is-not-zero rule: a null or absent value is a
+blank cell, a real `0` is `"0"`. A null cost read as zero prices an item at pure
+margin, which is the expensive direction.
+
+### Changed: `pricebook.v1` → `pricebook.v2` (append-only, but a bump)
+
+The two columns are APPENDED after `modified_on`; the twelve leading columns, the
+tabs, the grain and the row key are untouched. By the contract's own rules an
+appended column is additive and does not force a bump.
+
+It is a bump anyway, because a released fixture's bytes may never change and
+appending a column changes every row of every `pricebook.v1` fixture.
+`--republish pricebook.v1` is refused structurally the moment `columns` moves, and
+relaxing that refusal would open exactly the hole the published register closes.
+So `pricebook.v1` stays frozen on disk for consumers still pinned to it, and
+`pricebook.v2` gets its own fixture directory.
+
+**TrueQuote, TradeRated and Profit Wizard must each widen their supported
+`pricebook` range to include `pricebook.v2`.** Until they do, their contract check
+refuses the four tabs — loudly, which is the intended order of events, not a
+regression. A reader that keeps `pricebook.v1` in its range and looks columns up
+by name is otherwise unaffected: nothing it reads moved.
+
 ## [Unreleased] · A `0` in `total_revenue` meant "free work", and it shipped
 
 ### Fixed: a resolved `0` is now ABSENT, not a zero-dollar job

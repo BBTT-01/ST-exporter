@@ -6,20 +6,30 @@ output recordable as a fixture (ticket 04) and what every test in
 ``tests/st_exporter/test_pricebook.py`` exercises.
 
 The column sets and cell rules come from ``CONTRACT-pricebook-tabs.md``
-(`pricebook.v1`, frozen 2026-09-14). The rules that are easiest to break, and are
+(`pricebook.v2`). The rules that are easiest to break, and are
 therefore enforced here in one place:
 
 - ``st_id`` is never blank: a record with no ServiceTitan id is dropped rather
   than written as a keyless row that ``row_count`` would nevertheless count.
 - Every cell is text. A blank cell means empty; a missing column means absent.
-  Those are never collapsed — in particular ``price`` is **blank when null, never
-  ``0``**, because a real zero-priced item and an item with no price are
-  different facts to the consumer.
+  Those are never collapsed — in particular ``price``, ``cost`` and ``hours`` are
+  **blank when null, never ``0``**, because a real zero-cost item and an item
+  with no cost recorded are different facts to the consumer: one is free, the
+  other is unknown, and a pricing formula fed the first when it meant the second
+  prices the job at pure margin.
 - ``name`` prefers ``displayName``, falls back to ``name``, and is never blank.
 - ``category_ids`` and ``category_names`` are comma-separated in the SAME order,
   index for index.
 - ``image_refs`` carries identifiers only — never bytes — deduped by asset id,
   because assets repeat within a single payload.
+
+- ``cost`` and ``hours`` come from ServiceTitan's own ``cost`` and ``hours``
+  fields on the pricebook item. ``hours`` exists on all three item resources;
+  ``cost`` exists on ``equipment`` and ``materials`` and **not on ``services``**
+  (ServiceTitan's ``Pricebook.V2.ServiceResponse`` has no cost field at all — a
+  service's cost is its labour). So ``pricebook.services.cost`` is blank on
+  every row of every tenant, by construction rather than by accident, and
+  ``blank_columns`` exempts it for that reason.
 
 ``services``, ``equipment`` and ``materials`` share one shape and therefore one
 code path: the tab name carries the meaning, the parser does not have to.
@@ -31,7 +41,7 @@ from typing import Any
 
 from st_exporter.format import to_cell_text
 
-CONTRACT_VERSION = "pricebook.v1"
+CONTRACT_VERSION = "pricebook.v2"
 
 ITEM_COLUMNS: tuple[str, ...] = (
     "st_id",
@@ -46,6 +56,8 @@ ITEM_COLUMNS: tuple[str, ...] = (
     "model",
     "image_refs",
     "modified_on",
+    "cost",
+    "hours",
 )
 
 CATEGORY_COLUMNS: tuple[str, ...] = ("st_id", "name", "active", "parent_id")
@@ -83,7 +95,7 @@ def build_item_row(record: dict[str, Any]) -> dict[str, str]:
         "code": to_cell_text(record.get("code")),
         "name": _name(record),
         "description": to_cell_text(record.get("description")),
-        "price": _price(record.get("price")),
+        "price": _numeric(record.get("price")),
         "active": _bool_text(record.get("active")),
         "category_ids": category_ids,
         "category_names": category_names,
@@ -91,6 +103,8 @@ def build_item_row(record: dict[str, Any]) -> dict[str, str]:
         "model": to_cell_text(record.get("model")),
         "image_refs": image_refs(record.get("assets")),
         "modified_on": to_cell_text(record.get("modifiedOn")),
+        "cost": _numeric(record.get("cost")),
+        "hours": _numeric(record.get("hours")),
     }
 
 
@@ -132,11 +146,12 @@ def _name(record: dict[str, Any]) -> str:
     return to_cell_text(record.get("id"))
 
 
-def _price(value: Any) -> str:
-    """``price`` as text — **blank when null, never ``0``**.
+def _numeric(value: Any) -> str:
+    """``price`` / ``cost`` / ``hours`` as text — **blank when null, never ``0``**.
 
-    A genuine zero still renders as ``"0"``; only an absent/null price is blank.
-    Collapsing the two would tell the consumer a priceless item is free.
+    A genuine zero still renders as ``"0"``; only an absent/null value is blank.
+    Collapsing the two would tell the consumer a priceless item is free, a
+    costless item free to buy, and an hourless item instant to fit.
     """
     if value is None:
         return ""

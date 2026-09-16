@@ -80,7 +80,7 @@ def test_each_tab_gets_its_own_meta_row_with_the_contract_version(
 
     meta = parse_meta_grid(export_store.tabs["_meta"])
     for tab in PRICEBOOK_TABS:
-        assert meta[tab].contract_version == "pricebook.v1"
+        assert meta[tab].contract_version == "pricebook.v2"
         # Catalogue: full replace, so no cursor is ever carried.
         assert meta[tab].last_cursor == ""
         assert meta[tab].last_run_at == FIXED_NOW.isoformat()
@@ -196,7 +196,7 @@ def test_not_selecting_pricebook_leaves_its_tabs_and_meta_untouched(
     assert summary.pricebook_row_counts is None
     assert export_store.tabs["pricebook.services"] == before
     meta = parse_meta_grid(export_store.tabs["_meta"])
-    assert meta["pricebook.services"].contract_version == "pricebook.v1"
+    assert meta["pricebook.services"].contract_version == "pricebook.v2"
 
 
 # --- image upload lane -------------------------------------------------------

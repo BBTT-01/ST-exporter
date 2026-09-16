@@ -644,12 +644,12 @@ class TestTheGeneratorRefusesToRewriteAPublishedVersion:
         self, sandbox: tuple[Any, Path], capsys: pytest.CaptureFixture[str]
     ) -> None:
         module, root = sandbox
-        _drop_a_produced_tab(module, "pricebook.v1/pricebook.equipment.json")
+        _drop_a_produced_tab(module, "pricebook.v2/pricebook.equipment.json")
         (root / "CHANGELOG.md").write_text(
-            "# Changelog\n\n- republish pricebook.v1: tidy-up\n", encoding="utf-8"
+            "# Changelog\n\n- republish pricebook.v2: tidy-up\n", encoding="utf-8"
         )
 
-        assert _run(module, "--republish", "pricebook.v1") == 2
+        assert _run(module, "--republish", "pricebook.v2") == 2
         assert "may not add or remove a tab" in capsys.readouterr().out
 
     def test_republish_still_lands_a_genuine_typo_in_a_cell(
@@ -707,28 +707,28 @@ class TestTheGeneratorRefusesToRewriteAPublishedVersion:
         files the code still PRODUCES, so a registered file the code had stopped
         producing was never a violation, the generator never deleted it, and the
         byte-identity test still found it unchanged on disk. Deleting the
-        `pricebook.equipment` contract regenerated cleanly at `pricebook.v1` —
-        the manifest quietly dropped the tab while TrueQuote's tests against
-        `pricebook.v1` kept passing for a tab the exporter no longer wrote. Zero
-        rows, no error, `_meta` still saying `pricebook.v1`.
+        `pricebook.equipment` contract regenerated cleanly at its own version —
+        the manifest quietly dropped the tab while TrueQuote's tests against that
+        version kept passing for a tab the exporter no longer wrote. Zero rows,
+        no error, `_meta` still naming the same version.
         """
         module, root = sandbox
-        _drop_a_produced_tab(module, "pricebook.v1/pricebook.equipment.json")
+        _drop_a_produced_tab(module, "pricebook.v2/pricebook.equipment.json")
 
         assert _run(module) == 2
 
         printed = capsys.readouterr().out
-        assert "pricebook.v1 is published — bump to pricebook.v2" in printed
+        assert "pricebook.v2 is published — bump to pricebook.v3" in printed
         assert "the code no longer produces it" in printed
         # And the fixture it would have orphaned is still exactly where it was.
         assert (
-            root / contracts.FIXTURE_ROOT / "pricebook.v1" / "pricebook.equipment.json"
+            root / contracts.FIXTURE_ROOT / "pricebook.v2" / "pricebook.equipment.json"
         ).exists()
 
     def test_removing_a_tab_is_refused_in_check_mode_too(self, sandbox: tuple[Any, Path]) -> None:
         """CI runs `--check`; it must not be the lenient path for this either."""
         module, _root = sandbox
-        _drop_a_produced_tab(module, "pricebook.v1/pricebook.equipment.json")
+        _drop_a_produced_tab(module, "pricebook.v2/pricebook.equipment.json")
         assert _run(module, "--check") == 2
 
     def test_deleting_one_versions_key_from_the_register_is_refused(

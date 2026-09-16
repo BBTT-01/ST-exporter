@@ -36,7 +36,7 @@ beside `exporter_version`.
 |---|---|---|
 | `jobs` | **`jobs.v2`** | `jobs` |
 | `technicians` | **`technicians.v1`** | `technicians` |
-| `pricebook` | **`pricebook.v1`** | `pricebook.services`, `pricebook.equipment`, `pricebook.materials`, `pricebook.categories` |
+| `pricebook` | **`pricebook.v2`** | `pricebook.services`, `pricebook.equipment`, `pricebook.materials`, `pricebook.categories` |
 | `financial` | **`financial.v1`** | `accounting.invoices`, `payroll.timesheets`, `settings.businessUnits`, `reporting.jobCosts` |
 
 The source of truth is `src/st_exporter/contracts.py`, and
@@ -64,6 +64,26 @@ per appointment, `st_appointment_id` unique, same column set. Every version
 directory from `jobs.v2` onwards exists as files, and stays.
 
 `technicians` has never changed shape, so it is `technicians.v1`.
+
+### Why `pricebook` is v2 and not v1
+
+`pricebook.v2` APPENDS two columns to the three item tabs — `cost` and `hours` —
+and changes nothing else: same tabs, same grain, same row key, same twelve leading
+columns in the same order. By the rules below that is additive and would not force
+a bump.
+
+It is a bump anyway, because the published register forces it and should. A
+released fixture's bytes may never change (see "The fixture suite"), and appending
+a column changes every row of every fixture under that version. The alternatives
+were both worse: `--republish pricebook.v1` is refused structurally the moment
+`columns` moves, and relaxing that refusal to allow "additive" rewrites would hand
+the next person a way to reshape a released tab in place, which is the one thing
+the register exists to prevent.
+
+So a consumer still pinned to `pricebook.v1` keeps its frozen fixtures and its
+twelve columns, and a consumer that wants `cost` and `hours` widens its supported
+range to include `pricebook.v2`. Until it does, its contract check refuses the tab
+— loudly, which is the intended order of events.
 
 ### A blank `contract_version`
 
@@ -169,7 +189,8 @@ These are part of the contract, not implementation detail:
 ## What a consumer MUST do
 
 1. **Declare the range you understand**, per feed — e.g. "this app reads
-   `pricebook.v1`". Keep it beside the code that parses, not in a README.
+   `pricebook.v1` and `pricebook.v2`". Keep it beside the code that parses, not
+   in a README.
 2. **Read `_meta.contract_version` for the tab before parsing it.**
 3. On a version **outside your range** (including blank), return a typed
    `unsupported_contract` outcome. Do **not** parse. Do **not** guess. Do **not**
@@ -192,8 +213,9 @@ contracts/fixtures/manifest.json          # versions + sha256 of every file
 contracts/fixtures/published.json         # sha256 of every file AS RELEASED
 contracts/fixtures/jobs.v2/jobs.json
 contracts/fixtures/technicians.v1/technicians.json
-contracts/fixtures/pricebook.v1/pricebook.services.json
-contracts/fixtures/pricebook.v1/…          (equipment, materials, categories)
+contracts/fixtures/pricebook.v1/…          (the frozen twelve-column shape)
+contracts/fixtures/pricebook.v2/pricebook.services.json
+contracts/fixtures/pricebook.v2/…          (equipment, materials, categories)
 contracts/fixtures/financial.v1/accounting.invoices.json
 contracts/fixtures/financial.v1/…          (timesheets, businessUnits, jobCosts)
 ```
@@ -256,7 +278,7 @@ Each file:
 ```jsonc
 {
   "feed": "pricebook",
-  "contract_version": "pricebook.v1",
+  "contract_version": "pricebook.v2",
   "tab": "pricebook.services",
   "grain": "one row per pricebook item that has an st_id; …",
   "row_key": ["st_id"],
@@ -275,7 +297,11 @@ nothing else.
 The rows are not a happy path. They pin the cells that have already gone wrong, or
 are one careless edit from going wrong:
 
-- a **null price** next to a real **`0`** price, and a null cost next to a `0` cost;
+- a **null price** next to a real **`0`** price, a **null `cost`** next to a real
+  **`0`** cost and a **null `hours`** next to a real **`0`** hours, on the same
+  tab — a null cost read as zero prices an item at pure margin;
+- a `pricebook.services` row whose **`cost` is blank because the field does not
+  exist upstream**, beside equipment and material rows that carry one;
 - an **absent `active`** flag (blank) next to explicit `true` and `false`;
 - `category_ids` / `category_names` **index-aligned**, including a two-category item;
 - an `image_refs` list **deduped**, including an asset that is an authenticated
@@ -305,7 +331,7 @@ the data:
   "supported": {
     "jobs": ["jobs.v2"],
     "technicians": ["technicians.v1"],
-    "pricebook": ["pricebook.v1"],
+    "pricebook": ["pricebook.v1", "pricebook.v2"],
     "financial": ["financial.v1"]
   }
 }

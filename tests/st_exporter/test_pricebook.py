@@ -1,8 +1,8 @@
 """Contract tests for the pure `pricebook.*` row builders.
 
-Every assertion here traces to CONTRACT-pricebook-tabs.md (`pricebook.v1`, frozen
-2026-09-14). Two consuming apps parse these exact headers and cell rules, so a
-change that makes one of these fail is a contract break, not a test to update.
+Every assertion here traces to CONTRACT-pricebook-tabs.md (`pricebook.v2`). Two
+consuming apps parse these exact headers and cell rules, so a change that makes
+one of these fail is a contract break, not a test to update.
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ def _item(**overrides):
         "displayName": "16x7 Steel Door",
         "description": "A door",
         "price": 1299.5,
+        "cost": 640,
+        "hours": 3,
         "active": True,
         "categories": [{"id": 10, "name": "Doors"}, {"id": 11, "name": "Steel"}],
         "manufacturer": "Acme",
@@ -51,13 +53,20 @@ class TestColumns:
             "model",
             "image_refs",
             "modified_on",
+            "cost",
+            "hours",
         }
 
     def test_category_columns_are_exactly_the_contract(self) -> None:
         assert set(CATEGORY_COLUMNS) == {"st_id", "name", "active", "parent_id"}
 
     def test_contract_version_literal(self) -> None:
-        assert CONTRACT_VERSION == "pricebook.v1"
+        assert CONTRACT_VERSION == "pricebook.v2"
+
+    def test_cost_and_hours_are_appended_last(self) -> None:
+        # Appended, never inserted: a consumer reading by position must not have
+        # every column after `price` shift under it.
+        assert ITEM_COLUMNS[-2:] == ("cost", "hours")
 
     def test_item_grid_starts_with_the_header_row(self) -> None:
         assert build_item_grid([])[0] == list(ITEM_COLUMNS)
@@ -85,6 +94,38 @@ class TestCellRules:
 
     def test_price_uses_a_dot_separator(self) -> None:
         assert build_item_row(_item(price=1299.5))["price"] == "1299.5"
+
+    def test_cost_comes_from_the_service_titan_cost_field(self) -> None:
+        assert build_item_row(_item(cost=640))["cost"] == "640"
+
+    def test_hours_comes_from_the_service_titan_hours_field(self) -> None:
+        assert build_item_row(_item(hours=2.5))["hours"] == "2.5"
+
+    def test_cost_null_is_blank_not_zero(self) -> None:
+        # The expensive one: a null cost read as zero prices the item at pure
+        # margin, which is how an unusable catalogue looks usable.
+        assert build_item_row(_item(cost=None))["cost"] == ""
+
+    def test_hours_null_is_blank_not_zero(self) -> None:
+        assert build_item_row(_item(hours=None))["hours"] == ""
+
+    def test_a_missing_cost_key_is_blank_not_zero(self) -> None:
+        # Every `services` record takes this path: ServiceTitan's
+        # Pricebook.V2.ServiceResponse has no cost field at all.
+        record = _item()
+        del record["cost"]
+        assert build_item_row(record)["cost"] == ""
+
+    def test_a_missing_hours_key_is_blank_not_zero(self) -> None:
+        record = _item()
+        del record["hours"]
+        assert build_item_row(record)["hours"] == ""
+
+    def test_a_real_zero_cost_is_written_as_zero(self) -> None:
+        assert build_item_row(_item(cost=0))["cost"] == "0"
+
+    def test_a_real_zero_hours_is_written_as_zero(self) -> None:
+        assert build_item_row(_item(hours=0))["hours"] == "0"
 
     def test_active_is_lowercase_true_false(self) -> None:
         assert build_item_row(_item(active=True))["active"] == "true"

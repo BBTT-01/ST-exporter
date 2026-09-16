@@ -1,0 +1,29 @@
+{
+  "feed": "pricebook",
+  "contract_version": "pricebook.v2",
+  "tab": "pricebook.materials",
+  "grain": "one row per pricebook item that has an st_id; id-less records are dropped",
+  "row_key": [
+    "st_id"
+  ],
+  "columns": [
+    "st_id",
+    "code",
+    "name",
+    "description",
+    "price",
+    "active",
+    "category_ids",
+    "category_names",
+    "manufacturer",
+    "model",
+    "image_refs",
+    "modified_on",
+    "cost",
+    "hours"
+  ],
+  "rows": [
+    ["200", "MAT-1", "Torsion Spring", "", "0", "true", "11", "Doors", "Acme", "TS-1", "", "2026-09-04T00:00:00Z", "0", ""],
+    ["201", "MAT-2", "Bottom Seal", "Cost not recorded upstream", "24", "true", "11", "Doors", "", "", "", "2026-09-06T00:00:00Z", "", "0"]
+  ]
+}

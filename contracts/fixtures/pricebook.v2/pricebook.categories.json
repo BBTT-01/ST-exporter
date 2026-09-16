@@ -1,0 +1,19 @@
+{
+  "feed": "pricebook",
+  "contract_version": "pricebook.v2",
+  "tab": "pricebook.categories",
+  "grain": "one row per pricebook category; parent_id is blank at the top level",
+  "row_key": [
+    "st_id"
+  ],
+  "columns": [
+    "st_id",
+    "name",
+    "active",
+    "parent_id"
+  ],
+  "rows": [
+    ["10", "Service", "true", ""],
+    ["11", "Doors", "true", "10"]
+  ]
+}

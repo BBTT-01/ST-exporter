@@ -669,6 +669,35 @@ Also unverified: that the four tabs' row counts are small enough that a full
 replace every run stays well inside a Sheets write. A very large catalogue has
 never been measured.
 
+## Pricebook `cost` and `hours` — verified against the spec, not against a tenant
+
+`src/st_exporter/pricebook.py`
+
+`cost` and `hours` are read straight off ServiceTitan's own fields of those names.
+Both spellings are taken from the published Pricebook v2 OpenAPI document, not
+guessed and not taken from a consumer's client type:
+
+- `Pricebook.V2.MaterialResponse` and `Pricebook.V2.EquipmentResponse` both
+  declare `cost` (decimal, "The cost paid to acquire the material") and `hours`
+  (decimal, "The number of hours associated with the installing the …").
+- `Pricebook.V2.ServiceResponse` declares `hours` ("Hours needed to complete this
+  service") and **no cost field of any spelling**. So `pricebook.services.cost` is
+  blank on every row of every tenant by construction, and `blank_columns` exempts
+  it by name with that reason.
+
+What is still unverified is the same thing as everywhere else on this page: that a
+live tenant's payload matches its own document. The tripwire is in place either
+way — `cost` is NOT exempted on `pricebook.equipment` or `pricebook.materials`, so
+a wrong spelling there fires the whole-column-blank warning above 25 rows, and
+`hours` is exempted on no tab at all.
+
+Deliberately NOT copied from Profit Wizard's direct integration: its
+`item.price || item.memberPrice || item.addOnPrice` price fallback. Those are three
+different prices in the API (list, member, add-on), not three spellings of one, and
+a `||` chain fires on a real `0` — it would turn a genuinely free item into its
+member price. The exporter exports `price` and leaves the reconciliation to the
+consumer, which is the same reason `cost` and `hours` are blank-when-null here.
+
 ## Pricebook image upload — what could not be confirmed without a live TrueQuote
 
 `src/st_exporter/images/`

@@ -52,6 +52,12 @@ ALL_BLANK_OK: dict[str, dict[str, str]] = {
         "summary": "Free-text job summary; many tenants never fill it in.",
     },
     "pricebook.services": {
+        "cost": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse carries no cost field at "
+            "all, so this column is blank on every row of every tenant by "
+            "construction. It is in the contract so the three item tabs keep one "
+            "shape and one parser."
+        ),
         "description": "Optional catalogue prose; commonly empty catalogue-wide.",
         "manufacturer": "Meaningless for labour/service items.",
         "model": "Meaningless for labour/service items.",

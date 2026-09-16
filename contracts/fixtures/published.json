@@ -16,6 +16,12 @@
       "pricebook.materials.json": "83bb2618d9348b3265f7af8a40753104d9c91f0dacbfa857cb10c0ba7f6c5b65",
       "pricebook.services.json": "ffb73be1678c16cb60e81c673e7260c3774f6d7a0aafc48e1b46823a16414a55"
     },
+    "pricebook.v2": {
+      "pricebook.categories.json": "514caabf7bbbbe460d5e345460d24f9dec178c1e0dad6e2df25ddf5dc3e5145f",
+      "pricebook.equipment.json": "1da39c1641787e40af8a0c0718d329e0b46711bd38045208b5985b285938329c",
+      "pricebook.materials.json": "6e8b6b7127066ac53483574bf9c6bbdd1d9fc698e139bbdeb6cb41f4c5e5a444",
+      "pricebook.services.json": "b47525d1584e42b20dce6f6e5bd078d5d34bb8961d80ea8e30cca2839fae0f21"
+    },
     "technicians.v1": {
       "technicians.json": "3e9eeb3433a53750e1cf0469495d52004731b3c66cc20d60dfb743b999b98d8a"
     }
