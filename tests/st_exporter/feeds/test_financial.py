@@ -14,6 +14,7 @@ import pytest
 
 from st_cli.exceptions import APIError, NotFoundError
 from st_exporter.feeds.financial import (
+    JOB_SORT,
     TimesheetPaginationError,
     fetch_business_units,
     fetch_completed_job_ids,
@@ -91,6 +92,49 @@ class TestWindow:
             {"name": "From", "value": "2026-06-16"},
             {"name": "To", "value": "2026-09-14"},
         ]
+
+
+class TestJobListSort:
+    """`jpm/v2/.../jobs` validates `sort` against a closed list and 400s otherwise.
+
+    A live tenant (`tr-pioneer-overhead-door`, run 35034278334) answered
+    `{"errors":{"sort":["The value '-completedOn' is not valid for Sort."]}}`,
+    and the whole `payroll.timesheets` tab was skipped for it — the job list is
+    what drives the per-job timesheet calls. The endpoint's published
+    description names the only accepted fields: Id, ModifiedOn, CreatedOn,
+    Priority.
+    """
+
+    def test_the_job_list_is_sorted_by_an_accepted_field(self, mock_client) -> None:
+        mock_client.get.return_value = _envelope([])
+        fetch_completed_job_ids(mock_client, today=TODAY, window_days=30)
+        sort = mock_client.get.call_args.kwargs["params"]["sort"]
+        assert sort == JOB_SORT
+        assert sort.lstrip("+-") in {"Id", "ModifiedOn", "CreatedOn", "Priority"}
+
+    def test_the_rejected_completedon_sort_is_never_sent_again(self, mock_client) -> None:
+        # The exact parameter the live 400 named.
+        mock_client.get.return_value = _envelope([])
+        fetch_completed_job_ids(mock_client, today=TODAY, window_days=30)
+        assert "completedOn" not in mock_client.get.call_args.kwargs["params"]["sort"]
+
+    def test_the_whole_job_query_is_pinned(self, mock_client) -> None:
+        # The full request a live run must now make, spelled out.
+        mock_client.get.return_value = _envelope([])
+        fetch_completed_job_ids(mock_client, today=TODAY, window_days=90)
+        assert mock_client.get.call_args.kwargs["params"] == {
+            "completedOnOrAfter": "2026-06-16T00:00:00Z",
+            "sort": "-Id",
+            "page": 1,
+            "pageSize": 200,
+        }
+
+    def test_sorting_is_not_simply_dropped(self, mock_client) -> None:
+        # Unsorted, ServiceTitan answers ascending by id — so the max_jobs cap
+        # would keep the OLDEST jobs in the window rather than the newest.
+        mock_client.get.return_value = _envelope([])
+        fetch_completed_job_ids(mock_client, today=TODAY)
+        assert mock_client.get.call_args.kwargs["params"].get("sort")
 
 
 class TestTimesheets:
