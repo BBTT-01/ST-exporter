@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 from st_exporter.denormalize import build_job_rows
+from st_exporter.feeds.pricebook import apply_category_names, category_name_index
 from st_exporter.feeds.raw_cache import RawCache
 from tests.st_exporter.fixtures import tenant_financial, tenant_pricebook, tenant_run1
 
@@ -195,6 +196,25 @@ _SERVICE_3_UNKNOWN_ACTIVE = {
 }
 
 
+#: The category-name lookup a live run builds from the categories endpoint, over
+#: the same two categories the `pricebook.categories` fixture pins.
+_CATEGORY_NAMES = category_name_index([tenant_pricebook.CATEGORY_10, tenant_pricebook.CATEGORY_11])
+
+
+def _as_fetched(*records: dict[str, Any]) -> list[dict[str, Any]]:
+    """Item records as ``feeds.pricebook`` hands them to the row builder.
+
+    `equipment` and `materials` send ``categories`` as bare int ids with no names
+    (`tenant-pricebook-v2`: ``Pricebook.V2.{Equipment,Material}Response``), and the
+    fetch layer resolves those names off the categories endpoint. Putting the raw
+    records through that same pure pass here is what keeps the fixture a record of
+    what a RUN writes; hand-writing the resolved shape instead is precisely how the
+    object-only reader looked correct while blanking both columns on every
+    equipment and material row of run 35134016237.
+    """
+    return apply_category_names([dict(record) for record in records], _CATEGORY_NAMES)
+
+
 def _report_rows() -> list[dict[str, Any]]:
     """The Job Costing Summary report's rows, keyed by its own field names.
 
@@ -227,8 +247,8 @@ SOURCE_RECORDS: dict[str, list[dict[str, Any]]] = {
         # No id: dropped entirely rather than written as a keyless row.
         {"code": "SVC-NO-ID", "displayName": "Dropped", "price": 1},
     ],
-    "pricebook.equipment": [tenant_pricebook.EQUIPMENT_1],
-    "pricebook.materials": [tenant_pricebook.MATERIAL_1],
+    "pricebook.equipment": _as_fetched(tenant_pricebook.EQUIPMENT_1),
+    "pricebook.materials": _as_fetched(tenant_pricebook.MATERIAL_1),
     "pricebook.categories": [tenant_pricebook.CATEGORY_10, tenant_pricebook.CATEGORY_11],
     "accounting.invoices": [tenant_financial.INVOICE_1, tenant_financial.INVOICE_2_NO_ITEMS],
     "payroll.timesheets": (

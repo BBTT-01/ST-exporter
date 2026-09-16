@@ -165,10 +165,20 @@ def _categories(categories: Any) -> tuple[str, str]:
     An entry with no id is skipped entirely rather than contributing a name with
     no id beside it — the two columns must stay in the same order, index for
     index, and a half-entry is what would break that.
+
+    A **bare id** (``categories: [123, 456]``) is accepted as well as an object:
+    that is the shape ``equipment`` and ``materials`` actually return, per
+    ``tenant-pricebook-v2``'s OpenAPI, and reading only the object form is what
+    blanked both columns on 15031 rows of ``tr-doorservpro``. Such an entry's
+    name is blank here — ``feeds/pricebook`` resolves names off the categories
+    endpoint before the records reach this function — because ``category_ids``
+    alone is still a usable join key, and skipping the entry would lose that too.
     """
     ids: list[str] = []
     names: list[str] = []
     for entry in categories or []:
+        if isinstance(entry, (int, str)) and not isinstance(entry, bool):
+            entry = {"id": entry}
         if not isinstance(entry, dict):
             continue
         identifier = to_cell_text(entry.get("id")).strip()

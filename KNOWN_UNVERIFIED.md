@@ -450,19 +450,17 @@ Unverified, and worth knowing before trusting the quiet half:
 
 `src/st_exporter/feeds/pricebook.py`, `src/st_exporter/pricebook.py`
 
-Three guesses, none confirmable without a tenant:
-
-- **`active=Any`.** Assumed the pricebook list endpoints take the same
-  `active` parameter as the settings endpoints, so withdrawn items export as
-  `active=false` instead of vanishing. If the real parameter differs, the tabs
-  silently become active-only — which consumers cannot distinguish from a
-  contractor deleting items, and they are forbidden from deleting rows.
-- **`assets[].id`.** Taken from TrueQuote's own client type, where it is
-  `string | null`. `image_refs` falls back to `assets[].url` when the id is
-  absent, and that url is either an HTTPS URL or an authenticated storage path
-  (`Images/Pricebook/<uuid>.jpg`). Whether ServiceTitan supplies stable asset ids
-  at all on these payloads is unconfirmed; if it never does, `image_refs` is
-  entirely url/path-shaped, which the contract still permits ("identifiers").
+- **`active=Any` — CONFIRMED 2026-09-16** against `tenant-pricebook-v2`'s
+  OpenAPI: `active` on `/services`, `/materials` and `/equipment` is
+  `ActiveRequestArg` with values `[True, Any, False]`, defaulting to active-only.
+  The spelling was right and withdrawn items do export as `active=false`.
+- **`assets[].id` — RESOLVED 2026-09-16, and the guess was WRONG:**
+  `Pricebook.V2.SkuAssetResponse` has no `id` at all. Its fields are `alias`,
+  `fileName`, `isDefault`, `type` and `url`. So `image_refs` is **always**
+  url/path-shaped in production (the contract permits that — "identifiers"), the
+  `assets[].id` branch in `asset_identifier` only ever fires on fixtures, and the
+  asset dedupe is effectively a dedupe by url. Left in place: it costs one `or`
+  and it is the right identity if ServiceTitan ever adds ids.
 - **`name` is never blank.** The contract guarantees it; ServiceTitan could
   return both `displayName` and `name` as null. The builder falls back to `code`
   and then the item id rather than emit a blank cell. Whether that fallback ever
@@ -579,6 +577,45 @@ Also unverified: Profit Wizard's **claim response field names**. The client read
 several spellings for each field (`item_id`/`itemId`/`id`, `payload`/`body`/`data`,
 and so on) rather than assuming one, in the same widen-don't-narrow posture their
 result endpoint takes. Confirm the real names on the first live claim.
+
+## `categories` has two shapes — RESOLVED 2026-09-16, it was a real bug
+
+`src/st_exporter/feeds/pricebook.py`, `src/st_exporter/pricebook.py`
+
+Run `35134016237` on `BBTT-01/tr-doorservpro` (exporter 0.2.11) exported 61
+pricebook categories and then reported `category_ids` AND `category_names` blank
+on all 10041 `pricebook.equipment` rows and all 4990 `pricebook.materials` rows,
+while `pricebook.services` populated both.
+
+`tenant-pricebook-v2`'s OpenAPI says why: `Pricebook.V2.ServiceResponse.categories`
+is an array of `Pricebook.V2.SkuCategoryResponse` objects (`id`, `name`, `active`),
+but `Pricebook.V2.EquipmentResponse.categories` and
+`Pricebook.V2.MaterialResponse.categories` are arrays of **bare `int64` ids**. The
+reader accepted only the object form, so two thirds of the catalogue lost its
+category linkage entirely. Fixed by normalising both shapes in the fetch layer and
+resolving the names from the categories endpoint (one extra request, and only when
+nameless ids actually arrived).
+
+Still unverified: `categoryIds` is documented as taking a comma-separated list
+(`"example": "123,456"`), which contradicts the one-id-per-request quirk TrueQuote
+learned the hard way. The serial-request behaviour is deliberately kept — a
+live-tenant lesson outranks an example string — but it is worth re-measuring on a
+real tenant, because batching would cut the filtered fetch's request count.
+
+## `settings.businessUnits.Code` has no field behind it — CONFIRMED ABSENT 2026-09-16
+
+`src/st_exporter/financial.py`, `src/st_exporter/blank_columns.py`
+
+Run `35132986620` (same tenant) reported `Code` blank on all 189 business units.
+It is not a tenant that left it empty: `TenantSettings.V2.BusinessUnitResponse` in
+`tenant-settings-v2`'s OpenAPI has no `code` property, and neither does its export
+twin. The only code-ish fields are `accountCode`/`conceptCode` (the TENANT's
+franchise account and concept — identical on every unit, so not a substitute) and
+`certifiedSentriconSpecialistCode`. Profit Wizard's reader reads only
+`BusinessUnitId`, `Name`, `Address` and `Active`, so nothing downstream is waiting
+on it. Exempted in `ALL_BLANK_OK` with that reason; **the column should be dropped
+at the next `financial.v2` bump**, which is a contract change and is not being made
+here.
 
 ## The general tripwire: whole-column-blank detection
 
