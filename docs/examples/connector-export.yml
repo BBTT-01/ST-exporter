@@ -216,7 +216,7 @@ jobs:
   jobs-feed:
     if: >-
       github.event.schedule == '*/5 * * * *' || github.event.inputs.feed == 'jobs'
-    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.15
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.16
     with:
       feeds: "jobs"
     secrets:
@@ -231,7 +231,7 @@ jobs:
   technicians-feed:
     if: >-
       github.event.schedule == '*/30 * * * *' || github.event.inputs.feed == 'technicians'
-    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.15
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.16
     with:
       feeds: "technicians"
     secrets:
@@ -246,7 +246,7 @@ jobs:
   pricebook-feed:
     if: >-
       github.event.schedule == '7 * * * *' || github.event.inputs.feed == 'pricebook'
-    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.15
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.16
     with:
       feeds: "pricebook"
       # CONFIGURATION, not a gate: it narrows WHAT the pricebook feed exports,
@@ -273,7 +273,7 @@ jobs:
   financial-feed:
     if: >-
       github.event.schedule == '37 */6 * * *' || github.event.inputs.feed == 'financial'
-    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.15
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.16
     with:
       feeds: "financial"
     secrets:
@@ -293,7 +293,7 @@ jobs:
   images-feed:
     if: >-
       github.event.schedule == '22 */2 * * *' || github.event.inputs.feed == 'images'
-    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.15
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.16
     with:
       # `images` and nothing else. Adding an export feed here would put this job
       # back on the shared export lock and make it write `_meta`, which is the
@@ -341,7 +341,7 @@ jobs:
   outbox-drain:
     if: >-
       github.event.schedule == '*/5 * * * *' || github.event.inputs.feed == 'outbox'
-    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.15
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.16
     with:
       # `outbox` and nothing else. Adding an export feed here would put this job
       # back on the shared export lock and back behind the hourly pricebook run,
