@@ -444,7 +444,7 @@ class TestNotFoundDiagnostics:
         with pytest.raises(JobCostingReportNotFoundError) as excinfo:
             find_job_costing_summary(client)
         message = str(excinfo.value)
-        assert "are custom reports, which are never used" in message
+        assert "are marked as custom reports, which are never used" in message
         # ...and still carries the census.
         assert "1 category" in message
         assert "2 reports" in message
@@ -533,7 +533,7 @@ class TestTheAcceptedNameSet:
         )
         with pytest.raises(JobCostingReportNotFoundError) as excinfo:
             find_job_costing_summary(client)
-        assert "are custom reports, which are never used" in str(excinfo.value)
+        assert "are marked as custom reports, which are never used" in str(excinfo.value)
 
     def test_project_costing_summary_report_is_never_selected(self) -> None:
         """One token away from a name we accept, and a different report entirely.
@@ -661,7 +661,7 @@ class TestTheDiagnosticsWithAPluralNameSet:
             find_job_costing_summary(client)
         message = str(excinfo.value)
         assert "'Job Costing Summary' or 'Job Costing Summary Report'" in message
-        assert "are custom reports, which are never used" in message
+        assert "are marked as custom reports, which are never used" in message
 
 
 class TestTwoReportsSharingOneName:
@@ -803,3 +803,97 @@ class TestThePinnedReportId:
     def test_no_pin_is_the_unchanged_path(self) -> None:
         with pytest.raises(JobCostingReportAmbiguousError):
             find_job_costing_summary(self._tenant(), pinned_report_id=None)
+
+
+class TestTheCustomRefusalCarriesItsEvidence:
+    """A name-matching report skipped as custom must say WHICH marker fired.
+
+    `_CUSTOM_BOOLEAN_FIELDS` / `_CUSTOM_KIND_FIELDS` are guesses at a spelling
+    never seen on a real tenant (KNOWN_UNVERIFIED.md), and the asymmetry that
+    makes the guesses safe — a false positive costs a loud refusal, a false
+    negative costs silently wrong money — only holds if the loud refusal is
+    actually actionable. It was not: it said the matching reports were custom
+    and stopped, which points the contractor at a report they can already see
+    and tells whoever is debugging nothing about which guess fired.
+
+    These pin the evidence without touching selection: `custom_marker` is the
+    same rule `_looks_custom` was, and `TestDiscovery` still owns what gets
+    chosen.
+    """
+
+    def test_it_names_the_report_and_the_marker_that_skipped_it(self) -> None:
+        client = _client(
+            [{"id": 7, "name": "Accounting"}],
+            {"7": [{"id": 42, "name": JOB_COSTING_SUMMARY_REPORT_NAME, "isCustom": True}]},
+        )
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+
+        message = str(excinfo.value)
+        assert "category 7/report 42" in message
+        assert "isCustom=true" in message
+
+    def test_it_quotes_a_kind_field_value_rather_than_just_the_field(self) -> None:
+        client = _client(
+            [{"id": 7, "name": "Accounting"}],
+            {"7": [{"id": 42, "name": JOB_COSTING_SUMMARY_REPORT_NAME, "reportType": "Custom"}]},
+        )
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+
+        assert "reportType='Custom'" in str(excinfo.value)
+
+    def test_it_says_the_marker_spellings_are_unverified(self) -> None:
+        """The point of the whole message: this may be a false positive on a
+        guessed field name, not a missing report."""
+        client = _client(
+            [{"id": 7, "name": "Accounting"}],
+            {"7": [{"id": 42, "name": JOB_COSTING_SUMMARY_REPORT_NAME, "isCustom": True}]},
+        )
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+
+        message = str(excinfo.value)
+        assert "NOT confirmed" in message
+        assert "false" in message and "positive" in message
+
+    def test_it_names_every_skipped_report_when_several_match(self) -> None:
+        client = _client(
+            [{"id": 7, "name": "Accounting"}, {"id": 8, "name": "Ops"}],
+            {
+                "7": [{"id": 42, "name": JOB_COSTING_SUMMARY_REPORT_NAME, "isCustom": True}],
+                "8": [{"id": 99, "name": JOB_COSTING_SUMMARY_REPORT_NAME, "userDefined": True}],
+            },
+        )
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+
+        message = str(excinfo.value)
+        assert "category 7/report 42" in message
+        assert "category 8/report 99" in message
+
+    def test_a_builtin_beside_a_custom_namesake_is_still_selected(self) -> None:
+        """Selection is untouched — the evidence is only collected on the path
+        that ends in a refusal."""
+        client = _client(
+            [{"id": 7, "name": "Accounting"}],
+            {
+                "7": [
+                    {"id": 42, "name": JOB_COSTING_SUMMARY_REPORT_NAME, "isCustom": True},
+                    {"id": 43, "name": JOB_COSTING_SUMMARY_REPORT_NAME},
+                ]
+            },
+        )
+        assert find_job_costing_summary(client).report_id == "43"
+
+    def test_a_report_with_no_marker_produces_no_custom_evidence(self) -> None:
+        """A tenant where nothing is named right must keep the plain not-found
+        message, with no mention of custom reports to chase."""
+        client = _client(
+            [{"id": 7, "name": "Accounting"}],
+            {"7": [{"id": 42, "name": "Sales By Technician"}]},
+        )
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+
+        assert "custom" not in str(excinfo.value).lower()

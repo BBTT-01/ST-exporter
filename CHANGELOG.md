@@ -4,6 +4,33 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · The job-cost report refusal says which marker skipped a report
+
+### Changed: a name-matching report skipped as CUSTOM now names its evidence
+
+`reporting.jobCosts` is still absent on `tr-doorservpro`. The name half of that
+was diagnosed and fixed in 0.2.14 (the tenant carries "Job Costing Summary
+Report", not "Job Costing Summary") — but **no financial run has executed since**:
+the last one was 18:50 UTC at exporter 0.2.13 and the fix landed at 18:59 in
+0.2.14. The connector is pinned at `exporter-v0.2.19`, so the fix is deployed and
+untried. The census that diagnosed it listed that name **twice**, which under
+0.2.14+ resolves three ways: built-in + custom selects the built-in; two built-ins
+refuse as ambiguous; two customs take the custom path.
+
+Two of those three end in a refusal, and one was the least actionable message in
+the module: "the only report(s) named X are custom reports". The fields that
+judgement rests on (`isCustom`, `reportType`, ...) are guesses at a spelling never
+seen on a real tenant. The asymmetry that makes guessing safe — false positive
+costs a loud refusal, false negative costs silently wrong money — only holds while
+the loud half is actionable, and that message was not: it points the contractor at
+a report they can already see.
+
+The refusal now quotes each skipped report by category id, report id, name and
+**the marker it was judged on**, and says plainly that the spellings are
+unconfirmed, so a false positive reads as one rather than as a missing report.
+Selection is untouched: `custom_marker` is the same rule `_looks_custom` was, and
+`_looks_custom` is now a wrapper on it.
+
 ## [Unreleased] · Billed revenue on the `jobs` tab
 
 ### Added: `jobs.total_revenue`, appended (NOT a contract bump)
@@ -147,6 +174,7 @@ here". `--republish` now compares and writes at the released width for the same
 reason, so an append can neither break the typo-fix hatch nor ride in on one.
 
 ## [Unreleased] · Conditional image fetches, and a per-run asset cap
+
 
 ## [Unreleased] · A one-off image backfill that finishes
 
