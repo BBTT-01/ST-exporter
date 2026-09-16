@@ -119,17 +119,154 @@ def find_job_costing_summary(client: ServiceTitanClient) -> ReportRef:
     return find_builtin_report(client, JOB_COSTING_SUMMARY_REPORT_NAME)
 
 
+#: Caps on the census quoted back in a refusal. A tenant can hold thousands of
+#: reports, and this message goes to a WARNING line in the run log, so it is
+#: bounded three ways: how many near-miss names, how many other names, and how
+#: long any one name may be. The numbers are chosen to be readable in a log line
+#: while still being enough to spot "Job Cost Summary" sitting next to the
+#: report we asked for.
+_NEAR_MISS_CAP = 12
+_NAME_SAMPLE_CAP = 18
+_NAME_CHAR_CAP = 80
+#: Belt and braces over the three caps above: even 30 maximum-length names must
+#: not turn one warning into a wall of text.
+_CENSUS_CHAR_CAP = 1200
+
+_REPORTING_REMEDIATION = (
+    "Grant the Reporting permission (Report Categories, and Reports within the "
+    "category) and confirm the built-in Job Costing Summary report is available, "
+    "then re-run."
+)
+
+
+def _plural(count: int, singular: str, plural: str) -> str:
+    return f"{count} {singular if count == 1 else plural}"
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _tokens_akin(wanted: str, seen: str) -> bool:
+    """Same token, or close enough to be worth a human's eye.
+
+    "cost" matches "costing" (prefix) and "costs" matches "costing" (four shared
+    leading characters). This is for HIGHLIGHTING only — see :class:`_Census`.
+    """
+    if wanted == seen:
+        return True
+    if len(wanted) < 3 or len(seen) < 3:
+        return False
+    if wanted.startswith(seen) or seen.startswith(wanted):
+        return True
+    shared = 0
+    for a, b in zip(wanted, seen):
+        if a != b:
+            break
+        shared += 1
+    return shared >= 4
+
+
+class _Census:
+    """What the lookup actually SAW, so a refusal can say so.
+
+    A failed lookup is otherwise indistinguishable between three very different
+    situations — the Reporting scope is not really granted, the report is named
+    differently on this tenant, or it genuinely is not there — and the exporter
+    only gets one live run per question. So every category and report name that
+    goes past is counted here, with a bounded sample kept for the message.
+
+    Near-miss detection is deliberately crude and lives ONLY in this message: it
+    shares no code with :func:`_normalize`, which remains the entire matching
+    rule. Nothing here can cause a report to be selected.
+    """
+
+    def __init__(self, wanted: str) -> None:
+        self._wanted_tokens = wanted.split()
+        self.categories = 0
+        self.reports = 0
+        self._near_misses: list[str] = []
+        self._sample: list[str] = []
+
+    def saw_category(self) -> None:
+        self.categories += 1
+
+    def saw_report(self, name: Any) -> None:
+        self.reports += 1
+        display = _clip(" ".join(str(name).split()), _NAME_CHAR_CAP) if name is not None else ""
+        display = display or "(unnamed)"
+        if self._is_near_miss(_normalize(name)):
+            if len(self._near_misses) < _NEAR_MISS_CAP:
+                self._near_misses.append(display)
+        elif len(self._sample) < _NAME_SAMPLE_CAP:
+            self._sample.append(display)
+
+    def _is_near_miss(self, normalized: str) -> bool:
+        if not self._wanted_tokens or not normalized:
+            return False
+        seen = normalized.split()
+        hits = sum(
+            1 for wanted in self._wanted_tokens if any(_tokens_akin(wanted, s) for s in seen)
+        )
+        return hits >= min(2, len(self._wanted_tokens))
+
+    def diagnosis(self) -> str:
+        """The evidence sentence(s) appended to a not-found refusal."""
+        if self.categories == 0:
+            return (
+                "Nothing was visible to enumerate at all: 0 report categories and 0 "
+                "reports came back, so no name was ever compared. That points at the "
+                f"Reporting scope or at report visibility, not at a naming mismatch. "
+                f"{_REPORTING_REMEDIATION}"
+            )
+        if self.reports == 0:
+            return (
+                f"{_plural(self.categories, 'report category', 'report categories')} "
+                "were visible but contained 0 reports between them, so no name was "
+                "ever compared. That points at the Reporting scope or at report "
+                "visibility, not at a naming mismatch. "
+                f"{_REPORTING_REMEDIATION}"
+            )
+
+        parts = [
+            "Enumeration itself worked — "
+            f"{_plural(self.categories, 'category', 'categories')} and "
+            f"{_plural(self.reports, 'report', 'reports')} were read — so the Reporting "
+            "permission is in place; this is a naming or availability question, not a "
+            "scope one"
+        ]
+        if self._near_misses:
+            parts.append(
+                f"Similarly named reports seen ({len(self._near_misses)} shown): "
+                + "; ".join(self._near_misses)
+            )
+        if self._sample:
+            parts.append(
+                f"Other report names seen ({len(self._sample)} of {self.reports}): "
+                + "; ".join(self._sample)
+            )
+        body = _clip(". ".join(parts), _CENSUS_CHAR_CAP)
+        return (
+            f"{body}. Confirm with the contractor which of the reports above carries the "
+            "job-cost figures, or that the built-in Job Costing Summary report is enabled "
+            "for this tenant, then re-run."
+        )
+
+
 def find_builtin_report(client: ServiceTitanClient, report_name: str) -> ReportRef:
     """The one built-in report with exactly ``report_name``, or refuse."""
     wanted = _normalize(report_name)
     matches: dict[tuple[str, str], ReportRef] = {}
     skipped_custom = 0
+    census = _Census(wanted)
 
     for category in _iter_categories(client):
         category_id = category.get("id")
         if category_id is None:
             continue
+        census.saw_category()
         for report in _iter_reports(client, str(category_id)):
+            census.saw_report(report.get("name"))
             if _normalize(report.get("name")) != wanted:
                 continue
             if _looks_custom(report):
@@ -152,12 +289,11 @@ def find_builtin_report(client: ServiceTitanClient, report_name: str) -> ReportR
                 "a contractor-authored report would produce wrong cost numbers silently"
             )
         )
-        raise JobCostingReportNotFoundError(
-            f"{detail}. Grant the Reporting permission and confirm the built-in "
-            "Job Costing Summary report is available, then re-run."
-        )
+        raise JobCostingReportNotFoundError(f"{detail}. {census.diagnosis()}")
     if len(matches) > 1:
-        located = ", ".join(f"category {c}/report {r}" for c, r in sorted(matches))
+        located = ", ".join(
+            f"category {c}/report {r} ({matches[(c, r)].name!r})" for c, r in sorted(matches)
+        )
         raise JobCostingReportAmbiguousError(
             f"{len(matches)} distinct reports are named {report_name!r} ({located}). "
             "Refusing to choose between them — picking the wrong one would produce "
