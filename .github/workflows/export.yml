@@ -381,9 +381,30 @@ jobs:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
 
+      # The dependency cache is keyed on `pyproject.toml`, and the checkout
+      # above is what puts that file on disk — so this step can only follow it.
+      #
+      # `pip install -e .` costs ~15 seconds of resolving and downloading on a
+      # cold runner, and this workflow is not run once: every connector repo
+      # calls it on a five-minute schedule, several jobs per cycle. That is a
+      # quarter of a minute of dependency download per job, for ever, to install
+      # a dependency set that changes only when this repo's `pyproject.toml`
+      # changes — which is exactly the hash the cache is keyed on, so a release
+      # that changes dependencies misses the cache and repopulates it by itself.
+      #
+      # It caches pip's own download/wheel directory, NOT the environment, so the
+      # install still runs and still resolves: nothing about which code the job
+      # runs moves, and a corrupt or absent cache costs the 15 seconds back
+      # rather than failing. `cache-dependency-path` is explicit because
+      # setup-python's default hashes `requirements.txt`, which this repo does
+      # not have — and it FAILS the job when its path matches nothing, which for
+      # a workflow contractors run against live tenants is not a risk worth
+      # taking on a default.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
 
       - name: Install
         run: pip install -e .

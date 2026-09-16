@@ -4,6 +4,71 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · CI lints all of src/ and tests/, not half of it
+
+### Fixed: `src/st_cli/` and most of `tests/` were never linted
+
+`ci.yml`'s lint step named `src/st_exporter tests/st_exporter` only. Everything
+else — the whole of `src/st_cli/`, and every test outside `tests/st_exporter/` —
+was checked by nothing. Two E501s duly merged into the release line in `aa0bfb3`
+with no check going red, and a third plus an N802 had been sitting in
+`tests/test_engine.py` unnoticed.
+
+The exporter imports `st_cli` on every request it makes; there is no reading of
+"shared code" under which that half deserves less scrutiny. The step is now
+`ruff check src/ tests/` and `ruff format --check src/ tests/`, and the four
+existing violations are fixed in the same commit so the widened scope lands
+green.
+
+## [Unreleased] · A long throttle no longer looks like a hang
+
+### Added: the run log says when it is waiting, on which page, and for how long
+
+Honouring ServiceTitan's stated `Retry-After` is what made `reporting.jobCosts`
+reachable — and it made a successful run look broken. Run 35159471697 on
+`BBTT-01/tr-doorservpro` wrote `reporting.jobCosts=1563` and ran from **22:51:34
+to 22:58:44**: seven minutes during which the log emitted **nothing at all**. A
+throttle and a hung job are the same thing to whoever is watching the Actions log,
+and only one of them is worth cancelling.
+
+Three lines, no behaviour change:
+
+- **Each report page, before it is fetched** — report name, page number, rows
+  accumulated so far — and again after it lands with the rows that page added and
+  whether another page follows (which will be throttled by this one, since
+  reporting counts each page as another run of the report).
+- **Each rate-limit wait inside a report pull** — how long, which page, and how
+  much of the 420s `_MAX_RATE_LIMIT_SECONDS_PER_REPORT` budget is now spent. It is
+  emitted from the observer the pull already borrows from the client, so the chain
+  to a caller that holds a real shared governor (the image pass) is untouched.
+- **Each rate-limit sleep in `st_cli.client`**, which covers every feed rather
+  than just reporting. Only waits of 5s or more say anything: the blind 1s/2s/4s
+  curve is the ordinary noise of a busy endpoint and the image pass alone would
+  earn hundreds of those. The line names the ServiceTitan resource and never the
+  request's current url, which on an image fetch has been rebound to a presigned
+  blob address whose query string is a credential.
+
+`st_cli` had no logger before this. `configure_logging` now gives `st_cli` the
+same level and handler it gives `st_exporter`, so an exporter run shows these
+lines; a bare `st` CLI invocation configures no logging and is unchanged.
+
+### Changed: the reusable export workflow caches its dependency install
+
+`pip install -e .` costs ~15s of resolving and downloading on a cold runner, and
+`export.yml` is not run once — every connector repo calls it on a five-minute
+schedule, several jobs per cycle. `actions/setup-python` now caches pip's
+download directory, keyed on this repo's own `pyproject.toml` (the self-checkout
+puts it on disk before the cache step reads it, so it is the exporter's file and
+not the caller's).
+
+It caches downloads, not an environment: the install still runs and still
+resolves, so which code a job runs does not move, and a cold or corrupt cache
+costs the 15 seconds back rather than failing. `cache-dependency-path` is written
+out rather than defaulted because setup-python's default hashes
+`requirements.txt`, which this repo does not have, and a path that matches
+nothing FAILS the job — on every connector at once. A test pins that the path
+names a file this repo really ships.
+
 ## [Unreleased] · The pricebook tabs carry the whole payload
 
 ### Added: every scalar ServiceTitan returns on the pricebook item and category tabs
@@ -88,7 +153,6 @@ So `pricebook.v1` stays frozen on disk for consumers still pinned to it, and
 refuses the four tabs — loudly, which is the intended order of events, not a
 regression. A reader that keeps `pricebook.v1` in its range and looks columns up by
 name is otherwise unaffected: nothing it reads moved.
-
 ## [Unreleased] · A `0` in `total_revenue` meant "free work", and it shipped
 
 ### Fixed: a resolved `0` is now ABSENT, not a zero-dollar job
