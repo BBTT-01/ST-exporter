@@ -547,6 +547,12 @@ def _image_fields(images: ImageUploadSummary) -> str:
         f"images_signed_urls={images.conditional.signed_urls} "
         f"images_too_large={images.too_large} "
         f"images_unsupported={images.unsupported} "
+        # Byte-valid images too small to BE a picture — ServiceTitan's blank
+        # placeholder, served with 200 OK. Its own field, never folded into
+        # `images_unsupported`: a run that reports `images_placeholders=N` is
+        # NOT a clean run, and the fix (a permission) is nothing like the fix
+        # for an unsupported format.
+        f"images_placeholders={images.placeholders} "
         # WHAT the unsupported payloads looked like. `html:5` and `gif:5` are
         # the same `images_unsupported=5` and opposite diagnoses.
         f"images_unsupported_shapes={images.unsupported_shapes_field}"

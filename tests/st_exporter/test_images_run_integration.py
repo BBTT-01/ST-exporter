@@ -28,7 +28,13 @@ from tests.st_exporter.fixtures import tenant_pricebook
 
 TQ_BASE = "https://truequote.example.com/api/outbox"
 TQ_UPLOAD = f"{TQ_BASE}/pricebook-image"
-PNG = b"\x89PNG\r\n\x1a\n" + b"png-body"
+# Enough bytes that these fixtures clear `MIN_PLAUSIBLE_IMAGE_BYTES`. A real
+# pricebook photograph is kilobytes; a byte-valid image under the floor is a
+# blank placeholder and is refused on purpose (`assets.is_placeholder_image`),
+# so a fixture standing in for a REAL image has to look like one.
+_REAL_IMAGE_PADDING = b"\x00" * 2048
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"png-body" + _REAL_IMAGE_PADDING
 
 
 @pytest.fixture()
