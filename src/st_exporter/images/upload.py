@@ -96,6 +96,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from hashlib import sha256
 from time import monotonic
 from typing import Any, Iterable
 
@@ -105,9 +106,11 @@ from st_cli.client import ServiceTitanClient
 from st_cli.exceptions import APIError, STCLIError, TransportError
 from st_exporter.images.assets import (
     MAX_IMAGE_BYTES,
+    MIN_PLAUSIBLE_IMAGE_BYTES,
     PricebookAsset,
     describe_rejected_payload,
     idempotency_key,
+    is_placeholder_image,
     is_storage_path,
     payload_shape,
     redact_source_url,
@@ -190,6 +193,13 @@ class ImageUploadSummary:
     upload_rejected: int = 0
     unsupported: int = 0
     too_large: int = 0
+    # Byte-valid images too small to be a picture: ServiceTitan answers 200 OK
+    # with a blank placeholder where the caller may not see the real asset, and
+    # a placeholder passes the sniff. Counted UNDER ITS OWN NAME and never
+    # folded into `unsupported`, because the two ask for opposite fixes — an
+    # `unsupported` run says "we are not fetching images", a `placeholder` run
+    # says "we are fetching them and they are blank, check the permission".
+    placeholders: int = 0
     # True when ServiceTitan answered 403 on the authenticated images endpoint:
     # the tenant has not granted `Pricebook → Images`. Not an error — a fact the
     # run has to state out loud.
@@ -267,7 +277,7 @@ class ImageUploadSummary:
             f"download_failed={self.download_failed} rejected={self.upload_rejected} "
             f"unsupported={self.unsupported} "
             f"unsupported_shapes={self.unsupported_shapes_field} "
-            f"too_large={self.too_large} "
+            f"too_large={self.too_large} placeholders={self.placeholders} "
             f"revalidated={self.revalidated} not_modified={self.not_modified} "
             f"fetched={self.fetched} "
             f"max_assets={self.max_assets or 'none'} "
@@ -501,6 +511,17 @@ def _upload_one(
         _record_unsupported(summary, asset, payload, fetched)
         return True
 
+    if is_placeholder_image(payload):
+        # A well-formed image that is too small to BE a picture. It would sniff
+        # clean, upload clean and leave the contractor's catalogue full of blank
+        # grey squares while the run reported success. Refused, and refused
+        # under its own counter, so the run says "N placeholders skipped".
+        # Nothing is written to the ledger: the next run asks again, which is
+        # what we want if the tenant later grants the permission that makes the
+        # real bytes visible.
+        _record_placeholder(summary, asset, payload, fetched)
+        return True
+
     key = idempotency_key(asset, payload)
     summary.seen_keys.add(key)
     if ledger.has(key):
@@ -614,6 +635,39 @@ def _record_unsupported(
             "every one of them.",
             UNSUPPORTED_DETAIL_LIMIT,
         )
+
+
+def _record_placeholder(
+    summary: ImageUploadSummary,
+    asset: PricebookAsset,
+    payload: bytes,
+    fetched: _Fetched,
+) -> None:
+    """Count a blank placeholder, and log enough to recognise it again.
+
+    The sha256 is logged deliberately: it is the one fact that would let a
+    future, narrower rule name a specific placeholder by content instead of
+    trusting the size floor. Same bounded, sanitised rendering as
+    ``_record_unsupported`` — a placeholder is still a body from the wire.
+    """
+    summary.placeholders += 1
+    if summary.unsupported_detail_logged >= UNSUPPORTED_DETAIL_LIMIT:
+        return
+    summary.unsupported_detail_logged += 1
+    logger.warning(
+        "pricebook image REJECTED as a blank placeholder (%d bytes, under the %d byte "
+        "floor): item=%s asset=%s source=%s http_status=%s declared_content_type=%s "
+        "sha256=%s. ServiceTitan serves a placeholder with 200 OK where the caller may "
+        "not see the real asset; nothing was uploaded for this item.",
+        len(payload),
+        MIN_PLAUSIBLE_IMAGE_BYTES,
+        asset.external_item_id,
+        redact_source_url(asset.identity),
+        redact_source_url(asset.source_url),
+        fetched.status_code or "?",
+        _capped_declared(fetched.content_type),
+        sha256(payload).hexdigest(),
+    )
 
 
 def _capped_declared(value: str) -> str:

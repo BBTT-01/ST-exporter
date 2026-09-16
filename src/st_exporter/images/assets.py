@@ -168,6 +168,46 @@ def sniff_content_type(payload: bytes) -> ContentType | None:
     return None
 
 
+# The floor below which a byte-valid image is treated as a PLACEHOLDER rather
+# than as a picture.
+#
+# ServiceTitan's web image endpoint takes a `default=Default%2F1.png` parameter
+# and, when the caller may not see the real asset, answers **200 OK** with a
+# blank placeholder instead of a 404. One measured by hand was a 179x179 WebP of
+# 246 bytes: a perfectly well-formed RIFF/WEBP file that sniffs clean, uploads
+# clean, and shows the contractor an empty grey square. Sixteen thousand of
+# those, reported as a clean run, is the silent success this lane keeps hitting.
+#
+# 1 KiB, not 246. The threshold is not the observed sample — one tenant's
+# placeholder is one data point and the next could be 300 bytes — it is the
+# floor below which no PHOTOGRAPH exists. A lossy-compressed image carrying any
+# real detail costs on the order of a kilobyte before it carries anything: the
+# smallest real pricebook assets seen are 2-4 KiB, and a deliberately tiny
+# 64x64 product thumbnail still lands above 1 KiB. Everything under it is a
+# solid fill, a 1x1, or a spacer. 1 KiB is ~4x the observed placeholder — wide
+# enough that a differently-sized placeholder is still caught — and still well
+# under the smallest genuine asset, so it cannot silently drop a real image.
+#
+# This is deliberately NOT part of `sniff_content_type`: the sniff answers "what
+# format is this", stays exactly as narrow as TrueQuote's, and must keep
+# answering it. This answers a different question — "is this a picture of
+# anything" — and its rejections are counted under their own name.
+MIN_PLAUSIBLE_IMAGE_BYTES = 1024
+
+
+def is_placeholder_image(payload: bytes) -> bool:
+    """True for a byte-valid image too small to contain a real picture.
+
+    Size alone, on purpose. A content-hash blocklist would only catch the exact
+    placeholder we have already seen, and ServiceTitan serves a different one
+    per `default=` value and per requested `size=`; the floor catches every one
+    of them, including the ones nobody has met yet. The sha256 of each rejected
+    payload is logged so a hash rule can be added later if the floor ever proves
+    too blunt for a specific tenant.
+    """
+    return len(payload) < MIN_PLAUSIBLE_IMAGE_BYTES
+
+
 def idempotency_key(asset: PricebookAsset, payload: bytes) -> str:
     """Stable key for "these exact bytes, for this exact asset, already sent".
 

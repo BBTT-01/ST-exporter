@@ -15,6 +15,36 @@ from st_cli.exceptions import APIError, NotFoundError, RateLimitError, Transport
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.0  # seconds
 
+# How many 3xx hops one safe request may take before it is refused.
+#
+# ServiceTitan's `pricebook/v2/tenant/{id}/images?path=…` does not hand back the
+# bytes: it answers `302` with an empty body and a `Location` pointing at the
+# blob store the image actually lives in. Until this existed the exporter read
+# that 302 as the response — a zero-byte payload, no `Content-Type`, no
+# validator — and every single pricebook image was discarded by the byte sniff
+# as `shape=empty` (run 35143576507 on `BBTT-01/tr-doorservpro`: `considered=5
+# uploaded=0 unsupported=5 unsupported_shapes=empty:5`).
+#
+# Bounded rather than unbounded because a redirect loop must fail as one named
+# asset failure, not as a hang that eats the workflow's `timeout-minutes`. One
+# API hop plus a couple of CDN hops is the shape actually observed; 5 leaves
+# room without ever letting a cycle run.
+_MAX_REDIRECTS = 5
+
+# Statuses a GET follows. 303 is included (it names GET explicitly) and so are
+# 307/308, which preserve the method — which for a GET is the same thing.
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+# Only safe methods are followed. A 3xx on a POST/PATCH/PUT/DELETE is left to
+# the caller exactly as before: re-issuing a write against a new URL is the
+# duplicate-write hazard `_is_retriable_transport` exists to refuse.
+_REDIRECTABLE_METHODS = frozenset({"GET", "HEAD"})
+
+
+def _same_origin(left: httpx.URL, right: httpx.URL) -> bool:
+    """Scheme + host + effective port all equal — RFC 6454's origin, not the host."""
+    return left.scheme == right.scheme and left.host == right.host and left.port == right.port
+
 
 @dataclass(frozen=True)
 class FetchedFile:
@@ -174,6 +204,11 @@ class ServiceTitanClient:
         it is the cheapest possible success — so it travels back as a
         ``FetchedFile`` with an empty body rather than raising; only >= 400 maps
         onto the exception hierarchy, exactly as before.
+
+        A 3xx is followed (bounded by ``_MAX_REDIRECTS``, credentials dropped
+        off-origin) before it gets here, so ``status_code`` is the status of the
+        response that actually carried the bytes. ``pricebook/.../images`` does
+        redirect: it answers 302 and points at the blob store.
         """
         resp = self._send("GET", module, resource, params=params, headers=headers)
         return FetchedFile(
@@ -222,12 +257,22 @@ class ServiceTitanClient:
         ``except STCLIError`` anywhere upstream is a complete guard rather than
         one that holds until the network hiccups.
         """
-        url = self._url(module, resource)
+        url: str | httpx.URL = self._url(module, resource)
         retries = 0
         refreshed = False
         extra = dict(headers or {})
+        redirects = 0
+        # False once a redirect has taken us off ServiceTitan's API origin. Our
+        # credentials are scoped to that origin and to nowhere else, so they do
+        # not travel: not the bearer token, not `ST-App-Key`. httpx's own
+        # redirect handling drops `Authorization` cross-origin but knows nothing
+        # about `ST-App-Key`, which is exactly why this is hand-rolled rather
+        # than `follow_redirects=True` — an image 302 points at a blob host, and
+        # a tenant's app key must not be handed to it.
+        send_credentials = True
 
         while True:
+            request_headers = {**self._headers(), **extra} if send_credentials else dict(extra)
             try:
                 resp = self._http.request(
                     method,
@@ -235,7 +280,7 @@ class ServiceTitanClient:
                     # Rebuilt each pass, because a 401 refresh replaces the token
                     # mid-loop. `extra` is merged over it so a caller-supplied
                     # header wins, and so it survives the refresh.
-                    headers={**self._headers(), **extra},
+                    headers=request_headers,
                     params=params,
                     json=json_body,
                 )
@@ -261,7 +306,10 @@ class ServiceTitanClient:
                     f"({type(exc).__name__}: {exc})"
                 ) from exc
 
-            if resp.status_code == 401 and not refreshed:
+            # Only OUR origin's 401 is about OUR token. A 401 from a blob host
+            # we were redirected to is its own access control and refreshing a
+            # ServiceTitan token cannot answer it.
+            if resp.status_code == 401 and not refreshed and send_credentials:
                 self._token_manager.force_refresh()
                 refreshed = True
                 continue
@@ -270,6 +318,33 @@ class ServiceTitanClient:
                 retries += 1
                 wait = _BACKOFF_BASE * (2 ** (retries - 1))
                 time.sleep(wait)
+                continue
+
+            if method.upper() in _REDIRECTABLE_METHODS and resp.status_code in _REDIRECT_STATUSES:
+                location = resp.headers.get("location", "").strip()
+                if not location:
+                    # A 3xx with nowhere to go is not a success with an empty
+                    # body — which is precisely how it used to be read.
+                    raise APIError(
+                        resp.status_code,
+                        f"{method} {url} answered {resp.status_code} with no Location header",
+                    )
+                if redirects >= _MAX_REDIRECTS:
+                    raise APIError(
+                        resp.status_code,
+                        f"{method} {self._url(module, resource)} exceeded "
+                        f"{_MAX_REDIRECTS} redirects (last hop: {resp.status_code})",
+                    )
+                redirects += 1
+                target = resp.url.join(location)
+                if send_credentials and not _same_origin(target, resp.url):
+                    send_credentials = False
+                url = target
+                # The Location carries the whole query it wants — re-appending
+                # ours would duplicate `path=` onto a presigned blob url and
+                # invalidate its signature.
+                params = None
+                json_body = None
                 continue
 
             break

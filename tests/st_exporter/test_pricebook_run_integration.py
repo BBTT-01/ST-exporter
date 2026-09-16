@@ -210,7 +210,13 @@ TQ_BASE = "https://truequote.example.com/api/outbox"
 TQ_UPLOAD = f"{TQ_BASE}/pricebook-image"
 # tenant_pricebook's EQUIPMENT_1 carries this as its default asset.
 EQUIPMENT_IMAGE_URL = "https://cdn.example.com/a1.jpg"
-PNG = b"\x89PNG\r\n\x1a\n" + b"body"
+# Enough bytes that these fixtures clear `MIN_PLAUSIBLE_IMAGE_BYTES`. A real
+# pricebook photograph is kilobytes; a byte-valid image under the floor is a
+# blank placeholder and is refused on purpose (`assets.is_placeholder_image`),
+# so a fixture standing in for a REAL image has to look like one.
+_REAL_IMAGE_PADDING = b"\x00" * 2048
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"body" + _REAL_IMAGE_PADDING
 
 
 def _image_client():

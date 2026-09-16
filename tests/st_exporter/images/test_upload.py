@@ -15,7 +15,12 @@ import httpx
 import pytest
 import respx
 
-from st_cli.client import ServiceTitanClient
+from st_cli.client import _MAX_REDIRECTS, ServiceTitanClient
+from st_exporter.images.assets import (
+    MIN_PLAUSIBLE_IMAGE_BYTES,
+    is_placeholder_image,
+    sniff_content_type,
+)
 from st_exporter.images.client import TrueQuoteImageClient
 from st_exporter.images.ledger import ImageLedger
 from st_exporter.images.upload import (
@@ -34,8 +39,14 @@ PUBLIC_URL = "https://cdn.example.com/a1.jpg"
 STORAGE_PATH = "Images/Pricebook/9f2c-uuid.jpg"
 NOW = "2026-09-14T12:00:00+00:00"
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"png-body"
-JPEG = b"\xff\xd8\xff" + b"jpeg-body"
+# Enough bytes that these fixtures clear `MIN_PLAUSIBLE_IMAGE_BYTES`. A real
+# pricebook photograph is kilobytes; a byte-valid image under the floor is a
+# blank placeholder and is refused on purpose (`assets.is_placeholder_image`),
+# so a fixture standing in for a REAL image has to look like one.
+_REAL_IMAGE_PADDING = b"\x00" * 2048
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"png-body" + _REAL_IMAGE_PADDING
+JPEG = b"\xff\xd8\xff" + b"jpeg-body" + _REAL_IMAGE_PADDING
 
 PUBLIC_ITEM = {"id": 100, "assets": [{"id": "a1", "url": PUBLIC_URL, "isDefault": True}]}
 STORAGE_ITEM = {"id": 200, "assets": [{"id": None, "url": STORAGE_PATH}]}
@@ -1361,3 +1372,178 @@ def _rejection_line(caplog) -> str:
     lines = _rejection_lines(caplog)
     assert len(lines) == 1, lines
     return lines[0]
+
+
+class TestTheImageFetchFollowsRedirects:
+    """Run 35143576507 on ``BBTT-01/tr-doorservpro``: every asset came back as a
+    302 with a zero-byte body (``unsupported_shapes=empty:5``) because the
+    authenticated images endpoint does not serve the bytes, it points at them.
+    """
+
+    @respx.mock
+    def test_a_302_from_the_authenticated_endpoint_is_followed_and_uploaded(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        blob = "https://blob.servicetitan.example/pricebook/9f2c.jpg"
+        images = respx.get(_images_url(st_settings)).mock(
+            return_value=httpx.Response(302, headers={"location": blob})
+        )
+        hop = respx.get(blob).mock(
+            return_value=httpx.Response(200, content=JPEG, headers={"content-type": "image/jpeg"})
+        )
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [STORAGE_ITEM])
+
+        assert (summary.uploaded, summary.unsupported, summary.placeholders) == (1, 0, 0)
+        assert images.called and hop.called
+        assert upload.calls[0].request.content == JPEG
+
+    @respx.mock
+    def test_credentials_do_not_travel_to_another_host(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        blob = "https://blob.elsewhere.example/pricebook/9f2c.jpg"
+        respx.get(_images_url(st_settings)).mock(
+            return_value=httpx.Response(302, headers={"location": blob})
+        )
+        hop = respx.get(blob).mock(return_value=httpx.Response(200, content=JPEG))
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [STORAGE_ITEM])
+
+        assert summary.uploaded == 1
+        followed = hop.calls[0].request
+        assert "authorization" not in followed.headers
+        assert "st-app-key" not in followed.headers
+
+    @respx.mock
+    def test_credentials_do_travel_on_a_same_origin_redirect(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        same = f"{st_settings.api_base}/pricebook/v2/tenant/x/images/blob/9f2c.jpg"
+        respx.get(_images_url(st_settings)).mock(
+            return_value=httpx.Response(302, headers={"location": same})
+        )
+        hop = respx.get(same).mock(return_value=httpx.Response(200, content=JPEG))
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [STORAGE_ITEM])
+
+        assert summary.uploaded == 1
+        assert hop.calls[0].request.headers["authorization"] == "Bearer test-token"
+
+    @respx.mock
+    def test_a_redirect_chain_past_the_limit_is_refused_not_hung(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        # A cycle: without a bound this never terminates.
+        loop = "https://blob.servicetitan.example/loop.jpg"
+        respx.get(_images_url(st_settings)).mock(
+            return_value=httpx.Response(302, headers={"location": loop})
+        )
+        hop = respx.get(loop).mock(return_value=httpx.Response(302, headers={"location": loop}))
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [STORAGE_ITEM])
+
+        assert (summary.uploaded, summary.download_failed) == (0, 1)
+        assert not upload.called
+        assert len(hop.calls) <= _MAX_REDIRECTS
+
+    @respx.mock
+    def test_a_302_with_no_location_is_a_failure_not_an_empty_success(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(_images_url(st_settings)).mock(return_value=httpx.Response(302))
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [STORAGE_ITEM])
+
+        # Before this, the empty 302 body reached the sniff and was counted
+        # `unsupported` with `shape=empty` — a byte problem, which it is not.
+        assert (summary.download_failed, summary.unsupported) == (1, 0)
+        assert not upload.called
+
+    @respx.mock
+    def test_the_public_branch_follows_redirects_too(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        moved = "https://cdn.example.com/moved/a1.jpg"
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(302, headers={"location": moved}))
+        respx.get(moved).mock(return_value=httpx.Response(200, content=PNG))
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [PUBLIC_ITEM])
+
+        assert summary.uploaded == 1
+        assert upload.calls[0].request.content == PNG
+
+
+class TestBlankPlaceholdersAreRefusedUnderTheirOwnName:
+    """A 246-byte WebP is a well-formed image of nothing. Uploading 16,112 of
+    them and reporting a clean run is the failure this guards.
+    """
+
+    @staticmethod
+    def _webp(size: int) -> bytes:
+        head = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP"
+        return head + b"\x00" * (size - len(head))
+
+    @respx.mock
+    def test_a_placeholder_sized_body_is_rejected_and_counted_separately(
+        self, st_settings, st_client, image_client, caplog
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        # The size measured by hand against `go.servicetitan.com`.
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=self._webp(246)))
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        with caplog.at_level(logging.WARNING):
+            summary = _run(st_client, image_client, [PUBLIC_ITEM])
+
+        assert summary.placeholders == 1
+        # NOT folded into `unsupported`: the two ask for opposite fixes.
+        assert (summary.unsupported, summary.uploaded) == (0, 0)
+        assert not upload.called
+        assert "placeholders=1" in summary.as_log_fields()
+        assert "blank placeholder" in caplog.text
+
+    @respx.mock
+    def test_a_small_but_real_image_just_over_the_floor_is_not_rejected(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        real = self._webp(MIN_PLAUSIBLE_IMAGE_BYTES)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=real))
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [PUBLIC_ITEM])
+
+        assert (summary.uploaded, summary.placeholders) == (1, 0)
+        assert upload.calls[0].request.headers["content-type"] == "image/webp"
+
+    @respx.mock
+    def test_a_placeholder_leaves_nothing_in_the_ledger_so_the_next_run_asks_again(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=self._webp(246)))
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        store = InMemorySheetsStore()
+        ledger = ImageLedger(store)
+
+        _run(st_client, image_client, [PUBLIC_ITEM], ledger=ledger)
+
+        assert ledger.keys_for(PUBLIC_URL) == set()
+
+    def test_the_byte_sniff_itself_is_unchanged(self) -> None:
+        """The floor is a separate rule. A tiny PNG is still a PNG."""
+        assert sniff_content_type(b"\x89PNG\r\n\x1a\n") == "image/png"
+        assert is_placeholder_image(b"\x89PNG\r\n\x1a\n")
