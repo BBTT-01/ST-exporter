@@ -4,6 +4,56 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · The image upload is its own feed and its own job
+
+### Fixed: the pricebook image pass could never finish, and failed the pricebook feed while it tried
+
+Run `35130164187` on `BBTT-01/tr-doorservpro`, 2026-09-16: the image pass was
+SIGKILLed at **10m35s** (`Terminate orphan process ... (st-export)`) with **0 of
+~7,191 images uploaded**. GitHub reports a timed-out job as "cancelled", which
+reads like a competing run; `concurrency.cancel-in-progress` is `false`, so it
+was the timeout. `.github/workflows/export.yml` hardcoded `timeout-minutes: 10`.
+
+**It could not converge on its own.** `_upload_one` checked `ledger.has(key)`
+only AFTER downloading the bytes, because `idempotency_key(asset, payload)`
+hashes the payload. So every re-run re-downloaded the whole catalogue to
+rediscover what it had already sent, was killed in the same place, and — because
+a killed process flushes no ledger — forgot even that. Meanwhile the pass lived
+inside the `pricebook` feed's invocation, so its death reddened the hourly
+pricebook export too.
+
+Four changes, and it needs all four:
+
+* **`images` is a feed of its own** (`--feeds images`, `run_images`), with its
+  own caller job, its own cadence and its own concurrency lock. It writes no
+  export tab and no `_meta` row — verified by test, because that is the reusable
+  workflow's stated condition for leaving the shared export lock.
+* **It re-lists the pricebook from ServiceTitan** rather than reading the
+  exported tabs back. Reading them back is not possible against the frozen
+  `pricebook.v1` contract: `image_refs` carries the asset's id when there is one
+  and only otherwise its url, and the url is what gets downloaded. The
+  duplicated listing is ~36 requests against a pass that may download thousands
+  of images.
+* **`job_timeout_minutes`** (default 10, so every existing caller and every
+  other feed is untouched) drives `timeout-minutes` and is handed to the
+  exporter as `EXPORTER_JOB_TIMEOUT_MINUTES`. The pass stops two minutes short
+  of it and flushes its ledger, instead of being killed with nothing written.
+* **The pass resumes.** It works least-recently-verified first, so each run
+  starts on the images the last one did not reach; and it skips the DOWNLOAD
+  entirely for an asset whose item ServiceTitan has not modified since the
+  ledger confirmed it, so a converged catalogue costs no bytes at all.
+
+`_image_ledger`'s fourth column is renamed `uploaded_at` -> `verified_at` in
+place: same position, same data, an existing ledger loads unchanged. The summary
+line gains `images_pending=` (the number that falls to 0 as a sweep converges)
+and `images_revalidated=`.
+
+**`--upload-images` is kept, not removed** — a caller passing
+`--no-upload-images` keeps working — but it now applies to `--feeds images`
+rather than `--feeds pricebook`. A connector that repins without adding the
+`images-feed` job uploads no bytes from its pricebook job and says so at
+WARNING; image identifiers still reach the Sheet either way.
+
 ## [Unreleased] · Customer phone and email were never exported
 
 ### Fixed: `customer_phone` / `customer_email` blank on every row ever exported

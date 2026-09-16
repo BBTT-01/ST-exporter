@@ -658,3 +658,27 @@ the anchor, whose whole purpose is to be the one check the branch cannot subvert
 
 There is no in-repo tripwire for this, deliberately: any test that tried to assert
 it would itself be running inside the run that was skipped.
+
+## Images feed: does `modifiedOn` move when an item's IMAGE is replaced?
+
+`src/st_exporter/images/upload.py`, `_is_still_fresh` / `REVERIFY_AFTER_DAYS`
+
+The image pass skips the DOWNLOAD of any asset whose item has a `modifiedOn` no
+later than the moment the ledger last confirmed that asset's bytes. This is the
+only pre-download check available — the idempotency key hashes the payload, so
+`ledger.has(key)` cannot be asked until the bytes are already in hand, which is
+what used to make a ~7,191-asset tenant re-download the whole catalogue on every
+run just to rediscover it had already sent it (run 35130164187).
+
+What is assumed: ServiceTitan bumps a pricebook item's `modifiedOn` when one of
+its `assets` changes, and not only when a scalar field like `price` does. That
+is the behaviour the `pricebook.*` tabs' own full-replace-every-run design makes
+moot, so nothing in this repo has ever had to depend on it before.
+
+If the assumption is wrong, the failure is a DELAY, not a wrong picture, and it
+is bounded on purpose: `REVERIFY_AFTER_DAYS` (7) re-downloads every asset at
+least that often whatever the timestamps say, so a swapped image reaches
+TrueQuote within a week at worst. Check on a real tenant by replacing one item's
+image and watching whether the next `images-feed` run re-uploads it or reports
+it in `images_revalidated`. If it does not, lower `REVERIFY_AFTER_DAYS`; do not
+remove the check, or the pass stops converging.

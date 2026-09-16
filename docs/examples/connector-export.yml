@@ -22,6 +22,7 @@
 #   technicians-feed    */30        TradeRated, Profit Wizard
 #   pricebook-feed      hourly      TrueQuote
 #   financial-feed      */6 hours   Profit Wizard
+#   images-feed         */2 hours   TrueQuote — see below, it is not a tab feed
 #   outbox-drain        */5         everyone — see below, it is not a feed
 #
 # EVERY JOB RUNS ON ITS SCHEDULE, FOR EVERY CONTRACTOR. There is nothing here to
@@ -109,11 +110,53 @@
 # no Sheet and calls nothing.
 #
 # ===========================================================================
+# THE IMAGE PASS IS ITS OWN JOB
+# ===========================================================================
+#
+# `images-feed` writes no tab. It re-lists the pricebook from ServiceTitan and
+# POSTs each item's image BYTES to TrueQuote, recording what it sent in a
+# private ledger. `pricebook-feed` still exports the image IDENTIFIERS into the
+# `pricebook.*` tabs; this job is what makes the pictures themselves arrive.
+#
+# It used to be a flag on `pricebook-feed`, inside the same ten-minute job, and
+# on a tenant with thousands of images it could not finish: run 35130164187 on
+# `BBTT-01/tr-doorservpro` was SIGKILLed at 10m35s having uploaded ZERO images.
+# Worse, it could not converge on its own — a killed process writes no ledger,
+# so the next run re-downloaded the same prefix and was killed in the same
+# place, for ever — and while it failed it took the hourly pricebook export
+# down with it.
+#
+# Three things changed, and it needs all three:
+#
+#   1. Its own job, so a slow image pass can no longer fail the pricebook feed.
+#   2. Its own `job_timeout_minutes`, and the exporter is TOLD that number: it
+#      stops the pass two minutes short of it and flushes its ledger, instead of
+#      being killed mid-download with nothing written.
+#   3. Its own lock. It writes no `_meta` and touches no export tab, which is
+#      the reusable workflow's stated test for leaving the shared export lock —
+#      the same test `outbox-drain` passes. So a two-hourly image sweep never
+#      queues the */5 jobs feed behind it.
+#
+# A run that does not get through the whole catalogue is NORMAL and is not a
+# failure: it reports `images_pending=` and the next run starts with exactly the
+# images it did not reach, because the pass works least-recently-verified first.
+# `images_pending` falling to 0 over a few runs is a sweep converging. If it
+# never falls, raise `job_timeout_minutes` on this job — nothing else.
+#
+# TRUEQUOTE_IMAGE_TOKEN BELONGS TO THIS JOB AND NO OTHER. Leaving it on
+# `pricebook-feed` after adopting this file uploads nothing from there (the
+# exporter only builds an image client for the `images` feed) and the run says
+# so at WARNING. A contractor with no TrueQuote image token at all simply does
+# not add this job, or adds it and it no-ops: the identifiers still reach the
+# Sheet, only the bytes are skipped.
+#
+# ===========================================================================
 # WHY PRICEBOOK CAN STILL DELAY JOBS
 # ===========================================================================
 #
-# The drain now takes its own lock, so the 5-minute drain no longer queues
-# behind an hourly pricebook run. The four FEED jobs still share one lock, and
+# The drain and the image pass each take their own lock, so neither the
+# 5-minute drain nor the two-hourly image sweep queues behind an hourly
+# pricebook run. The four EXPORT feed jobs still share one lock, and
 # that is not an oversight: every export feed reads the whole `_meta` grid and
 # writes the whole `_meta` grid back, carrying over the rows for the feeds it
 # did not run. Two feeds running at once would roll each other's cursors and
@@ -137,6 +180,12 @@ on:
     - cron: "*/30 * * * *"   # technicians-feed
     - cron: "7 * * * *"      # pricebook-feed
     - cron: "37 */6 * * *"     # financial-feed
+    # Offset from the hourly pricebook run rather than landing beside it: the
+    # two are independent now (different locks), but a tenant reading the
+    # Actions list should be able to tell them apart at a glance. Two-hourly
+    # because a converged catalogue costs almost nothing to sweep and a large
+    # one takes several runs to converge either way.
+    - cron: "22 */2 * * *"     # images-feed
   workflow_dispatch:
     inputs:
       feed:
@@ -148,6 +197,7 @@ on:
           - technicians
           - pricebook
           - financial
+          - images
           - outbox
 # A manual dispatch runs ONE job, chosen above, rather than all of them. It used
 # to start every job at once; they all take the same lock, and GitHub keeps only
@@ -213,16 +263,12 @@ jobs:
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SHEETS_WRITER_JSON }}
       GOOGLE_SHEET_ID: ${{ secrets.EXPORT_SPREADSHEET_ID }}
       GOOGLE_RAW_CACHE_SHEET_ID: ${{ secrets.GOOGLE_RAW_CACHE_SHEET_ID }}
-      # The pricebook feed uploads item image BYTES to TrueQuote, so it needs
-      # TrueQuote's host and an `image_upload`-scoped token. This is NOT a
-      # drain lane and cannot become one: a lane needs
-      # TRUEQUOTE_MACHINE_TOKEN (scope `booking_outbox`) with the URL, and that
-      # token is issued separately and is given only to `outbox-drain` below.
-      # Adding `outbox` to this job's feeds would therefore drain nothing —
-      # which is the point. Omit both and the image identifiers still reach the
-      # Sheet; only the bytes are skipped.
-      TRUEQUOTE_OUTBOX_URL: ${{ secrets.TRUEQUOTE_OUTBOX_URL }}
-      TRUEQUOTE_IMAGE_TOKEN: ${{ secrets.TRUEQUOTE_IMAGE_TOKEN }}
+      # NO TRUEQUOTE_IMAGE_TOKEN. The image bytes moved to `images-feed` below,
+      # because downloading them could not fit in this job's ten minutes and was
+      # failing the whole pricebook export every hour. This job still exports the
+      # image IDENTIFIERS into the `pricebook.*` tabs — that never depended on
+      # the token. Putting the token back here uploads nothing (the exporter
+      # builds an image client only for the `images` feed) and the run warns.
 
   financial-feed:
     if: >-
@@ -238,6 +284,53 @@ jobs:
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SHEETS_WRITER_JSON }}
       GOOGLE_SHEET_ID: ${{ secrets.EXPORT_SPREADSHEET_ID }}
       GOOGLE_RAW_CACHE_SHEET_ID: ${{ secrets.GOOGLE_RAW_CACHE_SHEET_ID }}
+
+  # ==========================================================================
+  # THE IMAGE PASS — writes no tab, and the only job holding the image token.
+  # Read "THE IMAGE PASS IS ITS OWN JOB" at the top before changing it.
+  # ==========================================================================
+
+  images-feed:
+    if: >-
+      github.event.schedule == '22 */2 * * *' || github.event.inputs.feed == 'images'
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v0.2.15
+    with:
+      # `images` and nothing else. Adding an export feed here would put this job
+      # back on the shared export lock and make it write `_meta`, which is the
+      # entire reason it is allowed a lock of its own.
+      feeds: "images"
+      # The same category restriction the pricebook feed uses, so this job
+      # uploads images for exactly the items that one exports. Blank (the usual
+      # case) means the whole catalogue.
+      pricebook_category_ids: ${{ vars.PRICEBOOK_CATEGORY_IDS }}
+      # 30 rather than the default 10, and ONLY on this job — nothing else in
+      # this file passes it, so every other feed keeps the old ten minutes.
+      #
+      # This is the one job that downloads image bytes, and a large catalogue is
+      # more bytes than a 10-minute job can move. The pass stops itself two
+      # minutes short of this number and flushes its ledger, so a smaller value
+      # is SLOWER, not broken: each run works through the images the last one did
+      # not reach. What this number buys is fewer runs to a first full sweep.
+      #
+      # Raise it for a tenant with thousands of images. There is no cost to the
+      # other feeds: this job holds its own concurrency lock.
+      job_timeout_minutes: 30
+    secrets:
+      ST_CLIENT_ID: ${{ secrets.SERVICETITAN_CLIENT_ID }}
+      ST_CLIENT_SECRET: ${{ secrets.SERVICETITAN_CLIENT_SECRET }}
+      ST_APP_KEY: ${{ secrets.SERVICETITAN_APP_KEY }}
+      ST_TENANT_ID: ${{ secrets.SERVICETITAN_TENANT_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SHEETS_WRITER_JSON }}
+      GOOGLE_SHEET_ID: ${{ secrets.EXPORT_SPREADSHEET_ID }}
+      GOOGLE_RAW_CACHE_SHEET_ID: ${{ secrets.GOOGLE_RAW_CACHE_SHEET_ID }}
+      # TrueQuote's host and an `image_upload`-scoped token. THE ONLY JOB IN
+      # THIS FILE THAT GETS THE IMAGE TOKEN — it used to be on `pricebook-feed`,
+      # and leaving a copy there now uploads nothing and warns. This is NOT a
+      # drain lane and cannot become one: a lane needs TRUEQUOTE_MACHINE_TOKEN
+      # (scope `booking_outbox`) with the URL, and that token is issued
+      # separately and is given only to `outbox-drain` below.
+      TRUEQUOTE_OUTBOX_URL: ${{ secrets.TRUEQUOTE_OUTBOX_URL }}
+      TRUEQUOTE_IMAGE_TOKEN: ${{ secrets.TRUEQUOTE_IMAGE_TOKEN }}
 
   # ==========================================================================
   # THE DRAIN — the only job in this file that may name `outbox`, and the only

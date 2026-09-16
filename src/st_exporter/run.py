@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any, Callable, TypeVar
 
 from st_cli.client import ServiceTitanClient
@@ -77,7 +78,7 @@ from st_exporter.meta import (
     parse_meta_grid,
 )
 from st_exporter.pricebook import CONTRACT_VERSION, build_category_grid, build_item_grid
-from st_exporter.scopes import ScopeLedger
+from st_exporter.scopes import ScopeLedger, is_permission_denied
 from st_exporter.sheets import SheetsClient, SheetsPort, get_gspread_client
 from st_exporter.window import DEFAULT_WINDOW_DAYS, FINANCIAL_WINDOW_DAYS, in_window
 from st_exporter.writeback import JobsWriteBack
@@ -98,9 +99,25 @@ _RAW_CUSTOMER_CONTACTS = "_raw_customer_contacts"
 # product's secrets in some other workflow job can no longer cause a second
 # drain of the same queue. See EXPORT_FEEDS / OUTBOX_FEED below and cli.py.
 OUTBOX_FEED = "outbox"
+# `images` is not an export feed either, and for the same structural reason: it
+# writes no export tab and no `_meta` row. It POSTs pricebook image BYTES to
+# TrueQuote and records what it sent in `_image_ledger`, a tab on the PRIVATE
+# raw-cache Sheet that nothing else reads or writes.
+#
+# It used to be a flag on the pricebook feed (`--upload-images`), sharing that
+# feed's invocation, its ten-minute job and its concurrency lock. On a tenant
+# with ~7,191 assets the download pass could not finish inside the job, so the
+# runner SIGKILLed it — run 35130164187 on `BBTT-01/tr-doorservpro`, killed at
+# 10m35s with 0 images uploaded — and a killed process flushes no ledger, so
+# every run restarted the catalogue from the top. It could never converge, and
+# while it failed it took the hourly pricebook export down with it.
+#
+# Splitting it out gives it its own timeout, its own cadence and its own lock.
+# See `run_images` for where an independent pass gets its image references.
+IMAGES_FEED = "images"
 EXPORT_FEEDS = frozenset({"jobs", "technicians", "pricebook", "financial"})
-_VALID_FEEDS = EXPORT_FEEDS | {OUTBOX_FEED}
-_FEED_LIST = "jobs, technicians, pricebook, financial, outbox"
+_VALID_FEEDS = EXPORT_FEEDS | {OUTBOX_FEED, IMAGES_FEED}
+_FEED_LIST = "jobs, technicians, pricebook, financial, images, outbox"
 # Neither `pricebook` nor `financial` is a default. `pricebook` is a catalogue on a
 # much slower cadence than jobs (~5 min) and technicians (~30 min), and re-listing
 # it on every jobs run would be pure waste. `financial` is a six-hourly feed —
@@ -264,11 +281,149 @@ def run_export(
             contacts_max_customers=exporter_settings.contacts_max_customers,
             pricebook_category_ids=exporter_settings.pricebook_category_ids,
             image_client=image_client,
+            # `run_export` no longer runs an image pass in production — the
+            # `images` feed does (`run_images`), and `cli.py` builds an image
+            # client only for that feed. The budget is still computed and passed
+            # so the in-process lane stays bounded for any caller that injects an
+            # image client here directly, which the tests do.
+            image_deadline=monotonic() + exporter_settings.image_budget_seconds,
             dry_run=dry_run,
         )
     finally:
         if owns_client:
             active_client.close()
+
+
+def run_images(
+    st_settings: Settings,
+    exporter_settings: ExporterSettings,
+    *,
+    image_client: TrueQuoteImageClient,
+    client: ServiceTitanClient | None = None,
+    raw_cache_store: SheetsPort | None = None,
+    deadline: float | None = None,
+) -> ImageUploadSummary:
+    """Run the `images` feed: upload pricebook image bytes, and nothing else.
+
+    WHERE AN INDEPENDENT PASS GETS ITS IMAGE REFERENCES
+    ===================================================
+
+    It re-lists the pricebook from ServiceTitan, with the same
+    ``fetch_pricebook_items`` the `pricebook` feed uses and the same
+    ``pricebook_category_ids``. Two alternatives were considered and rejected:
+
+    **Reading the exported `pricebook.*` tabs back off the Sheet is not
+    possible** — not "expensive", not "coupled", impossible against the frozen
+    `pricebook.v1` contract. The tabs carry one image column, ``image_refs``,
+    and ``pricebook.asset_identifier`` fills it with the asset's ``id`` when
+    ServiceTitan supplies one and only otherwise with its ``url``. The url is
+    what gets downloaded, and for every asset that has an id the url is simply
+    not in the Sheet. ``select_uploadable_asset`` also needs ``fileName``,
+    ``alias``, ``type`` and ``isDefault``, and needs the whole candidate list to
+    pick the same primary image TrueQuote's own ``selectDefaultPricebookImage``
+    would. None of that is exported. Reading the Sheet back would have meant
+    widening a frozen consumer-facing contract to carry upload plumbing, and
+    then coupling the image pass to whether the pricebook feed had run recently.
+
+    **Persisting the item records in the raw cache** would work — that is what
+    ``feeds/raw_cache.py`` does for the five change feeds — but it makes the
+    hourly pricebook feed write several megabytes of JSON it has no other use
+    for, and reintroduces exactly the freshness coupling the split exists to
+    remove: the image pass would then be as stale as the last pricebook run.
+
+    **So it re-fetches, and the duplicated work is a rounding error.** The
+    listing is three paginated calls at 200 records a page — about 36 requests
+    for a 7,191-item catalogue — against a pass whose real cost is up to 7,191
+    HTTPS downloads of up to 8 MiB each. It is the same fetch that makes the
+    pricebook feed itself viable hourly. In exchange the feed is self-contained:
+    it does not care whether the pricebook tab has ever been written or how
+    stale it is, because it never reads it.
+
+    WHAT IT WRITES
+    ==============
+
+    ``_image_ledger``, on the PRIVATE raw-cache Sheet, and nothing else. No
+    export tab, no `_meta` row, no read-modify-write of any grid another feed
+    touches — which is what lets the caller give this job its own concurrency
+    lock instead of queueing it behind the export feeds. Never add a `_meta`
+    write here without moving the job back onto the shared lock.
+    """
+    configure_logging()
+
+    if deadline is None:
+        deadline = monotonic() + exporter_settings.image_budget_seconds
+
+    owns_client = client is None
+    active_client = client or ServiceTitanClient(st_settings)
+    try:
+        active_raw_cache_store = raw_cache_store or SheetsClient.open(
+            get_gspread_client(exporter_settings.service_account_json),
+            exporter_settings.raw_cache_sheet_id,
+        )
+        records, catalogue_complete = _fetch_image_catalogue(
+            active_client, category_ids=exporter_settings.pricebook_category_ids
+        )
+        summary = _upload_pricebook_images(
+            active_client,
+            active_raw_cache_store,
+            records,
+            image_client=image_client,
+            image_deadline=deadline,
+            run_at=datetime.now(timezone.utc).isoformat(),
+            dry_run=False,
+            catalogue_complete=catalogue_complete,
+        )
+        # `_upload_pricebook_images` answers None only for "no client / dry run",
+        # neither of which can be true here.
+        assert summary is not None
+        return summary
+    finally:
+        if owns_client:
+            active_client.close()
+
+
+def _fetch_image_catalogue(
+    client: ServiceTitanClient,
+    *,
+    category_ids: tuple[str, ...] = (),
+) -> tuple[list[dict[str, Any]], bool]:
+    """Every pricebook item that could carry an image, and whether that is ALL of them.
+
+    One resource refused or failing must not cost the others: a TrueQuote-only
+    tenant has `Pricebook -> Services`, `-> Equipment` and `-> Categories` ticked
+    and NOT `-> Materials`, so a 403 on materials is the ORDINARY state of the
+    tenants this feed exists for, and treating it as a failure would skip the
+    images they are paying for. Same rule as the pricebook feed's `_TabGuard`.
+
+    The boolean is the prune veto, and it is the whole reason this returns a pair.
+    A resource that did not answer means its items never reached the list, so its
+    ledger entries would look "not seen" — and "not looked at" must never be read
+    as "gone". Anything short of a clean full listing sets it False.
+    """
+    records: list[dict[str, Any]] = []
+    complete = True
+    for resource in ITEM_RESOURCES:
+        try:
+            records.extend(fetch_pricebook_items(client, resource, category_ids=category_ids))
+        except STCLIError as exc:
+            complete = False
+            if is_permission_denied(exc):
+                # Quiet, like a never-granted tab: no annotation, no failure.
+                logger.info(
+                    "images: ServiceTitan answered 403 for pricebook.%s, so this tenant's "
+                    "app was not granted it. Its images are skipped and the other "
+                    "resources still run.",
+                    resource,
+                )
+            else:
+                logger.warning(
+                    "images: pricebook.%s could not be listed (%s). Its images are skipped "
+                    "this run and retried by the next one; the ledger is NOT pruned, so "
+                    "nothing already delivered is forgotten.",
+                    resource,
+                    exc,
+                )
+    return records, complete
 
 
 def _resolve_stores(
@@ -306,6 +461,9 @@ def _run(
     contacts_max_customers: int = DEFAULT_MAX_CONTACT_CUSTOMERS,
     pricebook_category_ids: tuple[str, ...] = (),
     image_client: TrueQuoteImageClient | None = None,
+    # None = no budget. Only a caller that knows nothing will kill the process
+    # may leave it unset; `run_export` always sets one.
+    image_deadline: float | None = None,
     dry_run: bool,
 ) -> ExportSummary:
     now = datetime.now(timezone.utc)
@@ -505,6 +663,7 @@ def _run(
             raw_cache_store,
             pricebook_item_records,
             image_client=image_client,
+            image_deadline=image_deadline,
             run_at=run_at,
             dry_run=dry_run,
             # An item tab that did not produce a grid — failed, or refused with a
@@ -1231,6 +1390,7 @@ def _upload_pricebook_images(
     item_records: list[dict[str, Any]],
     *,
     image_client: TrueQuoteImageClient | None,
+    image_deadline: float | None,
     run_at: str,
     dry_run: bool,
     catalogue_complete: bool = True,
@@ -1252,6 +1412,10 @@ def _upload_pricebook_images(
     ``ImageLedger.keep``'s precondition is that the caller saw the WHOLE
     catalogue, and a failed `pricebook.equipment` means every equipment image
     key is simply absent from ``seen_keys`` rather than gone.
+
+    ``image_deadline`` bounds the pass so it ends with a FLUSHED ledger rather
+    than a SIGKILL. A pass that runs out of budget is ``stopped``, which already
+    vetoes the prune for exactly the right reason: it did not see the catalogue.
     """
     if image_client is None or dry_run:
         return None
@@ -1259,7 +1423,9 @@ def _upload_pricebook_images(
     ledger = ImageLedger(raw_cache_store)
     summary = ImageUploadSummary()
     try:
-        summary = upload_pricebook_images(client, image_client, ledger, item_records, now=run_at)
+        summary = upload_pricebook_images(
+            client, image_client, ledger, item_records, now=run_at, deadline=image_deadline
+        )
         # Only prune on a pass that actually saw the whole catalogue — a run
         # stopped by a 403, a rate limit or a failed download has "not looked
         # at" assets that must not be mistaken for "gone" and re-uploaded next

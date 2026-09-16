@@ -17,7 +17,7 @@ import respx
 from st_cli.client import ServiceTitanClient
 from st_exporter.images.client import TrueQuoteImageClient
 from st_exporter.images.ledger import ImageLedger
-from st_exporter.images.upload import upload_pricebook_images
+from st_exporter.images.upload import BUDGET_SPENT, upload_pricebook_images
 from st_exporter.sheets import InMemorySheetsStore
 from tests.st_exporter.conftest import mock_auth_token
 
@@ -408,3 +408,271 @@ class TestServiceTitanUnreachable:
         assert summary.stopped is None
         assert summary.download_failed == 1
         assert summary.uploaded == 1
+
+
+# ---------------------------------------------------------------------------
+# BOUNDED AND RESUMABLE.
+#
+# Run 35130164187 on `BBTT-01/tr-doorservpro`: ~7,191 assets, the process
+# SIGKILLed by the runner at 10m35s, 0 images uploaded. It could not converge on
+# its own, because a killed process flushes no ledger and the next run started
+# the catalogue from the top and was killed in the same place.
+#
+# Two things had to become true, and neither is sufficient alone: the pass must
+# STOP ITSELF while it can still write the ledger, and the next pass must START
+# WHERE THIS ONE STOPPED.
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """A `monotonic()` that advances one second per reading.
+
+    The pass reads the clock exactly once per asset, before starting it, so one
+    tick per asset makes "a budget of N seconds" mean "N assets" — which is what
+    lets these tests talk about how far a bounded run gets without sleeping.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        reading = self.now
+        self.now += 1.0
+        return reading
+
+
+def _item(item_id: int) -> dict:
+    return {
+        "id": item_id,
+        "modifiedOn": "2026-09-14T00:00:00+00:00",
+        "assets": [{"id": f"a{item_id}", "url": f"https://cdn.example.com/{item_id}.jpg"}],
+    }
+
+
+def _bounded_run(st_client, image_client, records, store, *, budget: float) -> tuple:
+    """One bounded pass over ``records`` against the ledger persisted in ``store``.
+
+    Returns ``(summary, uploaded_item_ids)``. The ledger is re-read from the
+    store each time and flushed at the end, exactly as a fresh process would —
+    that is the part run 35130164187 never reached.
+    """
+    ledger = ImageLedger(store)
+    uploads = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+    before = len(uploads.calls)
+    with patch("st_exporter.images.upload.monotonic", _FakeClock()):
+        summary = upload_pricebook_images(
+            st_client, image_client, ledger, records, now=NOW, deadline=budget
+        )
+    ledger.flush()
+    sent = [call.request.url.params["external_item_id"] for call in list(uploads.calls)[before:]]
+    return summary, sent
+
+
+class TestTheDeadlineStopsItCleanly:
+    @respx.mock
+    def test_a_spent_budget_stops_the_pass_and_says_so(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """`stopped` is set, and set BEFORE the process would have been killed.
+
+        That is the whole difference: a pass that stops itself returns a summary
+        and flushes a ledger, while a SIGKILLed one writes nothing at all and
+        every upload it managed is re-sent by the next run, for ever.
+        """
+        mock_auth_token(st_settings.auth_url)
+        for item_id in range(1, 7):
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=PNG)
+            )
+        records = [_item(i) for i in range(1, 7)]
+
+        summary, sent = _bounded_run(
+            st_client, image_client, records, InMemorySheetsStore(), budget=3
+        )
+
+        assert summary.stopped == BUDGET_SPENT
+        # Three assets started, three never reached — and the pass knows which.
+        assert len(sent) == 3
+        assert summary.pending == 3
+        assert summary.considered == 3
+
+    @respx.mock
+    def test_no_budget_at_all_never_stops_early(self, st_settings, st_client, image_client) -> None:
+        """A local run, and every existing test, passes no deadline. That must
+        stay a pass that runs to the end of the catalogue."""
+        mock_auth_token(st_settings.auth_url)
+        for item_id in range(1, 6):
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=PNG)
+            )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run(st_client, image_client, [_item(i) for i in range(1, 6)])
+
+        assert summary.stopped is None
+        assert (summary.uploaded, summary.pending) == (5, 0)
+
+    @respx.mock
+    def test_the_ledger_survives_a_stopped_pass(self, st_settings, st_client, image_client) -> None:
+        """The point of stopping cleanly, stated as an assertion: what the pass
+        DID upload before it ran out of budget is still on disk afterwards."""
+        mock_auth_token(st_settings.auth_url)
+        for item_id in range(1, 7):
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=PNG)
+            )
+        store = InMemorySheetsStore()
+
+        _bounded_run(st_client, image_client, [_item(i) for i in range(1, 7)], store, budget=3)
+
+        rows = store.tabs["_image_ledger"][1:]
+        assert len(rows) == 3, "a stopped pass must still record what it delivered"
+
+
+class TestASecondRunResumesRatherThanRestarting:
+    @respx.mock
+    def test_two_bounded_runs_sweep_a_catalogue_one_run_cannot(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """THE EVIDENCE. Six assets, a budget that fits three, run twice.
+
+        Run 2 must upload the three run 1 never reached — not the three it
+        already did. The old pass re-tread the same prefix every time, which is
+        why a 7,191-asset tenant uploaded zero images on every run for ever
+        rather than converging over a few hours.
+        """
+        mock_auth_token(st_settings.auth_url)
+        downloads = {
+            item_id: respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=PNG)
+            )
+            for item_id in range(1, 7)
+        }
+        records = [_item(i) for i in range(1, 7)]
+        store = InMemorySheetsStore()
+
+        first, sent_first = _bounded_run(st_client, image_client, records, store, budget=3)
+        downloaded_in_run_one = {i for i, route in downloads.items() if route.calls}
+
+        second, sent_second = _bounded_run(st_client, image_client, records, store, budget=3)
+
+        assert first.stopped == BUDGET_SPENT
+        assert sorted(sent_first) == sorted(str(i) for i in downloaded_in_run_one)
+        # Run 2 starts where run 1 stopped: disjoint from it, and between them
+        # the two runs cover the whole catalogue.
+        assert not set(sent_first) & set(sent_second), (
+            f"run 2 re-trod run 1's prefix: {sent_first} then {sent_second}"
+        )
+        assert sorted(sent_first + sent_second) == sorted(str(i) for i in range(1, 7))
+        # Run 2 spends its own three-asset budget on the three run 1 missed, so
+        # it too reports `pending` — the three it already delivered. That is a
+        # sweep converging, not a failure, and the run after it proves it: full
+        # coverage, nothing left to visit, and nothing to upload.
+        assert second.stopped == BUDGET_SPENT and second.pending == 3
+        third, sent_third = _bounded_run(st_client, image_client, records, store, budget=100)
+        assert (sent_third, third.pending, third.stopped) == ([], 0, None)
+
+    @respx.mock
+    def test_a_third_run_over_a_converged_catalogue_downloads_nothing(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """Once swept, a pass costs no bytes at all.
+
+        This is the pre-download half of the ledger check. The idempotency key
+        hashes the PAYLOAD, so `ledger.has(key)` cannot be asked until the bytes
+        are in hand — which is what used to force a re-download of all ~7,191
+        assets on every run just to rediscover they had already been sent. The
+        item's `modifiedOn` is the cheap validator that answers it earlier.
+        """
+        mock_auth_token(st_settings.auth_url)
+        downloads = {
+            item_id: respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=PNG)
+            )
+            for item_id in range(1, 7)
+        }
+        records = [_item(i) for i in range(1, 7)]
+        store = InMemorySheetsStore()
+
+        _bounded_run(st_client, image_client, records, store, budget=3)
+        _bounded_run(st_client, image_client, records, store, budget=3)
+        before = {i: len(route.calls) for i, route in downloads.items()}
+
+        third, sent = _bounded_run(st_client, image_client, records, store, budget=100)
+
+        assert sent == [], "a converged catalogue must upload nothing"
+        assert {i: len(route.calls) for i, route in downloads.items()} == before, (
+            "a converged catalogue must DOWNLOAD nothing either — that is the "
+            "root inefficiency this check exists to remove"
+        )
+        assert third.revalidated == 6
+        assert third.stopped is None and third.pending == 0
+
+    @respx.mock
+    def test_a_modified_item_is_downloaded_again(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """The skip fails CLOSED. An item ServiceTitan says changed after our
+        last confirmation is re-downloaded, so replaced bytes still reach
+        TrueQuote."""
+        mock_auth_token(st_settings.auth_url)
+        route = respx.get("https://cdn.example.com/1.jpg").mock(
+            return_value=httpx.Response(200, content=PNG)
+        )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        store = InMemorySheetsStore()
+
+        _bounded_run(st_client, image_client, [_item(1)], store, budget=100)
+        moved = _item(1) | {"modifiedOn": "2099-01-01T00:00:00+00:00"}
+        summary, _ = _bounded_run(st_client, image_client, [moved], store, budget=100)
+
+        assert len(route.calls) == 2, "a changed item must be re-read, not assumed"
+        assert summary.revalidated == 0
+
+    @respx.mock
+    def test_an_item_with_no_modified_on_is_never_assumed_fresh(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """Blank means "cannot prove freshness", never "fresh"."""
+        mock_auth_token(st_settings.auth_url)
+        route = respx.get("https://cdn.example.com/1.jpg").mock(
+            return_value=httpx.Response(200, content=PNG)
+        )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        store = InMemorySheetsStore()
+        undated = {"id": 1, "assets": [{"id": "a1", "url": "https://cdn.example.com/1.jpg"}]}
+
+        _bounded_run(st_client, image_client, [undated], store, budget=100)
+        summary, _ = _bounded_run(st_client, image_client, [undated], store, budget=100)
+
+        assert len(route.calls) == 2
+        assert summary.revalidated == 0
+        assert summary.already_uploaded == 1, "still deduped, just not for free"
+
+    @respx.mock
+    def test_a_cheaply_skipped_asset_is_not_pruned_out_of_the_ledger(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """The trap under the pre-download skip.
+
+        `ImageLedger.keep` prunes every key this run did not SEE, and a skipped
+        asset computes no content hash — so without deliberately re-contributing
+        its known keys, a converged catalogue would prune itself empty and
+        re-upload everything on the run after that.
+        """
+        mock_auth_token(st_settings.auth_url)
+        respx.get("https://cdn.example.com/1.jpg").mock(
+            return_value=httpx.Response(200, content=PNG)
+        )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        store = InMemorySheetsStore()
+
+        _bounded_run(st_client, image_client, [_item(1)], store, budget=100)
+        summary, _ = _bounded_run(st_client, image_client, [_item(1)], store, budget=100)
+
+        ledger = ImageLedger(store)
+        ledger.keep(summary.seen_keys)
+        ledger.flush()
+        assert len(store.tabs["_image_ledger"][1:]) == 1, (
+            "the prune forgot an asset the pass deliberately did not download"
+        )

@@ -11,16 +11,26 @@ Sheet the exporter's own service account owns, never the shared Export Store. A
 lost or corrupted ledger costs bandwidth on the next run and nothing else —
 re-POSTing is safe by construction (see ``client.py``), so this file must never
 be the reason a run fails.
+
+``verified_at`` is also what ORDERS the next pass. A run works through the
+catalogue oldest-verification-first, so an asset this ledger has never heard of
+is attempted before one it confirmed an hour ago. That is what lets a pass with
+a time budget sweep a 7,000-image catalogue over several runs instead of
+re-treading the same prefix until the runner kills it — see ``upload.py``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from st_exporter.sheets import SheetsPort
 
 _TAB_NAME = "_image_ledger"
-_COLUMNS = ("idempotency_key", "asset_ref", "storage_path", "uploaded_at")
+# `verified_at` occupies the column an older exporter wrote `uploaded_at` into,
+# positionally identical, so an existing ledger loads unchanged. The name is the
+# honest one: the value is refreshed every time a later run confirms the same
+# bytes are still delivered, not only when bytes are sent.
+_COLUMNS = ("idempotency_key", "asset_ref", "storage_path", "verified_at")
 
 
 @dataclass(frozen=True)
@@ -28,7 +38,7 @@ class ImageLedgerEntry:
     idempotency_key: str
     asset_ref: str
     storage_path: str
-    uploaded_at: str
+    verified_at: str
 
 
 class ImageLedger:
@@ -45,6 +55,16 @@ class ImageLedger:
     def __init__(self, store: SheetsPort) -> None:
         self._store = store
         self._entries: dict[str, ImageLedgerEntry] = {}
+        # asset_ref -> the latest `verified_at` any of its keys carries. Kept
+        # beside `_entries` rather than derived on demand because the pass reads
+        # it once per asset while ordering the catalogue.
+        self._by_ref: dict[str, str] = {}
+        # asset_ref -> every key recorded for it. An asset the pass skips
+        # WITHOUT downloading has no content hash, so it cannot contribute its
+        # key to ``seen_keys`` by the usual door — and a key missing from
+        # ``seen_keys`` is exactly what ``keep`` prunes. This is how a cheap skip
+        # says "this asset is still in the catalogue" without opening it.
+        self._keys_by_ref: dict[str, set[str]] = {}
         self._loaded = False
 
     def _ensure_loaded(self) -> None:
@@ -54,17 +74,61 @@ class ImageLedger:
         for row in grid[1:]:  # skip header
             if len(row) < len(_COLUMNS):
                 continue  # malformed row; never crash a run over ledger corruption
-            entry = ImageLedgerEntry(*row[: len(_COLUMNS)])
-            self._entries[entry.idempotency_key] = entry
+            self._remember(ImageLedgerEntry(*row[: len(_COLUMNS)]))
         self._loaded = True
+
+    def _remember(self, entry: ImageLedgerEntry) -> None:
+        self._entries[entry.idempotency_key] = entry
+        previous = self._by_ref.get(entry.asset_ref, "")
+        self._by_ref[entry.asset_ref] = max(previous, entry.verified_at)
+        self._keys_by_ref.setdefault(entry.asset_ref, set()).add(entry.idempotency_key)
 
     def has(self, idempotency_key: str) -> bool:
         self._ensure_loaded()
         return idempotency_key in self._entries
 
+    def last_verified(self, asset_ref: str) -> str | None:
+        """When this asset was last confirmed delivered, or None if never.
+
+        One asset can hold several keys — the key carries a content hash, so a
+        replaced image leaves its predecessor behind until ``keep`` prunes it.
+        The latest of them is the answer to "when did we last look at this",
+        which is what the pass orders by and what lets it skip a re-download.
+
+        ISO-8601 UTC strings throughout, so a lexical ``max`` is a chronological
+        one. Every writer is ``run_at``/``now`` from ``run.py``, which is
+        ``datetime.now(timezone.utc).isoformat()``.
+        """
+        self._ensure_loaded()
+        return self._by_ref.get(asset_ref)
+
+    def keys_for(self, asset_ref: str) -> set[str]:
+        """Every key this ledger holds for one asset.
+
+        Handed straight to ``seen_keys`` by a pass that skipped the asset
+        without downloading it: the asset is demonstrably still in the
+        catalogue, so its entries must survive the prune even though no content
+        hash was computed this run.
+        """
+        self._ensure_loaded()
+        return set(self._keys_by_ref.get(asset_ref, ()))
+
     def record(self, entry: ImageLedgerEntry) -> None:
         self._ensure_loaded()
-        self._entries[entry.idempotency_key] = entry
+        self._remember(entry)
+
+    def verify(self, idempotency_key: str, now: str) -> None:
+        """Note that these exact bytes were re-checked and are still delivered.
+
+        Without this an already-uploaded asset would keep its original timestamp
+        for ever, sort to the front of every later pass, and be re-examined on
+        every run while the assets behind it were never reached.
+        """
+        self._ensure_loaded()
+        entry = self._entries.get(idempotency_key)
+        if entry is None:
+            return
+        self._remember(replace(entry, verified_at=now))
 
     def keep(self, idempotency_keys: set[str]) -> None:
         """Drop entries for assets this run no longer sees.
@@ -75,7 +139,12 @@ class ImageLedger:
         "gone", not "not looked at".
         """
         self._ensure_loaded()
-        self._entries = {k: v for k, v in self._entries.items() if k in idempotency_keys}
+        kept = {k: v for k, v in self._entries.items() if k in idempotency_keys}
+        self._entries = {}
+        self._by_ref = {}
+        self._keys_by_ref = {}
+        for entry in kept.values():
+            self._remember(entry)
 
     def flush(self) -> None:
         """Write the full ledger back in one call. No-op if nothing was loaded."""
@@ -83,7 +152,7 @@ class ImageLedger:
             return
         grid: list[list[str]] = [list(_COLUMNS)]
         grid.extend(
-            [e.idempotency_key, e.asset_ref, e.storage_path, e.uploaded_at]
+            [e.idempotency_key, e.asset_ref, e.storage_path, e.verified_at]
             for e in self._entries.values()
         )
         self._store.replace_grid(_TAB_NAME, grid)

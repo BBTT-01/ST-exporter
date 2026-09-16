@@ -54,25 +54,32 @@ def test_every_lane_secret_is_optional(workflow_text: str) -> None:
             assert "required: false" in secrets_block[index : index + 200], stripped
 
 
-def test_the_feeds_validator_accepts_the_outbox_feed(workflow_text: str) -> None:
-    """The workflow validates `feeds` before `st-export` does. If it rejected
-    `outbox`, the one job allowed to drain would fail before Python ran."""
-    assert "jobs|technicians|pricebook|financial|outbox)" in workflow_text
+def test_the_feeds_validator_accepts_every_feed_the_exporter_does(workflow_text: str) -> None:
+    """The workflow validates `feeds` before `st-export` does. If it rejected a
+    feed, the job asking for it would fail before Python ran — that is how the
+    one job allowed to drain, or the one allowed to upload images, stops."""
+    assert "jobs|technicians|pricebook|financial|images|outbox)" in workflow_text
 
 
-def test_the_drain_and_the_export_feeds_take_different_locks(workflow_text: str) -> None:
-    """Two locks, split by what a run WRITES.
+def test_the_meta_free_feeds_take_their_own_locks(workflow_text: str) -> None:
+    """Three locks, split by what a run WRITES.
 
     A drain-only run never reads or writes `_meta` (`cli.py` does not call
     `run_export` at all for it), so it is safe beside an export — and it has to
-    be, or the 5-minute drain queues behind the hourly pricebook run. Anything
-    else falls back to the shared export lock, which is the safe side.
+    be, or the 5-minute drain queues behind the hourly pricebook run. An
+    images-only run passes the same test for the same reason: `run_images` never
+    opens the Export Store, and the only tab it rewrites is `_image_ledger` on
+    the private raw-cache Sheet. Anything else falls back to the shared export
+    lock, which is the safe side.
     """
     assert (
         "group: st-export-${{ github.repository }}-"
-        "${{ inputs.feeds == 'outbox' && 'outbox' || 'export' }}" in workflow_text
+        "${{ (inputs.feeds == 'outbox' && 'outbox') || "
+        "(inputs.feeds == 'images' && 'images') || 'export' }}" in workflow_text
     )
     # Never cancel a run mid-drain: that is the crash the ledger recovers from.
+    # Same for an image pass: a cancelled one loses the ledger it was about to
+    # flush, which is the whole failure this split exists to end.
     assert "cancel-in-progress: false" in workflow_text
 
 
@@ -127,6 +134,10 @@ FEED_VARIABLES = ("JOBS_FEED", "TECHNICIANS_FEED", "PRICEBOOK_FEED", "FINANCIAL_
 
 FEED_JOBS = ("jobs-feed", "technicians-feed", "pricebook-feed", "financial-feed")
 DRAIN_JOB = "outbox-drain"
+# Not in FEED_JOBS: like the drain, it writes no tab and no `_meta` row. It is
+# the job that POSTs pricebook image BYTES to TrueQuote, and it is the only job
+# in the file that may hold TRUEQUOTE_IMAGE_TOKEN.
+IMAGES_JOB = "images-feed"
 
 
 @pytest.fixture(scope="module")
@@ -230,13 +241,22 @@ def test_no_job_condition_reads_any_repository_variable(caller: dict[Any, Any]) 
 
 
 def test_pricebook_category_ids_survives_because_it_is_not_a_gate(caller: dict[Any, Any]) -> None:
-    """The one surviving `vars` reference. It narrows WHAT the pricebook feed
-    exports; it never decides WHETHER the feed runs, so it lives in `with:` and
-    a blank value exports the whole catalogue."""
+    """The one surviving `vars` NAME. It narrows WHAT the pricebook feed exports
+    and which items the image pass uploads for; it never decides WHETHER either
+    runs, so it lives in `with:` and a blank value means the whole catalogue.
+
+    Two references now, one per job, and they must agree: an image pass scoped
+    to different categories than the tab it illustrates would upload pictures
+    for items the Sheet does not carry.
+    """
     text = CALLER.read_text()
-    assert text.count("vars.") == 1, "the only repository variable left is PRICEBOOK_CATEGORY_IDS"
-    assert "pricebook_category_ids: ${{ vars.PRICEBOOK_CATEGORY_IDS }}" in text
-    assert "PRICEBOOK_CATEGORY_IDS" not in caller["jobs"]["pricebook-feed"]["if"]
+    assert text.count("vars.") == 2, "the only repository variable left is PRICEBOOK_CATEGORY_IDS"
+    assert text.count("pricebook_category_ids: ${{ vars.PRICEBOOK_CATEGORY_IDS }}") == 2
+    for name in ("pricebook-feed", IMAGES_JOB):
+        assert "PRICEBOOK_CATEGORY_IDS" not in caller["jobs"][name]["if"]
+        assert caller["jobs"][name]["with"]["pricebook_category_ids"] == (
+            "${{ vars.PRICEBOOK_CATEGORY_IDS }}"
+        )
 
 
 def test_the_drain_runs_exactly_once_per_cycle(caller: dict[Any, Any]) -> None:
@@ -272,7 +292,7 @@ def test_no_feed_job_is_given_a_product_machine_token(caller: dict[Any, Any]) ->
     `image_upload`-scoped TRUEQUOTE_IMAGE_TOKEN. That pair uploads image bytes
     and cannot form a drain lane.
     """
-    for name in FEED_JOBS:
+    for name in (*FEED_JOBS, IMAGES_JOB):
         held = set(caller["jobs"][name].get("secrets", {}))
         assert not {secret for secret in held if secret.endswith("_MACHINE_TOKEN")}, name
 
@@ -370,19 +390,21 @@ def test_the_caller_header_table_states_the_cadence_each_job_actually_runs_on(
     six-hourly. A wrong table is how a contractor concludes a feed is broken."""
     header = CALLER.read_text().split("jobs:", 1)[0]
     stated = dict(re.findall(r"^#   ([a-z-]+-(?:feed|drain)) +(\S+(?: \S+)?) ", header, re.M))
-    assert set(stated) == set(FEED_JOBS) | {DRAIN_JOB}, stated
+    assert set(stated) == set(FEED_JOBS) | {DRAIN_JOB, IMAGES_JOB}, stated
     expected_minutes = {
         "jobs-feed": "*/5",
         "technicians-feed": "*/30",
         "pricebook-feed": "hourly",
         "financial-feed": "*/6 hours",
+        IMAGES_JOB: "*/2 hours",
         DRAIN_JOB: "*/5",
     }
     assert stated == expected_minutes, (
         f"THE HEADER TABLE IS STALE — it says {stated}, the crons say {expected_minutes}."
     )
-    # And the claim about `financial-feed` is grounded in the cron, not in this table.
+    # And the claims are grounded in the crons, not in this table.
     assert _evaluate(caller["jobs"]["financial-feed"]["if"], schedule="37 */6 * * *")
+    assert _evaluate(caller["jobs"][IMAGES_JOB]["if"], schedule="22 */2 * * *")
 
 
 # ---------------------------------------------------------------------------
@@ -967,3 +989,85 @@ def test_the_drift_warning_never_fails_a_build() -> None:
     assert step["continue-on-error"] is True
     assert step["run"].rstrip().endswith("exit 0")
     assert "::warning" in step["run"] and "::error" not in step["run"]
+
+
+# ---------------------------------------------------------------------------
+# The `images` feed — its own job, its own lock, its own timeout, and the only
+# job in the file holding TRUEQUOTE_IMAGE_TOKEN.
+#
+# It used to be a flag on `pricebook-feed`. Run 35130164187 on
+# `BBTT-01/tr-doorservpro` was SIGKILLed at 10m35s having uploaded 0 of ~7,191
+# images, and took the hourly pricebook export down with it every hour. Each
+# assertion below is one of the three things that had to be true for that to
+# stop happening.
+# ---------------------------------------------------------------------------
+
+
+def test_the_image_pass_is_a_job_of_its_own(caller: dict[Any, Any]) -> None:
+    """`feeds: "images"` exactly, and it runs on its own schedule.
+
+    Anything else in its `feeds:` puts it back on the shared export lock (see
+    the reusable workflow's concurrency group) and makes it write `_meta`.
+    """
+    assert caller["jobs"][IMAGES_JOB]["with"]["feeds"] == "images"
+    assert IMAGES_JOB in _jobs_ever_run(caller)
+
+
+def test_no_other_job_asks_for_the_images_feed(caller: dict[Any, Any]) -> None:
+    """Two image passes would re-tread the same catalogue against one ledger and
+    halve the forward progress each run makes."""
+    uploading = [name for name, job in caller["jobs"].items() if "images" in job["with"]["feeds"]]
+    assert uploading == [IMAGES_JOB]
+
+
+def test_only_the_images_job_is_given_the_image_token(caller: dict[Any, Any]) -> None:
+    """The token moved off `pricebook-feed`, and it must not come back.
+
+    A copy left there is not merely redundant: it is what used to make the
+    pricebook feed download thousands of images inside its own ten-minute job,
+    which is the failure this split exists to end.
+    """
+    holding = [
+        name
+        for name, job in caller["jobs"].items()
+        if "TRUEQUOTE_IMAGE_TOKEN" in (job.get("secrets") or {})
+    ]
+    assert holding == [IMAGES_JOB]
+
+
+def test_the_images_job_raises_its_own_timeout_and_nothing_else_does(
+    caller: dict[Any, Any],
+) -> None:
+    """One job passes `job_timeout_minutes`, and it is this one.
+
+    Every other job leaves it unset and therefore keeps the reusable workflow's
+    default of 10 — which is the whole point of giving the input a default
+    rather than making every caller state a number.
+    """
+    passing = {
+        name: job["with"]["job_timeout_minutes"]
+        for name, job in caller["jobs"].items()
+        if "job_timeout_minutes" in (job.get("with") or {})
+    }
+    assert set(passing) == {IMAGES_JOB}
+    assert passing[IMAGES_JOB] > 10
+
+
+def test_the_reusable_workflow_defaults_the_timeout_to_ten(workflow_text: str) -> None:
+    """The default is what keeps every EXISTING caller and every other feed on
+    exactly the behaviour they had before this input existed."""
+    inputs: Any = yaml.safe_load(workflow_text)
+    declared = inputs.get("on", inputs.get(True))["workflow_call"]["inputs"]
+    assert declared["job_timeout_minutes"]["default"] == 10
+    assert "timeout-minutes: ${{ inputs.job_timeout_minutes }}" in workflow_text
+
+
+def test_the_exporter_is_told_the_runner_deadline(workflow_text: str) -> None:
+    """Forwarding it is not optional and its absence is SILENT.
+
+    Without `EXPORTER_JOB_TIMEOUT_MINUTES` the exporter assumes the default ten
+    minutes, so a job given thirty would be killed by the runner at thirty
+    having stopped uploading at eight — or, worse, a job given ten would be
+    killed at ten with an unflushed ledger, which is the original bug exactly.
+    """
+    assert "EXPORTER_JOB_TIMEOUT_MINUTES: ${{ inputs.job_timeout_minutes }}" in workflow_text

@@ -70,6 +70,27 @@ on:
           request), so leave it blank unless a tenant really needs it.
         type: string
         default: ""
+      job_timeout_minutes:
+        description: >-
+          How long this job may run before GitHub kills it. 10 — the old
+          hardcoded value — is still the default, so every existing caller and
+          every feed other than `images` is untouched.
+
+          Raise it ONLY for an `images` job whose tenant has a large image
+          catalogue. The exporter is handed this same number
+          (`EXPORTER_JOB_TIMEOUT_MINUTES`) and stops its image pass a couple of
+          minutes short of it, so the run ends with a WRITTEN image ledger
+          instead of a SIGKILL. It is one number rather than two on purpose: a
+          separate image budget could disagree with the job timeout, and the
+          direction it would eventually disagree in is the one that loses the
+          ledger.
+
+          The pass is resumable — it works oldest-verification-first, so each
+          run starts on the images the last one did not reach. A bigger number
+          means fewer runs to a first full sweep, not the difference between
+          working and not.
+        type: number
+        default: 10
     secrets:
       ST_CLIENT_ID:
         required: true
@@ -156,7 +177,21 @@ jobs:
     #               keeps the 5-minute drain off the back of an hourly
     #               pricebook run.
     #
-    # The comparison is against the exact string `outbox` and nothing fancier,
+    #   ...-images  a run that asks for `images` AND NOTHING ELSE. Same
+    #               reasoning, verified the same way: `cli.py` does not call
+    #               `run_export` for it either, `run_images` never opens the
+    #               Export Store at all, and the ONLY tab it read-modify-writes
+    #               is `_image_ledger` on the private raw-cache Sheet, which
+    #               nothing else reads or writes. `SheetsClient.replace_grid` is
+    #               scoped to one worksheet, so it cannot disturb the sibling
+    #               `_raw_*` tabs the jobs feed writes. No `_meta`, therefore its
+    #               own lock — and that is the whole point: a slow image pass can
+    #               no longer hold the export lock and delay the hourly pricebook
+    #               feed, which is what made one tenant's pricebook export red
+    #               every hour (run 35130164187, SIGKILL at 10m35s).
+    #
+    # The comparison is against the exact strings `outbox` and `images` and
+    # nothing fancier,
     # because the SAFE side of any ambiguity is the shared export lock. A run
     # asking for `jobs,outbox`, or for ` outbox ` with a stray space, writes
     # `_meta` (or might) and lands in `...-export` with everything else. Adding
@@ -173,9 +208,9 @@ jobs:
     # cancel-in-progress: false — killing a run mid-drain is exactly the
     # crash the ledger has to recover from; better to just queue.
     concurrency:
-      group: st-export-${{ github.repository }}-${{ inputs.feeds == 'outbox' && 'outbox' || 'export' }}
+      group: st-export-${{ github.repository }}-${{ (inputs.feeds == 'outbox' && 'outbox') || (inputs.feeds == 'images' && 'images') || 'export' }}
       cancel-in-progress: false
-    timeout-minutes: 10
+    timeout-minutes: ${{ inputs.job_timeout_minutes }}
     permissions:
       contents: read
     steps:
@@ -358,6 +393,10 @@ jobs:
           EXPORTER_FINANCIAL_MAX_JOBS: ${{ inputs.financial_max_jobs }}
           EXPORTER_CONTACTS_ROUTE: ${{ inputs.contacts_route }}
           EXPORTER_CONTACTS_MAX_CUSTOMERS: ${{ inputs.contacts_max_customers }}
+          # The exporter is told the runner's own deadline so the image pass can
+          # stop short of it. Forgetting to forward it does not fail anything —
+          # it silently restores the SIGKILL, so `test_workflow.py` asserts it.
+          EXPORTER_JOB_TIMEOUT_MINUTES: ${{ inputs.job_timeout_minutes }}
           FEEDS: ${{ inputs.feeds }}
         run: |
           # Per-segment check rather than an enumeration of every combination —
@@ -366,7 +405,7 @@ jobs:
           IFS=',' read -ra FEED_PARTS <<< "$FEEDS"
           for feed in "${FEED_PARTS[@]}"; do
             case "$(echo "$feed" | tr -d '[:space:]')" in
-              jobs|technicians|pricebook|financial|outbox) ;;
+              jobs|technicians|pricebook|financial|images|outbox) ;;
               *) echo "::error::invalid feeds input: $FEEDS" >&2; exit 1 ;;
             esac
           done
