@@ -16,6 +16,7 @@ import respx
 from st_cli.exceptions import RateLimitError
 from st_exporter.feeds.reporting import (
     JOB_COSTING_SUMMARY_REPORT_NAME,
+    JOB_COSTING_SUMMARY_REPORT_NAMES,
     JobCostingReportAmbiguousError,
     JobCostingReportNotFoundError,
     ReportColumnsMismatchError,
@@ -445,3 +446,217 @@ class TestNotFoundDiagnostics:
         # ...and still carries the census.
         assert "1 category" in message
         assert "2 reports" in message
+
+
+class TestTheAcceptedNameSet:
+    """ServiceTitan spells this report's name differently between tenants.
+
+    Live run 35135903923 on `tr-doorservpro` (exporter 0.2.13) enumerated 12
+    categories and 265 reports and found no "Job Costing Summary" at all — but
+    the diagnostics' near-miss list carried "Job Costing Summary Report" twice,
+    plus a "Project Costing Summary Report" that is a DIFFERENT report.
+
+    So the feed accepts a short ordered list of exact names. These pin that the
+    list widens *which exact strings count* and nothing else: no substring, no
+    fuzziness, no second-choice name creeping past a first-choice one.
+    """
+
+    def test_the_documented_short_name_is_still_the_first_choice(self) -> None:
+        assert JOB_COSTING_SUMMARY_REPORT_NAMES[0] == JOB_COSTING_SUMMARY_REPORT_NAME
+        assert JOB_COSTING_SUMMARY_REPORT_NAMES == (
+            "Job Costing Summary",
+            "Job Costing Summary Report",
+        )
+
+    def test_the_short_name_still_matches_on_a_tenant_that_has_it(self) -> None:
+        client = _client([{"id": 7}], {"7": [{"id": 42, "name": "Job Costing Summary"}]})
+        assert find_job_costing_summary(client) == ReportRef("7", "42", "Job Costing Summary")
+
+    def test_the_longer_name_matches_on_a_tenant_that_has_only_that(self) -> None:
+        client = _client([{"id": 7}], {"7": [{"id": 42, "name": "Job Costing Summary Report"}]})
+        assert find_job_costing_summary(client) == ReportRef(
+            "7", "42", "Job Costing Summary Report"
+        )
+
+    def test_the_live_tenants_shape_selects_the_builtin_over_its_custom_namesake(self) -> None:
+        """Run 35135903923's shape: two "Job Costing Summary Report" entries.
+
+        The diagnostics' near-miss list is built from EVERY enumerated report —
+        `_Census.saw_report` runs before both the name check and `_looks_custom`
+        — so a duplicate in that list may be one built-in plus one contractor
+        copy. That is this case: `_looks_custom` drops the copy and the built-in
+        is selected unambiguously.
+        """
+        client = _client(
+            [{"id": 11, "name": "Accounting"}, {"id": 12, "name": "My Reports"}],
+            {
+                "11": [
+                    {"id": 501, "name": "Job Costing Summary Report"},
+                    {"id": 502, "name": "Project Costing Summary Report"},
+                ],
+                "12": [
+                    {"id": 900, "name": "Job Costing Summary Report", "isCustom": True},
+                ],
+            },
+        )
+        ref = find_job_costing_summary(client)
+        # Visible under `pytest -s`: the outcome for the live tenant's shape.
+        print(f"\n  run 35135903923 shape -> selected {ref}")
+        assert ref == ReportRef("11", "501", "Job Costing Summary Report")
+
+    def test_two_builtins_under_one_accepted_name_are_still_ambiguous(self) -> None:
+        # The other reading of that duplicate in the near-miss list. It must
+        # refuse, not pick: the two carry different numbers.
+        client = _client(
+            [{"id": 11}, {"id": 12}],
+            {
+                "11": [{"id": 501, "name": "Job Costing Summary Report"}],
+                "12": [{"id": 502, "name": "Job Costing Summary Report"}],
+            },
+        )
+        with pytest.raises(JobCostingReportAmbiguousError) as excinfo:
+            find_job_costing_summary(client)
+        message = str(excinfo.value)
+        assert "'Job Costing Summary Report'" in message
+        assert "category 11/report 501" in message and "category 12/report 502" in message
+
+    def test_two_customs_under_one_accepted_name_take_the_custom_path(self) -> None:
+        # The third reading: no built-in exists under that name either.
+        client = _client(
+            [{"id": 11}, {"id": 12}],
+            {
+                "11": [{"id": 501, "name": "Job Costing Summary Report", "isCustom": True}],
+                "12": [{"id": 502, "name": "Job Costing Summary Report", "userDefined": True}],
+            },
+        )
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+        assert "are custom reports, which are never used" in str(excinfo.value)
+
+    def test_project_costing_summary_report_is_never_selected(self) -> None:
+        """One token away from a name we accept, and a different report entirely.
+
+        If it ever matched, the tab would fill with project-level figures under
+        job-level headings — wrong money, reported as success.
+        """
+        client = _client(
+            [{"id": 11}],
+            {"11": [{"id": 777, "name": "Project Costing Summary Report"}]},
+        )
+        with pytest.raises(JobCostingReportNotFoundError):
+            find_job_costing_summary(client)
+
+    def test_project_costing_loses_even_sitting_beside_the_report_we_want(self) -> None:
+        client = _client(
+            [{"id": 11}],
+            {
+                "11": [
+                    {"id": 777, "name": "Project Costing Summary Report"},
+                    {"id": 501, "name": "Job Costing Summary Report"},
+                ]
+            },
+        )
+        assert find_job_costing_summary(client).report_id == "501"
+
+    def test_the_first_choice_name_wins_when_both_names_exist_as_builtins(self) -> None:
+        # Two DIFFERENT accepted names both matching is not ambiguity — it is
+        # resolved by the declared order, deterministically and testably.
+        client = _client(
+            [{"id": 11}, {"id": 12}],
+            {
+                "12": [{"id": 502, "name": "Job Costing Summary Report"}],
+                "11": [{"id": 501, "name": "Job Costing Summary"}],
+            },
+        )
+        assert find_job_costing_summary(client) == ReportRef("11", "501", "Job Costing Summary")
+
+    def test_a_second_choice_name_never_stands_in_for_a_first_choice_ambiguity(self) -> None:
+        """The dangerous fall-through, pinned shut.
+
+        If the first-choice name is ambiguous, moving on to the second-choice
+        name would turn a loud refusal into a confident wrong answer.
+        """
+        client = _client(
+            [{"id": 11}, {"id": 12}, {"id": 13}],
+            {
+                "11": [{"id": 501, "name": "Job Costing Summary"}],
+                "12": [{"id": 502, "name": "Job Costing Summary"}],
+                "13": [{"id": 503, "name": "Job Costing Summary Report"}],
+            },
+        )
+        with pytest.raises(JobCostingReportAmbiguousError) as excinfo:
+            find_job_costing_summary(client)
+        message = str(excinfo.value)
+        assert "'Job Costing Summary'" in message
+        # It refused on the FIRST name; the second name's report is not offered
+        # as the answer or blamed for the clash.
+        assert "report 503" not in message
+
+    def test_the_tenant_is_enumerated_only_once_for_the_whole_name_set(self) -> None:
+        # Reporting is throttled hard; two accepted names must not mean two
+        # full walks of every category.
+        client = _client([{"id": 11}], {"11": [{"id": 501, "name": "Job Costing Summary"}]})
+        find_job_costing_summary(client)
+        assert client.get.call_count == 2  # categories, then category 11's reports
+
+
+class TestTheDiagnosticsWithAPluralNameSet:
+    """The refusal message has to stay accurate now that several names count."""
+
+    def test_the_refusal_names_every_accepted_spelling(self) -> None:
+        client = _client([{"id": 7}], {"7": [{"id": 1, "name": "Invoice Aging"}]})
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+        message = str(excinfo.value)
+        assert "'Job Costing Summary' or 'Job Costing Summary Report'" in message
+        assert "1 category" in message and "1 report" in message
+        assert "permission is in place" in message
+
+    def test_the_live_tenants_near_miss_list_still_renders(self) -> None:
+        """The census sees every report, matched or not, custom or not.
+
+        Reproduces run 35135903923's census against a name set that deliberately
+        does NOT include what the tenant has, to prove the highlighting still
+        fires for each accepted spelling.
+        """
+        client = _client(
+            [{"id": 11}, {"id": 12}],
+            {
+                "11": [
+                    {"id": 501, "name": "Job Costing Summary Report", "isCustom": True},
+                    {"id": 502, "name": "Project Costing Summary Report", "isCustom": True},
+                ],
+                "12": [{"id": 900, "name": "Invoice Aging"}],
+            },
+        )
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+        message = str(excinfo.value)
+        similar, _, other = message.partition("Other report names seen")
+        assert "Job Costing Summary Report" in similar
+        assert "Project Costing Summary Report" in similar
+        assert "Invoice Aging" in other
+        # ...and the census counted the reports it never matched.
+        assert "2 categories" in message and "3 reports" in message
+
+    def test_a_near_miss_of_only_the_longer_name_is_highlighted_too(self) -> None:
+        client = _client(
+            [{"id": 7}],
+            {"7": [{"id": 1, "name": "Invoice Aging"}, {"id": 2, "name": "Costing Report"}]},
+        )
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+        similar, _, other = str(excinfo.value).partition("Other report names seen")
+        assert "Costing Report" in similar
+        assert "Invoice Aging" in other
+
+    def test_the_custom_only_refusal_also_names_every_accepted_spelling(self) -> None:
+        client = _client(
+            [{"id": 7}],
+            {"7": [{"id": 42, "name": "Job Costing Summary Report", "isCustom": True}]},
+        )
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+        message = str(excinfo.value)
+        assert "'Job Costing Summary' or 'Job Costing Summary Report'" in message
+        assert "are custom reports, which are never used" in message

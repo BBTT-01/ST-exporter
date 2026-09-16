@@ -16,7 +16,10 @@ code prefers a name match and then falls back to scoring every report; this modu
 deliberately has **no such fallback**:
 
 - exact name match after case-folding and whitespace collapsing — never
-  "contains", never fuzzy, never a best-of score;
+  "contains", never fuzzy, never a best-of score. ServiceTitan spells this
+  report's name differently between tenants, so a short ORDERED list of exact
+  names is accepted (see :data:`JOB_COSTING_SUMMARY_REPORT_NAMES`); each entry
+  is still matched exactly, and an earlier name always beats a later one;
 - a report carrying any marker that says it is user-defined is skipped even when
   the name matches, because a contractor can name their own report anything;
 - no match at all raises :class:`JobCostingReportNotFoundError`;
@@ -49,9 +52,33 @@ from st_cli.pagination import fetch_all
 
 MODULE = "reporting"
 
-#: The built-in report this feed replicates. Matched exactly (case-folded,
-#: whitespace-collapsed) — see the module docstring for why there is no fallback.
+#: The built-in report this feed replicates, in the spelling ServiceTitan's own
+#: documentation uses. Matched exactly (case-folded, whitespace-collapsed) — see
+#: the module docstring for why there is no fallback.
 JOB_COSTING_SUMMARY_REPORT_NAME = "Job Costing Summary"
+
+#: Every exact name this feed will accept for that report, **in priority order**.
+#:
+#: ServiceTitan ships the same built-in report under more than one name depending
+#: on the tenant: run 35135903923 on `tr-doorservpro` enumerated 12 categories and
+#: 265 reports and found no "Job Costing Summary" at all, but did carry
+#: "Job Costing Summary Report". Other tenants carry the shorter name, so both are
+#: accepted rather than swapping one hard-coded string for another.
+#:
+#: This is a list of ALTERNATIVE SPELLINGS, not a relaxation of the rule. Each
+#: entry is still matched exactly after :func:`_normalize`; the list only widens
+#: *which* exact strings count. Order is load-bearing and deterministic: a
+#: built-in match on an earlier name wins outright, and a later name is consulted
+#: only when the earlier one matched no built-in report at all. A later name can
+#: therefore never quietly stand in for an earlier one that was ambiguous.
+#:
+#: Do not add a name that another report could plausibly be. "Project Costing
+#: Summary Report" is a DIFFERENT ServiceTitan report — one token away from an
+#: accepted name and carrying different numbers — and must never appear here.
+JOB_COSTING_SUMMARY_REPORT_NAMES: tuple[str, ...] = (
+    JOB_COSTING_SUMMARY_REPORT_NAME,
+    "Job Costing Summary Report",
+)
 
 _CATEGORIES_RESOURCE = "report-categories"
 _PAGE_SIZE = 200
@@ -72,11 +99,19 @@ class ReportUnavailableError(STCLIError):
 
 
 class JobCostingReportNotFoundError(ReportUnavailableError):
-    """No report named exactly `Job Costing Summary` is visible to this tenant."""
+    """No report named exactly any of the accepted names is visible to this tenant.
+
+    See :data:`JOB_COSTING_SUMMARY_REPORT_NAMES` for the accepted spellings.
+    """
 
 
 class JobCostingReportAmbiguousError(ReportUnavailableError):
-    """More than one distinct report carries that exact name — refuse to choose."""
+    """More than one distinct report carries ONE accepted name — refuse to choose.
+
+    Raised for duplicates under a single name. It is not raised when two
+    *different* accepted names each match: that is resolved deterministically by
+    the order of :data:`JOB_COSTING_SUMMARY_REPORT_NAMES`.
+    """
 
 
 class ReportRateLimitedError(ReportUnavailableError):
@@ -113,10 +148,11 @@ class ReportRef:
 def find_job_costing_summary(client: ServiceTitanClient) -> ReportRef:
     """Locate the built-in Job Costing Summary report for this tenant, by name.
 
-    Raises :class:`JobCostingReportNotFoundError` or :class:`JobCostingReportAmbiguousError`
+    Tries each of :data:`JOB_COSTING_SUMMARY_REPORT_NAMES` in order. Raises
+    :class:`JobCostingReportNotFoundError` or :class:`JobCostingReportAmbiguousError`
     rather than returning a best guess. See the module docstring.
     """
-    return find_builtin_report(client, JOB_COSTING_SUMMARY_REPORT_NAME)
+    return find_builtin_report(client, JOB_COSTING_SUMMARY_REPORT_NAMES)
 
 
 #: Caps on the census quoted back in a refusal. A tenant can hold thousands of
@@ -181,8 +217,10 @@ class _Census:
     rule. Nothing here can cause a report to be selected.
     """
 
-    def __init__(self, wanted: str) -> None:
-        self._wanted_tokens = wanted.split()
+    def __init__(self, wanted: Sequence[str]) -> None:
+        # One token list per accepted name; a report is a near miss if it is a
+        # near miss for ANY of them. Highlighting only — see the class docstring.
+        self._wanted_tokens = [name.split() for name in wanted if name.split()]
         self.categories = 0
         self.reports = 0
         self._near_misses: list[str] = []
@@ -205,10 +243,12 @@ class _Census:
         if not self._wanted_tokens or not normalized:
             return False
         seen = normalized.split()
-        hits = sum(
-            1 for wanted in self._wanted_tokens if any(_tokens_akin(wanted, s) for s in seen)
-        )
-        return hits >= min(2, len(self._wanted_tokens))
+        return any(self._is_near_miss_of(tokens, seen) for tokens in self._wanted_tokens)
+
+    @staticmethod
+    def _is_near_miss_of(wanted_tokens: list[str], seen: list[str]) -> bool:
+        hits = sum(1 for wanted in wanted_tokens if any(_tokens_akin(wanted, s) for s in seen))
+        return hits >= min(2, len(wanted_tokens))
 
     def diagnosis(self) -> str:
         """The evidence sentence(s) appended to a not-found refusal."""
@@ -253,10 +293,38 @@ class _Census:
         )
 
 
-def find_builtin_report(client: ServiceTitanClient, report_name: str) -> ReportRef:
-    """The one built-in report with exactly ``report_name``, or refuse."""
-    wanted = _normalize(report_name)
-    matches: dict[tuple[str, str], ReportRef] = {}
+def _quote_names(names: Sequence[str]) -> str:
+    """``'A'`` / ``'A' or 'B'`` / ``'A', 'B' or 'C'`` — for refusal messages."""
+    if not names:
+        return "(no names)"
+    if len(names) == 1:
+        return repr(names[0])
+    return ", ".join(repr(n) for n in names[:-1]) + f" or {names[-1]!r}"
+
+
+def find_builtin_report(
+    client: ServiceTitanClient,
+    report_names: str | Sequence[str],
+) -> ReportRef:
+    """The one built-in report carrying one of ``report_names`` exactly, or refuse.
+
+    ``report_names`` is a single name or an ORDERED sequence of alternative exact
+    names (ServiceTitan spells some built-in reports differently per tenant). The
+    tenant is enumerated **once**; the names are then resolved in the order given:
+
+    * the first name with at least one built-in match decides the outcome, and
+    * if that name has more than one distinct built-in match, this raises
+      :class:`JobCostingReportAmbiguousError` — it does NOT move on to the next
+      name. A later name silently standing in for an earlier ambiguous one is
+      exactly the "picked the wrong report" failure the refusal exists to stop.
+
+    A later name is therefore only ever reached when every earlier name matched
+    no built-in report at all.
+    """
+    accepted = (report_names,) if isinstance(report_names, str) else tuple(report_names)
+    wanted = [_normalize(name) for name in accepted]
+    #: index into `accepted` -> the distinct built-ins found under that name
+    matches_by_name: list[dict[tuple[str, str], ReportRef]] = [{} for _ in accepted]
     skipped_custom = 0
     census = _Census(wanted)
 
@@ -267,7 +335,10 @@ def find_builtin_report(client: ServiceTitanClient, report_name: str) -> ReportR
         census.saw_category()
         for report in _iter_reports(client, str(category_id)):
             census.saw_report(report.get("name"))
-            if _normalize(report.get("name")) != wanted:
+            normalized = _normalize(report.get("name"))
+            try:
+                index = wanted.index(normalized)
+            except ValueError:
                 continue
             if _looks_custom(report):
                 # A contractor can name their own report anything, including this.
@@ -277,29 +348,33 @@ def find_builtin_report(client: ServiceTitanClient, report_name: str) -> ReportR
             if report_id is None:
                 continue
             ref = ReportRef(str(category_id), str(report_id), str(report.get("name")))
-            matches[(ref.category_id, ref.report_id)] = ref
+            matches_by_name[index][(ref.category_id, ref.report_id)] = ref
 
-    if not matches:
-        detail = (
-            f"no built-in report named {report_name!r} is visible to this tenant"
-            if not skipped_custom
-            else (
-                f"the only report(s) named {report_name!r} visible to this tenant "
-                f"({skipped_custom}) are custom reports, which are never used — "
-                "a contractor-authored report would produce wrong cost numbers silently"
+    for name, matches in zip(accepted, matches_by_name):
+        if not matches:
+            continue
+        if len(matches) > 1:
+            located = ", ".join(
+                f"category {c}/report {r} ({matches[(c, r)].name!r})" for c, r in sorted(matches)
             )
+            raise JobCostingReportAmbiguousError(
+                f"{len(matches)} distinct reports are named {name!r} ({located}). "
+                "Refusing to choose between them — picking the wrong one would produce "
+                "wrong cost numbers with no error."
+            )
+        return next(iter(matches.values()))
+
+    quoted = _quote_names(accepted)
+    detail = (
+        f"no built-in report named {quoted} is visible to this tenant"
+        if not skipped_custom
+        else (
+            f"the only report(s) named {quoted} visible to this tenant "
+            f"({skipped_custom}) are custom reports, which are never used — "
+            "a contractor-authored report would produce wrong cost numbers silently"
         )
-        raise JobCostingReportNotFoundError(f"{detail}. {census.diagnosis()}")
-    if len(matches) > 1:
-        located = ", ".join(
-            f"category {c}/report {r} ({matches[(c, r)].name!r})" for c, r in sorted(matches)
-        )
-        raise JobCostingReportAmbiguousError(
-            f"{len(matches)} distinct reports are named {report_name!r} ({located}). "
-            "Refusing to choose between them — picking the wrong one would produce "
-            "wrong cost numbers with no error."
-        )
-    return next(iter(matches.values()))
+    )
+    raise JobCostingReportNotFoundError(f"{detail}. {census.diagnosis()}")
 
 
 def field_names(metadata: dict[str, Any]) -> list[str]:
