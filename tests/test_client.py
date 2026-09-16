@@ -501,9 +501,7 @@ class TestALongWaitSaysSoBeforeItStarts:
         assert "not a hang" in caplog.text.lower()
 
     @respx.mock
-    def test_the_ordinary_one_second_backoff_stays_quiet(
-        self, client, monkeypatch, caplog
-    ) -> None:
+    def test_the_ordinary_one_second_backoff_stays_quiet(self, client, monkeypatch, caplog) -> None:
         """The blind curve is the ordinary noise of a busy endpoint. The pricebook
         image pass alone can earn hundreds of those across its workers, and
         narrating every one would bury the run log the line exists to make
@@ -535,8 +533,12 @@ class TestALongWaitSaysSoBeforeItStarts:
         )
         respx.get("https://blob.example.com/i.jpg").mock(
             side_effect=[
-                httpx.Response(429, json={"title": "Rate limit is exceeded. Try again in 30 seconds."}),
-                httpx.Response(200, content=b"\x89PNG\r\n\x1a\n", headers={"Content-Type": "image/png"}),
+                httpx.Response(
+                    429, json={"title": "Rate limit is exceeded. Try again in 30 seconds."}
+                ),
+                httpx.Response(
+                    200, content=b"\x89PNG\r\n\x1a\n", headers={"Content-Type": "image/png"}
+                ),
             ]
         )
         with caplog.at_level(logging.INFO, logger="st_cli.client"):
