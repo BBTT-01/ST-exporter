@@ -70,6 +70,27 @@ on:
           request), so leave it blank unless a tenant really needs it.
         type: string
         default: ""
+      image_max_assets:
+        description: >-
+          Cap on how many pricebook assets ONE `images` run fetches over the
+          network. 0 (the default) means NO CAP — a number here would silently
+          truncate a large catalogue for ever on any caller that never chose
+          one, and a tenant permanently missing its last N images looks exactly
+          like a clean run.
+
+          Set a number to bound a run while an image strategy settles. Assets
+          the pass skips for free (ServiceTitan says the item has not been
+          modified since the ledger last confirmed it) do NOT count against it:
+          the cap bounds work, not the scan.
+
+          Hitting it is announced on the run as
+          `images_stopped=per-run asset cap reached`, which is deliberately
+          distinct from the time budget's `images_stopped=time budget for the
+          image pass spent` — the two ask for different dials. The pass is
+          resumable either way: it works oldest-verification-first, so the next
+          run starts on the assets this one did not reach.
+        type: number
+        default: 0
       job_timeout_minutes:
         description: >-
           How long this job may run before GitHub kills it. 10 — the old
@@ -397,6 +418,7 @@ jobs:
           # stop short of it. Forgetting to forward it does not fail anything —
           # it silently restores the SIGKILL, so `test_workflow.py` asserts it.
           EXPORTER_JOB_TIMEOUT_MINUTES: ${{ inputs.job_timeout_minutes }}
+          EXPORTER_IMAGE_MAX_ASSETS: ${{ inputs.image_max_assets }}
           FEEDS: ${{ inputs.feeds }}
         run: |
           # Per-segment check rather than an enumeration of every combination —

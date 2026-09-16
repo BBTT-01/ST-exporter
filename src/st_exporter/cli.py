@@ -529,6 +529,22 @@ def _image_fields(images: ImageUploadSummary) -> str:
         f"images_stopped={images.stopped or 'no'} "
         f"images_pending={images.pending} "
         f"images_revalidated={images.revalidated} "
+        # The conditional-request measurement, on the run's own output line
+        # rather than only in the log, because it is the whole point of the
+        # first few runs: `images_not_modified` is what the 304 path saved, and
+        # `images_no_validator` is how many responses offered nothing to quote
+        # back and therefore stay on the old full-re-download schedule. Nobody
+        # has confirmed ServiceTitan honours conditional requests; these two
+        # numbers are the confirmation. See `images/conditional.py`.
+        f"images_not_modified={images.not_modified} "
+        f"images_fetched={images.fetched} "
+        # The cap in force and whether it BIT, so one line answers "did it stop
+        # on the cap or on the clock" without cross-referencing the config.
+        f"images_max_assets={images.max_assets or 'none'} "
+        f"images_cap_hit={str(images.cap_hit).lower()} "
+        f"images_conditional_sent={images.conditional.conditional_sent} "
+        f"images_no_validator={images.conditional.validators_absent} "
+        f"images_signed_urls={images.conditional.signed_urls} "
         f"images_too_large={images.too_large} "
         f"images_unsupported={images.unsupported}"
     )

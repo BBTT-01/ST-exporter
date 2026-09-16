@@ -324,3 +324,55 @@ class TestWritesAreNeverResent:
         with patch("st_cli.client.time.sleep"):
             assert client.get("crm", "customers") == {"data": []}
         assert route.call_count == 2
+
+
+class TestConditionalFileFetch:
+    """`get_file` is what lets the image pass ask "have these bytes changed?".
+
+    Nobody has confirmed ServiceTitan honours `If-None-Match`, so the contract
+    pinned here is the one that has to hold either way: the headers go out
+    ALONGSIDE the auth headers, and a 304 comes back as a result rather than as
+    an exception.
+    """
+
+    @respx.mock
+    def test_conditional_headers_ride_with_the_auth_headers(self, client, settings):
+        route = respx.get(
+            f"{settings.api_base}/pricebook/v2/tenant/{settings.tenant_id}/images"
+        ).mock(return_value=httpx.Response(200, content=b"bytes", headers={"etag": '"v1"'}))
+
+        fetched = client.get_file(
+            "pricebook", "images", params={"path": "x.jpg"}, headers={"If-None-Match": '"v1"'}
+        )
+
+        request = route.calls[0].request
+        assert request.headers["if-none-match"] == '"v1"'
+        assert request.headers["authorization"].startswith("Bearer ")
+        assert request.headers["st-app-key"]
+        assert (fetched.status_code, fetched.content, fetched.etag) == (200, b"bytes", '"v1"')
+        assert fetched.has_validator is True
+        assert fetched.not_modified is False
+
+    @respx.mock
+    def test_a_304_is_a_result_not_an_error(self, client, settings):
+        respx.get(f"{settings.api_base}/pricebook/v2/tenant/{settings.tenant_id}/images").mock(
+            return_value=httpx.Response(304, headers={"etag": '"v1"'})
+        )
+
+        fetched = client.get_file(
+            "pricebook", "images", params={"path": "x.jpg"}, headers={"If-None-Match": '"v1"'}
+        )
+
+        assert fetched.not_modified is True
+        assert fetched.content == b""
+
+    @respx.mock
+    def test_no_validator_in_the_response_is_reported_not_invented(self, client, settings):
+        respx.get(f"{settings.api_base}/pricebook/v2/tenant/{settings.tenant_id}/images").mock(
+            return_value=httpx.Response(200, content=b"bytes")
+        )
+
+        fetched = client.get_file("pricebook", "images", params={"path": "x.jpg"})
+
+        assert (fetched.etag, fetched.last_modified) == (None, None)
+        assert fetched.has_validator is False

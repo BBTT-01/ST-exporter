@@ -315,6 +315,27 @@ jobs:
       # Raise it for a tenant with thousands of images. There is no cost to the
       # other feeds: this job holds its own concurrency lock.
       job_timeout_minutes: 30
+      # OPTIONAL, and left unset here on purpose: 0 (no cap) is the default.
+      #
+      # A cap bounds how many assets ONE run FETCHES over the network — a second
+      # stopping condition beside the timeout above, bounding work rather than
+      # the clock. Set a number for a BOUNDED PROVING RUN — the first run on a
+      # tenant, where the question is "does a single image reach TrueQuote at
+      # all", not "how fast does the catalogue converge" — e.g.
+      #
+      #   image_max_assets: 500
+      #
+      # or while an image strategy is still settling, e.g. 1000.
+      #
+      # Assets the pass skips for free (ServiceTitan says the item has not
+      # changed since the ledger confirmed it) do not count against it, so a
+      # converged catalogue still sweeps end to end. Hitting it is announced as
+      # `images_stopped=per-run asset cap reached`, which is deliberately not
+      # the same words as the time budget's — the two ask for different dials.
+      #
+      # Do not leave a cap set and forget it: the pass still converges (each run
+      # starts on the assets the last one missed), but a catalogue that grows
+      # faster than the cap sweeps never finishes.
     secrets:
       ST_CLIENT_ID: ${{ secrets.SERVICETITAN_CLIENT_ID }}
       ST_CLIENT_SECRET: ${{ secrets.SERVICETITAN_CLIENT_SECRET }}

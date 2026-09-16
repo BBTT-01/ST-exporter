@@ -1071,3 +1071,21 @@ def test_the_exporter_is_told_the_runner_deadline(workflow_text: str) -> None:
     killed at ten with an unflushed ledger, which is the original bug exactly.
     """
     assert "EXPORTER_JOB_TIMEOUT_MINUTES: ${{ inputs.job_timeout_minutes }}" in workflow_text
+
+
+def test_the_per_run_image_asset_cap_defaults_to_unlimited(workflow_text: str) -> None:
+    """0 = no cap, and that is the default on purpose.
+
+    A number here would silently truncate a large catalogue for ever on every
+    caller that never chose one, and a tenant permanently missing its last N
+    images looks exactly like a clean run.
+    """
+    inputs: Any = yaml.safe_load(workflow_text)
+    declared = inputs.get("on", inputs.get(True))["workflow_call"]["inputs"]
+    assert declared["image_max_assets"]["default"] == 0
+
+
+def test_the_exporter_is_told_the_asset_cap(workflow_text: str) -> None:
+    """Forwarding it is not optional and its absence is SILENT: the input would
+    accept a number and the run would ignore it."""
+    assert "EXPORTER_IMAGE_MAX_ASSETS: ${{ inputs.image_max_assets }}" in workflow_text

@@ -17,6 +17,7 @@ from st_exporter.feeds.contacts import (
     ROUTES,
 )
 from st_exporter.feeds.financial import DEFAULT_MAX_TIMESHEET_JOBS
+from st_exporter.images.upload import NO_ASSET_CAP
 from st_exporter.window import FINANCIAL_WINDOW_DAYS
 
 # The reusable workflow's own default `job_timeout_minutes`, repeated here so a
@@ -140,6 +141,26 @@ class ExporterSettings(BaseSettings):
         default=DEFAULT_JOB_TIMEOUT_MINUTES,
         ge=1,
         validation_alias="EXPORTER_JOB_TIMEOUT_MINUTES",
+    )
+
+    # Cap on how many assets ONE image run fetches over the network. 0 — the
+    # default — is NO CAP, and that is deliberate: a number here would quietly
+    # truncate a large catalogue for ever on every caller that never chose one,
+    # and the symptom (a tenant permanently missing its last N images) looks
+    # exactly like a clean run. A caller that wants the pass bounded sets a
+    # number, and the run then says out loud when the cap bit
+    # (`images_stopped=per-run asset cap reached`).
+    #
+    # `modifiedOn` skips are free and do not count against it — the cap bounds
+    # WORK, not the scan — so a converged catalogue still sweeps end to end.
+    # ge=0 rather than ge=1 because 0 is the sentinel, not a degenerate cap; a
+    # cap of 1 would be legal and nearly useless, a cap of 0 meaning "fetch
+    # nothing" would be the bug rather than a configuration of it.
+    # Not GOOGLE_-prefixed; see window_days.
+    image_max_assets: int = Field(
+        default=NO_ASSET_CAP,
+        ge=0,
+        validation_alias="EXPORTER_IMAGE_MAX_ASSETS",
     )
 
     @property

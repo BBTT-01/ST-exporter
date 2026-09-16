@@ -17,7 +17,11 @@ import respx
 from st_cli.client import ServiceTitanClient
 from st_exporter.images.client import TrueQuoteImageClient
 from st_exporter.images.ledger import ImageLedger
-from st_exporter.images.upload import BUDGET_SPENT, upload_pricebook_images
+from st_exporter.images.upload import (
+    ASSET_CAP_REACHED,
+    BUDGET_SPENT,
+    upload_pricebook_images,
+)
 from st_exporter.sheets import InMemorySheetsStore
 from tests.st_exporter.conftest import mock_auth_token
 
@@ -676,3 +680,507 @@ class TestASecondRunResumesRatherThanRestarting:
         assert len(store.tabs["_image_ledger"][1:]) == 1, (
             "the prune forgot an asset the pass deliberately did not download"
         )
+
+
+# ---------------------------------------------------------------------------
+# CONDITIONAL REQUESTS.
+#
+# The weekly re-verification used to be a full RE-DOWNLOAD of every asset,
+# because the only cheap freshness signal — the ITEM's `modifiedOn` — is a proxy
+# for an ASSET-level change that nobody has confirmed on a live tenant. The
+# insurance stays; its price does not. A stored `ETag`/`Last-Modified` is quoted
+# back, and a 304 is a verification that moved no bytes.
+#
+# Every test below also pins the FALLBACK, because nothing here is known to work
+# against real ServiceTitan: no validator in the response means a plain GET and
+# the behaviour the pass has always had.
+# ---------------------------------------------------------------------------
+
+LATER = "2026-09-24T12:00:00+00:00"  # NOW + 10 days: past REVERIFY_AFTER_DAYS.
+ETAG = '"asset-v1"'
+LAST_MODIFIED = "Mon, 14 Sep 2026 00:00:00 GMT"
+
+
+def _run_at(st_client, image_client, records, store, when, **kwargs):
+    """One pass over ``records`` at wall-clock ``when``, ledger persisted in ``store``."""
+    ledger = ImageLedger(store)
+    summary = upload_pricebook_images(st_client, image_client, ledger, records, now=when, **kwargs)
+    ledger.flush()
+    return summary
+
+
+def _ledger_rows(store) -> list[list[str]]:
+    return store.tabs["_image_ledger"][1:]
+
+
+class TestConditionalRequestsReplaceTheWeeklyReDownload:
+    @respx.mock
+    def test_a_304_verifies_the_asset_without_downloading_or_uploading_it(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """THE EVIDENCE for the 304 path.
+
+        Run 1 downloads the bytes and stores the server's `ETag`. Ten days later
+        — past `REVERIFY_AFTER_DAYS`, so the `modifiedOn` shortcut has expired
+        and the old code would have re-downloaded the whole image — run 2 sends
+        `If-None-Match`, gets a 304 with an EMPTY body, and is done.
+        """
+        mock_auth_token(st_settings.auth_url)
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        store = InMemorySheetsStore()
+        bytes_on_the_wire: list[int] = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            if request.headers.get("if-none-match") == ETAG:
+                bytes_on_the_wire.append(0)
+                return httpx.Response(304, headers={"etag": ETAG})
+            bytes_on_the_wire.append(len(PNG))
+            return httpx.Response(200, content=PNG, headers={"etag": ETAG})
+
+        route = respx.get("https://cdn.example.com/1.jpg").mock(side_effect=respond)
+
+        first = _run_at(st_client, image_client, [_item(1)], store, NOW)
+        second = _run_at(st_client, image_client, [_item(1)], store, LATER)
+
+        assert (first.uploaded, first.not_modified) == (1, 0)
+        # The re-verification happened, and cost NO bytes and NO upload.
+        assert route.call_count == 2, "the weekly re-verification must still happen"
+        assert (second.not_modified, second.uploaded) == (1, 0)
+        assert second.already_uploaded == 1
+        assert upload.call_count == 1, "a 304 must never re-POST bytes TrueQuote has"
+        assert bytes_on_the_wire == [len(PNG), 0], (
+            "the whole point: the second verification moved zero image bytes"
+        )
+        assert second.conditional.conditional_sent == 1
+        assert second.conditional.not_modified == 1
+        print("\n304 EVIDENCE:", second.conditional.as_log_fields())
+        print("304 VERDICT :", second.conditional.verdict())
+        print("304 SUMMARY :", second.as_log_fields())
+
+    @respx.mock
+    def test_a_304_refreshes_the_verification_timestamp(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """A 304 that did not re-stamp the ledger would sort this asset to the
+        front of every later pass for ever — the non-convergence the ordering
+        exists to prevent, reintroduced through the cheapest door."""
+        mock_auth_token(st_settings.auth_url)
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        store = InMemorySheetsStore()
+        respx.get("https://cdn.example.com/1.jpg").mock(
+            side_effect=lambda request: (
+                httpx.Response(304)
+                if request.headers.get("if-none-match")
+                else httpx.Response(200, content=PNG, headers={"etag": ETAG})
+            )
+        )
+
+        _run_at(st_client, image_client, [_item(1)], store, NOW)
+        assert [row[3] for row in _ledger_rows(store)] == [NOW]
+
+        _run_at(st_client, image_client, [_item(1)], store, LATER)
+
+        assert [row[3] for row in _ledger_rows(store)] == [LATER]
+
+    @respx.mock
+    def test_a_200_with_a_validator_uploads_and_stores_it(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(
+            return_value=httpx.Response(
+                200, content=PNG, headers={"etag": ETAG, "last-modified": LAST_MODIFIED}
+            )
+        )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        store = InMemorySheetsStore()
+
+        summary = _run_at(st_client, image_client, [PUBLIC_ITEM], store, NOW)
+
+        assert summary.uploaded == 1
+        row = _ledger_rows(store)[0]
+        assert (row[4], row[5]) == (ETAG, LAST_MODIFIED)
+        assert summary.conditional.validators_present == 1
+        assert summary.conditional.validators_absent == 0
+
+    @respx.mock
+    def test_both_validators_are_quoted_back(self, st_settings, st_client, image_client) -> None:
+        """We do not know which of the two (if either) ServiceTitan implements,
+        so both are sent when both are known."""
+        mock_auth_token(st_settings.auth_url)
+        route = respx.get("https://cdn.example.com/1.jpg").mock(
+            return_value=httpx.Response(
+                200, content=PNG, headers={"etag": ETAG, "last-modified": LAST_MODIFIED}
+            )
+        )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        store = InMemorySheetsStore()
+
+        _run_at(st_client, image_client, [_item(1)], store, NOW)
+        _run_at(st_client, image_client, [_item(1)], store, LATER)
+
+        second = route.calls[1].request
+        assert second.headers["if-none-match"] == ETAG
+        assert second.headers["if-modified-since"] == LAST_MODIFIED
+
+    @respx.mock
+    def test_the_authenticated_endpoint_is_asked_conditionally_too(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """ServiceTitan's own images endpoint is the one nobody has measured."""
+        mock_auth_token(st_settings.auth_url)
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        store = InMemorySheetsStore()
+        images = respx.get(_images_url(st_settings)).mock(
+            side_effect=lambda request: (
+                httpx.Response(304)
+                if request.headers.get("if-none-match")
+                else httpx.Response(200, content=JPEG, headers={"etag": ETAG})
+            )
+        )
+
+        _run_at(st_client, image_client, [STORAGE_ITEM], store, NOW)
+        summary = _run_at(st_client, image_client, [STORAGE_ITEM], store, LATER)
+
+        assert images.call_count == 2
+        # The auth header still goes with it — the conditional headers are
+        # merged OVER the auth ones, never instead of them.
+        assert images.calls[1].request.headers["authorization"] == "Bearer test-token"
+        assert images.calls[1].request.headers["if-none-match"] == ETAG
+        assert summary.not_modified == 1
+
+
+class TestItDegradesToTodaysBehaviourWithNoValidators:
+    @respx.mock
+    def test_a_response_with_no_validators_still_works_and_is_counted(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """The defensive case, and the one that may well be reality.
+
+        No `ETag`, no `Last-Modified`: nothing to quote back, so the weekly
+        re-verification is a plain GET and a full download — exactly what the
+        pass did before. It must still dedupe, and the run must SAY that the
+        server offered nothing, because that is the measurement.
+        """
+        mock_auth_token(st_settings.auth_url)
+        route = respx.get("https://cdn.example.com/1.jpg").mock(
+            return_value=httpx.Response(200, content=PNG)
+        )
+        upload = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        store = InMemorySheetsStore()
+
+        first = _run_at(st_client, image_client, [_item(1)], store, NOW)
+        second = _run_at(st_client, image_client, [_item(1)], store, LATER)
+
+        assert first.uploaded == 1
+        assert route.call_count == 2, "with no validator the re-check must re-download"
+        assert not route.calls[1].request.headers.get("if-none-match")
+        assert (second.uploaded, second.already_uploaded) == (0, 1)
+        assert upload.call_count == 1, "identical bytes are still never re-sent"
+        assert second.conditional.validators_absent == 1
+        assert second.conditional.conditional_sent == 0
+        assert "NO validator" in second.conditional.verdict()
+        print("\nFALLBACK EVIDENCE:", second.conditional.as_log_fields())
+        print("FALLBACK VERDICT :", second.conditional.verdict())
+
+    @respx.mock
+    def test_a_pre_upgrade_ledger_row_is_not_discarded(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """The upgrade run must not re-upload a 7,000-image catalogue.
+
+        Every ledger written before this feature has four columns, not six. A
+        strict width check would drop every row as malformed.
+        """
+        mock_auth_token(st_settings.auth_url)
+        route = respx.get("https://cdn.example.com/1.jpg").mock(
+            return_value=httpx.Response(200, content=PNG)
+        )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        store = InMemorySheetsStore()
+
+        _run_at(st_client, image_client, [_item(1)], store, NOW)
+        # Rewrite the ledger in the OLD four-column shape.
+        legacy = [list(row[:4]) for row in _ledger_rows(store)]
+        store.replace_grid(
+            "_image_ledger",
+            [["idempotency_key", "asset_ref", "storage_path", "verified_at"], *legacy],
+        )
+
+        summary = _run_at(st_client, image_client, [_item(1)], store, NOW)
+
+        assert route.call_count == 1, "the old row must still buy the free skip"
+        assert summary.revalidated == 1
+
+    @respx.mock
+    def test_a_conditional_request_answered_200_is_counted_as_a_miss(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """A server that IGNORES `If-None-Match` answers 200 with the whole body.
+
+        That is the outcome the summary has to be able to name, because it is
+        indistinguishable from "the image changed" without the counter.
+        """
+        mock_auth_token(st_settings.auth_url)
+        respx.get("https://cdn.example.com/1.jpg").mock(
+            return_value=httpx.Response(200, content=PNG, headers={"etag": ETAG})
+        )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        store = InMemorySheetsStore()
+
+        _run_at(st_client, image_client, [_item(1)], store, NOW)
+        summary = _run_at(st_client, image_client, [_item(1)], store, LATER)
+
+        assert summary.conditional.conditional_sent == 1
+        assert summary.conditional.not_modified == 0
+        assert summary.conditional.conditional_missed == 1
+        assert "NOT ONE 304" in summary.conditional.verdict()
+
+    @respx.mock
+    def test_a_signed_url_is_reported(self, st_settings, st_client, image_client) -> None:
+        """Signed urls would explain a 0% hit rate, and cannot be fixed here."""
+        mock_auth_token(st_settings.auth_url)
+        signed = "https://cdn.example.com/1.jpg?X-Amz-Signature=deadbeef&X-Amz-Credential=k"
+        respx.get(signed).mock(return_value=httpx.Response(200, content=PNG))
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        record = {"id": 1, "assets": [{"id": None, "url": signed}]}
+
+        summary = _run_at(st_client, image_client, [record], InMemorySheetsStore(), NOW)
+
+        assert summary.conditional.signed_urls == 1
+        # No `asset.id`, so the ledger's own reference is the url: a fresh url
+        # next listing is a fresh asset and nothing can ever match.
+        assert summary.conditional.unstable_refs == 1
+        assert "look signed" in summary.conditional.verdict()
+
+
+class TestThePerRunAssetCap:
+    @respx.mock
+    def test_the_cap_stops_the_pass_with_its_own_reason(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """Two stopping conditions, two reasons. An operator reading
+        `images_stopped=` must know which dial to turn."""
+        mock_auth_token(st_settings.auth_url)
+        for item_id in range(1, 7):
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=PNG)
+            )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run_at(
+            st_client,
+            image_client,
+            [_item(i) for i in range(1, 7)],
+            InMemorySheetsStore(),
+            NOW,
+            max_assets=2,
+        )
+
+        assert summary.stopped == ASSET_CAP_REACHED
+        assert summary.stopped != BUDGET_SPENT
+        assert (summary.fetched, summary.uploaded, summary.pending) == (2, 2, 4)
+        assert summary.complete is False, "a capped pass has not seen the catalogue"
+
+    @respx.mock
+    def test_no_cap_is_the_default_and_never_bites(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """A default that truncated a catalogue for ever would be a trap."""
+        mock_auth_token(st_settings.auth_url)
+        for item_id in range(1, 7):
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=PNG)
+            )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run_at(
+            st_client, image_client, [_item(i) for i in range(1, 7)], InMemorySheetsStore(), NOW
+        )
+
+        assert summary.stopped is None
+        assert (summary.uploaded, summary.pending) == (6, 0)
+
+    @respx.mock
+    def test_the_cap_and_the_deadline_are_separate_conditions(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """The same catalogue, the same cap, a tighter clock: the clock wins and
+        says so. Neither reason may shadow the other."""
+        mock_auth_token(st_settings.auth_url)
+        for item_id in range(1, 7):
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=PNG)
+            )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        ledger = ImageLedger(InMemorySheetsStore())
+
+        with patch("st_exporter.images.upload.monotonic", _FakeClock()):
+            summary = upload_pricebook_images(
+                st_client,
+                image_client,
+                ledger,
+                [_item(i) for i in range(1, 7)],
+                now=NOW,
+                deadline=2,
+                max_assets=4,
+            )
+
+        assert summary.stopped == BUDGET_SPENT
+        assert summary.fetched == 2
+
+    @respx.mock
+    def test_a_free_skip_does_not_consume_the_cap(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """The cap bounds WORK, not the scan.
+
+        Counting `modifiedOn` skips would stop a converged catalogue part-way
+        through a sweep it could have finished for nothing — and would make
+        every run report `stopped`, so the ledger would never be pruned again.
+        """
+        mock_auth_token(st_settings.auth_url)
+        for item_id in range(1, 7):
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=PNG)
+            )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        store = InMemorySheetsStore()
+        records = [_item(i) for i in range(1, 7)]
+
+        _run_at(st_client, image_client, records, store, NOW)  # converge first
+        summary = _run_at(st_client, image_client, records, store, NOW, max_assets=2)
+
+        assert summary.revalidated == 6
+        assert (summary.fetched, summary.stopped, summary.pending) == (0, None, 0)
+        assert summary.complete is True
+
+    @respx.mock
+    def test_two_capped_runs_sweep_different_slices_and_the_union_converges(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """THE EVIDENCE for the cap.
+
+        Six assets, a cap of three, run twice against the same ledger. The cap
+        has to compose with least-recently-verified-first ordering or it is
+        simply a truncation: run 2 must fetch the three run 1 never reached.
+        """
+        mock_auth_token(st_settings.auth_url)
+        downloads = {
+            item_id: respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=PNG)
+            )
+            for item_id in range(1, 7)
+        }
+        uploads = respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        records = [_item(i) for i in range(1, 7)]
+        store = InMemorySheetsStore()
+
+        first = _run_at(st_client, image_client, records, store, NOW, max_assets=3)
+        slice_a = {i for i, route in downloads.items() if route.calls}
+        sent_a = [call.request.url.params["external_item_id"] for call in uploads.calls]
+
+        second = _run_at(st_client, image_client, records, store, NOW, max_assets=3)
+        slice_b = {i for i, route in downloads.items() if route.calls} - slice_a
+        later_calls = list(uploads.calls)[len(sent_a) :]
+        sent_b = [call.request.url.params["external_item_id"] for call in later_calls]
+
+        assert first.stopped == ASSET_CAP_REACHED
+        assert len(slice_a) == 3 and len(slice_b) == 3
+        assert not slice_a & slice_b, f"run 2 re-trod run 1's slice: {slice_a} then {slice_b}"
+        assert slice_a | slice_b == set(range(1, 7)), "the union must be the whole catalogue"
+        assert not set(sent_a) & set(sent_b)
+        assert sorted(sent_a + sent_b) == sorted(str(i) for i in range(1, 7))
+        # Run 2 spends its own cap on the three run 1 never reached — they sort
+        # FIRST, having never been verified — and stops on the cap with run 1's
+        # three still to visit. That is a sweep converging, and the run after it
+        # proves it: every asset now has a timestamp, every one is skipped for
+        # free, the cap never bites and the pass sees the catalogue WHOLE.
+        assert (second.fetched, second.stopped, second.pending) == (3, ASSET_CAP_REACHED, 3)
+        third = _run_at(st_client, image_client, records, store, NOW, max_assets=3)
+        assert (third.revalidated, third.fetched) == (6, 0)
+        assert third.stopped is None and third.pending == 0 and third.complete is True
+        print(f"\nCAP EVIDENCE: run1 fetched {sorted(slice_a)} stopped={first.stopped!r}")
+        print(f"CAP EVIDENCE: run2 fetched {sorted(slice_b)} stopped={second.stopped!r}")
+        print(
+            f"CAP EVIDENCE: union={sorted(slice_a | slice_b)} overlap={sorted(slice_a & slice_b)}"
+        )
+        print(
+            f"CAP EVIDENCE: run3 revalidated={third.revalidated} fetched={third.fetched} "
+            f"stopped={third.stopped!r} complete={third.complete}"
+        )
+
+
+class TestTheSummaryLineAnswersWhyItStopped:
+    """One log line, both halves: the cap in force and whether it bit.
+
+    An operator reading `images_stopped=` should never have to cross-reference
+    the workflow inputs to learn which dial to turn.
+    """
+
+    @respx.mock
+    def test_the_cap_and_the_fact_it_bit_are_both_on_the_line(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        for item_id in range(1, 5):
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=PNG)
+            )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run_at(
+            st_client,
+            image_client,
+            [_item(i) for i in range(1, 5)],
+            InMemorySheetsStore(),
+            NOW,
+            max_assets=2,
+        )
+
+        line = summary.as_log_fields()
+        assert "max_assets=2" in line
+        assert "cap_hit=true" in line
+        assert f"stopped={ASSET_CAP_REACHED}" in line
+        print("\nCAP SUMMARY LINE:", line)
+
+    @respx.mock
+    def test_an_uncapped_run_says_so_rather_than_printing_a_zero(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        """`max_assets=0` would read as "cap of zero", which is the opposite."""
+        mock_auth_token(st_settings.auth_url)
+        respx.get(PUBLIC_URL).mock(return_value=httpx.Response(200, content=PNG))
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+
+        summary = _run_at(st_client, image_client, [PUBLIC_ITEM], InMemorySheetsStore(), NOW)
+
+        assert "max_assets=none" in summary.as_log_fields()
+        assert "cap_hit=false" in summary.as_log_fields()
+
+    @respx.mock
+    def test_a_budget_stop_is_not_reported_as_a_cap_hit(
+        self, st_settings, st_client, image_client
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        for item_id in range(1, 5):
+            respx.get(f"https://cdn.example.com/{item_id}.jpg").mock(
+                return_value=httpx.Response(200, content=PNG)
+            )
+        respx.post(TQ_UPLOAD).mock(return_value=_accepted())
+        ledger = ImageLedger(InMemorySheetsStore())
+
+        with patch("st_exporter.images.upload.monotonic", _FakeClock()):
+            summary = upload_pricebook_images(
+                st_client,
+                image_client,
+                ledger,
+                [_item(i) for i in range(1, 5)],
+                now=NOW,
+                deadline=2,
+                max_assets=1000,
+            )
+
+        assert summary.cap_hit is False
+        assert f"stopped={BUDGET_SPENT}" in summary.as_log_fields()
+        assert "max_assets=1000" in summary.as_log_fields()
