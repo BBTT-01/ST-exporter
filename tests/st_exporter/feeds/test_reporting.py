@@ -897,3 +897,66 @@ class TestTheCustomRefusalCarriesItsEvidence:
             find_job_costing_summary(client)
 
         assert "custom" not in str(excinfo.value).lower()
+
+
+class TestTheRateLimitBudgetForOneReport:
+    """The client now waits as long as ServiceTitan asks, which is what makes a
+    paginated report reachable — and is also why one pull needs a ceiling.
+
+    Reporting counts each PAGE as a run of the report, so a multi-page pull is
+    throttled by its own previous page and legitimately takes minutes. "Wait as
+    long as you are told, every page, forever" is how a run gets SIGKILLed by the
+    runner with nothing written and nothing learned.
+    """
+
+    def _client_that_is_always_throttled(self, seconds: float):
+        client = MagicMock()
+        client.on_rate_limited = None
+
+        def post(module, resource, json_body=None, params=None, idempotent=False):
+            # Stand in for the client's own internal sleep: it calls the governor
+            # with the seconds it is about to wait, then eventually succeeds.
+            if client.on_rate_limited is not None:
+                client.on_rate_limited(seconds)
+            return {"fields": [{"name": "JobNumber"}], "data": [["1"]], "hasMore": True}
+
+        client.post.side_effect = post
+        return client
+
+    def test_a_pull_that_parks_too_long_is_skipped_not_left_running(self) -> None:
+        client = self._client_that_is_always_throttled(60.0)
+        with pytest.raises(ReportRateLimitedError) as excinfo:
+            fetch_report_rows(client, ReportRef("7", "42", "R"), parameters=[])
+        message = str(excinfo.value)
+        assert "rate limiter" in message
+        assert "unaffected" in message
+
+    def test_the_governor_the_caller_already_had_is_restored(self) -> None:
+        """`fetch_report_rows` borrows `on_rate_limited` to measure the wait. The
+        image pass sets that hook for real, so leaving it replaced would silently
+        disconnect a shared rate limiter for the rest of the run."""
+        client = self._client_that_is_always_throttled(60.0)
+        sentinel = MagicMock()
+        client.on_rate_limited = sentinel
+        with pytest.raises(ReportRateLimitedError):
+            fetch_report_rows(client, ReportRef("7", "42", "R"), parameters=[])
+        assert client.on_rate_limited is sentinel
+
+    def test_an_existing_governor_still_hears_every_wait(self) -> None:
+        client = self._client_that_is_always_throttled(60.0)
+        heard: list[float] = []
+        client.on_rate_limited = heard.append
+        with pytest.raises(ReportRateLimitedError):
+            fetch_report_rows(client, ReportRef("7", "42", "R"), parameters=[])
+        assert heard and set(heard) == {60.0}
+
+    def test_a_report_that_is_never_throttled_is_unaffected(self) -> None:
+        client = MagicMock()
+        client.on_rate_limited = None
+        client.post.return_value = {
+            "fields": [{"name": "JobNumber"}],
+            "data": [["1"], ["2"]],
+            "hasMore": False,
+        }
+        rows = fetch_report_rows(client, ReportRef("7", "42", "R"), parameters=[])
+        assert rows == [{"JobNumber": "1"}, {"JobNumber": "2"}]

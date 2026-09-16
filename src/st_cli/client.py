@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable
 
 import httpx
@@ -14,6 +17,29 @@ from st_cli.exceptions import APIError, NotFoundError, RateLimitError, Transport
 
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 1.0  # seconds
+
+#: The longest one 429 may park a request for, however long the server asks.
+#:
+#: The exponential curve above is 1s + 2s + 4s = SEVEN SECONDS of total patience,
+#: which is right for an endpoint that throttles per-second and hopeless for one
+#: that throttles per-minute. ServiceTitan's reporting endpoint allows roughly one
+#: run of the same report per minute per tenant, and **each page of a report
+#: counts as another run** — so page 2 of any multi-page report is throttled by
+#: page 1, every time, on every tenant. Run 35158215902 on `BBTT-01/tr-doorservpro`:
+#:
+#:     HTTP 429 {"status":429,"title":"Rate limit is exceeded. Try again in 50
+#:     seconds."}  (page 2, 11 seconds into the report)
+#:
+#: Seven seconds of backoff against a fifty-second ask fails 100% of the time, so
+#: `reporting.jobCosts` could never have been written for a report long enough to
+#: paginate — not on a dispatch, not on the six-hourly schedule.
+#:
+#: The server says how long it wants; the fix is to believe it rather than guess.
+#: This cap exists only so a server that asks for an hour cannot park a run until
+#: the GitHub runner SIGKILLs it (see `EXPORTER_JOB_TIMEOUT_MINUTES`) — a wait
+#: longer than this is refused as a rate-limit failure, loudly, which the caller
+#: already knows how to degrade from.
+_MAX_RATE_LIMIT_WAIT = 90.0  # seconds
 
 # How many 3xx hops one safe request may take before it is refused.
 #
@@ -108,6 +134,52 @@ def _is_retriable_transport(method: str, exc: httpx.HTTPError, *, idempotent: bo
     if method.upper() == "GET" or idempotent:
         return True
     return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+
+
+#: ServiceTitan states the wait in the RFC 7231 problem body, not only in a
+#: header: `{"status":429,"title":"Rate limit is exceeded. Try again in 50
+#: seconds."}`. Matched case-insensitively, integer or decimal.
+_RETRY_AFTER_IN_BODY = re.compile(r"try again in\s+(\d+(?:\.\d+)?)\s*second", re.IGNORECASE)
+
+
+def retry_after_seconds(resp: httpx.Response) -> float | None:
+    """How long the server asked us to wait, in seconds, or ``None``.
+
+    Two sources, header first:
+
+    1. ``Retry-After`` — RFC 7231 allows either a delay in seconds or an HTTP
+       date, and both spellings are accepted because which one a given edge
+       returns is not ours to choose.
+    2. the response BODY. ServiceTitan's 429 carries the number in its problem
+       document (*"Rate limit is exceeded. Try again in 50 seconds."*) and does
+       not always set the header, so reading only the header is the same as
+       reading nothing on the endpoint that needs this most.
+
+    Never returns a negative wait: an ``Retry-After`` date already in the past
+    means "now", and a negative sleep would raise.
+    """
+    header = resp.headers.get("retry-after", "").strip()
+    if header:
+        try:
+            return max(0.0, float(header))
+        except ValueError:
+            pass
+        try:
+            when = parsedate_to_datetime(header)
+        except (TypeError, ValueError):
+            when = None
+        if when is not None:
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    try:
+        body = resp.text
+    except Exception:  # pragma: no cover - a body that cannot be decoded is not a wait
+        return None
+    match = _RETRY_AFTER_IN_BODY.search(body or "")
+    if match:
+        return max(0.0, float(match.group(1)))
+    return None
 
 
 class ServiceTitanClient:
@@ -354,7 +426,21 @@ class ServiceTitanClient:
 
             if resp.status_code == 429 and retries < _MAX_RETRIES:
                 retries += 1
-                wait = _BACKOFF_BASE * (2 ** (retries - 1))
+                # The server's own number first, the blind curve only when it
+                # did not give one. A 429 that says "try again in 50 seconds"
+                # and is retried 7 seconds later is a request that was never
+                # going to succeed.
+                asked = retry_after_seconds(resp)
+                wait = asked if asked is not None else _BACKOFF_BASE * (2 ** (retries - 1))
+                if wait > _MAX_RATE_LIMIT_WAIT:
+                    # Refuse rather than park the whole run: a caller that skips
+                    # one tab is recoverable, a job killed by the runner loses
+                    # everything it had already done.
+                    raise RateLimitError(
+                        f"{method} {url} was rate-limited and the server asked for "
+                        f"{wait:.0f}s, beyond the {_MAX_RATE_LIMIT_WAIT:.0f}s this client "
+                        f"will wait on one request. Not waiting. Detail: {resp.text}"
+                    )
                 self._notify_rate_limited(wait)
                 time.sleep(wait)
                 continue
