@@ -457,6 +457,43 @@ def test_ci_cannot_interfere_with_the_customer_export_workflow(ci: dict[Any, Any
     assert not any("export.yml" in entry for entry in used), used
 
 
+def test_the_dependency_cache_is_keyed_on_a_file_that_is_actually_there(
+    workflow_text: str,
+) -> None:
+    """`cache: pip` FAILS the job when `cache-dependency-path` matches nothing.
+
+    That is a caching optimisation taking down an export the contractor's
+    scheduled run depends on, for no benefit, and it would do it on every
+    connector at once. The path is therefore pinned to a file this repo really
+    ships — and the checkout that puts it on disk runs before setup-python, so
+    the hash is of the exporter's own `pyproject.toml` and not of whatever the
+    CALLER repo happens to have at that path.
+    """
+    steps = list(yaml.safe_load(workflow_text)["jobs"]["export"]["steps"])
+    setup = [step for step in steps if "setup-python" in str(step.get("uses", ""))]
+    assert len(setup) == 1, setup
+    with_ = dict(setup[0]["with"])
+    assert with_.get("cache") == "pip", with_
+
+    dependency_path = str(with_["cache-dependency-path"])
+    assert (WORKFLOW.parents[2] / dependency_path).is_file(), dependency_path
+
+    names = [str(step.get("uses", "")) or str(step.get("name", "")) for step in steps]
+    assert names.index("actions/checkout@v4") < names.index(str(setup[0]["uses"])), names
+
+
+def test_the_install_still_installs_this_repo_not_a_cached_environment(
+    workflow_text: str,
+) -> None:
+    """The cache holds pip's downloads, not the environment. If that ever became
+    a cached virtualenv, a job could run code from a previous release while
+    reporting the version it checked out — the v0.2.1 failure mode with a new
+    cause."""
+    steps = list(yaml.safe_load(workflow_text)["jobs"]["export"]["steps"])
+    install = [step for step in steps if step.get("name") == "Install"]
+    assert [str(step["run"]).strip() for step in install] == ["pip install -e ."]
+
+
 def test_the_export_workflow_is_still_reusable_only(workflow_text: str) -> None:
     """The other direction of the same separation: adding CI must not have given
     `export.yml` a trigger of its own, which would run it here against no secrets."""
