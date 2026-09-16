@@ -230,8 +230,11 @@ class TestMcpFactories:
         tool(mcp_ctx, filters={"sort": "+id"}, sort="-modifiedOn")
         assert mock_client.get.call_args[1]["params"]["sort"] == "+id"
 
-    def test_list_tool_resource_default_sort_overrides_modifiedOn(self, deps, mcp_ctx, mock_client):
-        """Resources with default_sort use it instead of -modifiedOn (e.g. payroll/gross-pay-items)."""
+    def test_list_tool_resource_default_sort_overrides_modified_on(
+        self, deps, mcp_ctx, mock_client
+    ):
+        """Resources with default_sort use it instead of -modifiedOn (e.g.
+        payroll/gross-pay-items)."""
         res = Resource("gross-pay-items", ops="L", date_filter=True, default_sort="-date")
         tool = engine._make_list_tool("payroll", res, deps)
         mock_client.get.return_value = make_envelope([])

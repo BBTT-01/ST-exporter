@@ -84,5 +84,13 @@ jobs:
 
       - name: Lint
         run: |
-          ruff check src/st_exporter tests/st_exporter
-          ruff format --check src/st_exporter tests/st_exporter
+          # The WHOLE of src/ and tests/, not just the exporter half.
+          #
+          # This step used to name `src/st_exporter tests/st_exporter` only, so
+          # `src/st_cli/` and every test outside `tests/st_exporter/` were never
+          # linted at all — and two E501s duly merged into the release line in
+          # `aa0bfb3` without a single check going red. The exporter imports
+          # st_cli on every request it makes; there is no reading of "shared
+          # code" under which that half deserves less scrutiny.
+          ruff check src/ tests/
+          ruff format --check src/ tests/

@@ -4,6 +4,22 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · CI lints all of src/ and tests/, not half of it
+
+### Fixed: `src/st_cli/` and most of `tests/` were never linted
+
+`ci.yml`'s lint step named `src/st_exporter tests/st_exporter` only. Everything
+else — the whole of `src/st_cli/`, and every test outside `tests/st_exporter/` —
+was checked by nothing. Two E501s duly merged into the release line in `aa0bfb3`
+with no check going red, and a third plus an N802 had been sitting in
+`tests/test_engine.py` unnoticed.
+
+The exporter imports `st_cli` on every request it makes; there is no reading of
+"shared code" under which that half deserves less scrutiny. The step is now
+`ruff check src/ tests/` and `ruff format --check src/ tests/`, and the four
+existing violations are fixed in the same commit so the widened scope lands
+green.
+
 ## [Unreleased] · A long throttle no longer looks like a hang
 
 ### Added: the run log says when it is waiting, on which page, and for how long
