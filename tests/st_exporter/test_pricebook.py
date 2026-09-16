@@ -12,6 +12,7 @@ from st_exporter.pricebook import (
     CONTRACT_VERSION,
     ITEM_COLUMNS,
     build_category_grid,
+    build_category_row,
     build_item_grid,
     build_item_row,
     image_refs,
@@ -38,35 +39,95 @@ def _item(**overrides):
     return record
 
 
+#: The `pricebook.v1` header, verbatim. It is spelled out here rather than sliced
+#: off `ITEM_COLUMNS`, because a slice of the thing under test proves nothing: it
+#: would follow a rename straight over the cliff.
+_V1_ITEM_COLUMNS = (
+    "st_id",
+    "code",
+    "name",
+    "description",
+    "price",
+    "active",
+    "category_ids",
+    "category_names",
+    "manufacturer",
+    "model",
+    "image_refs",
+    "modified_on",
+)
+
+_V1_CATEGORY_COLUMNS = ("st_id", "name", "active", "parent_id")
+
+
 class TestColumns:
+    def test_the_v1_columns_are_untouched_and_still_lead(self) -> None:
+        # The whole basis on which v2 is additive: a consumer reading any of the
+        # original twelve, by name OR by position, sees exactly what it saw.
+        assert ITEM_COLUMNS[: len(_V1_ITEM_COLUMNS)] == _V1_ITEM_COLUMNS
+
+    def test_the_v1_category_columns_are_untouched_and_still_lead(self) -> None:
+        assert CATEGORY_COLUMNS[: len(_V1_CATEGORY_COLUMNS)] == _V1_CATEGORY_COLUMNS
+
     def test_item_columns_are_exactly_the_contract(self) -> None:
-        assert set(ITEM_COLUMNS) == {
-            "st_id",
-            "code",
-            "name",
-            "description",
-            "price",
-            "active",
-            "category_ids",
-            "category_names",
-            "manufacturer",
-            "model",
-            "image_refs",
-            "modified_on",
+        assert ITEM_COLUMNS == _V1_ITEM_COLUMNS + (
             "cost",
             "hours",
-        }
+            "member_price",
+            "add_on_price",
+            "add_on_member_price",
+            "taxable",
+            "is_labor",
+            "is_inventory",
+            "deduct_as_job_cost",
+            "pays_commission",
+            "commission_bonus",
+            "unit_of_measure",
+            "cross_sale_group",
+            "account",
+            "cost_of_sale_account",
+            "asset_account",
+            "warranty_duration",
+            "warranty_description",
+            "manufacturer_warranty_duration",
+            "manufacturer_warranty_description",
+            "service_provider_warranty_duration",
+            "service_provider_warranty_description",
+            "primary_vendor_id",
+            "primary_vendor_name",
+            "primary_vendor_part",
+            "primary_vendor_cost",
+            "other_vendor_ids",
+            "other_vendor_names",
+            "source",
+            "external_id",
+        )
+
+    def test_no_column_is_declared_twice(self) -> None:
+        assert len(set(ITEM_COLUMNS)) == len(ITEM_COLUMNS)
+        assert len(set(CATEGORY_COLUMNS)) == len(CATEGORY_COLUMNS)
 
     def test_category_columns_are_exactly_the_contract(self) -> None:
-        assert set(CATEGORY_COLUMNS) == {"st_id", "name", "active", "parent_id"}
+        assert CATEGORY_COLUMNS == _V1_CATEGORY_COLUMNS + (
+            "description",
+            "image",
+            "position",
+            "category_type",
+            "business_unit_ids",
+            "sku_image_refs",
+            "sku_video_refs",
+            "source",
+            "external_id",
+        )
 
     def test_contract_version_literal(self) -> None:
         assert CONTRACT_VERSION == "pricebook.v2"
 
-    def test_cost_and_hours_are_appended_last(self) -> None:
+    def test_cost_and_hours_lead_the_appended_block(self) -> None:
         # Appended, never inserted: a consumer reading by position must not have
-        # every column after `price` shift under it.
-        assert ITEM_COLUMNS[-2:] == ("cost", "hours")
+        # every column after `price` shift under it. These two are the reason
+        # v2 exists, so they come first of the new ones.
+        assert ITEM_COLUMNS[12:14] == ("cost", "hours")
 
     def test_item_grid_starts_with_the_header_row(self) -> None:
         assert build_item_grid([])[0] == list(ITEM_COLUMNS)
@@ -188,6 +249,151 @@ class TestCategories:
         assert row["category_names"].split(",") == ["", "Steel"]
 
 
+class TestTheFullPayload:
+    """v2 emits every scalar ServiceTitan returns. These pin HOW, not just THAT."""
+
+    def test_a_nested_object_is_flattened_into_prefixed_columns(self) -> None:
+        row = build_item_row(
+            _item(primaryVendor={"vendorId": 77, "vendorName": "Acme Supply", "cost": 410.25})
+        )
+        assert row["primary_vendor_id"] == "77"
+        assert row["primary_vendor_name"] == "Acme Supply"
+        assert row["primary_vendor_cost"] == "410.25"
+
+    def test_an_absent_nested_object_leaves_every_one_of_its_columns_blank(self) -> None:
+        row = build_item_row(_item(primaryVendor=None))
+        assert row["primary_vendor_id"] == ""
+        assert row["primary_vendor_name"] == ""
+        assert row["primary_vendor_cost"] == ""
+
+    def test_a_null_inside_a_nested_object_is_blank_not_zero(self) -> None:
+        row = build_item_row(_item(primaryVendor={"vendorId": 77, "cost": None}))
+        assert row["primary_vendor_cost"] == ""
+
+    def test_a_real_zero_inside_a_nested_object_is_written_as_zero(self) -> None:
+        row = build_item_row(_item(primaryVendor={"vendorId": 77, "cost": 0}))
+        assert row["primary_vendor_cost"] == "0"
+
+    def test_a_list_of_objects_uses_the_category_convention(self) -> None:
+        # Index-aligned id/name CSV, the SAME style as category_ids/category_names
+        # rather than a second one invented beside it.
+        row = build_item_row(
+            _item(
+                otherVendors=[
+                    {"vendorId": 1, "vendorName": "One"},
+                    {"vendorId": 2, "vendorName": "Two"},
+                ]
+            )
+        )
+        assert row["other_vendor_ids"] == "1,2"
+        assert row["other_vendor_names"] == "One,Two"
+
+    def test_a_vendor_with_no_id_is_dropped_from_both_columns(self) -> None:
+        row = build_item_row(
+            _item(otherVendors=[{"vendorName": "Orphan"}, {"vendorId": 2, "vendorName": "Two"}])
+        )
+        assert row["other_vendor_ids"] == "2"
+        assert row["other_vendor_names"] == "Two"
+
+    def test_the_two_equipment_warranties_never_share_a_column(self) -> None:
+        # Folding them together would put a manufacturer's warranty and a service
+        # provider's in one cell, wrong in a way no consumer could detect.
+        row = build_item_row(
+            _item(
+                manufacturerWarranty={"duration": 120, "description": "10 year parts"},
+                serviceProviderWarranty={"duration": 12, "description": "1 year labour"},
+            )
+        )
+        assert row["manufacturer_warranty_duration"] == "120"
+        assert row["manufacturer_warranty_description"] == "10 year parts"
+        assert row["service_provider_warranty_duration"] == "12"
+        assert row["service_provider_warranty_description"] == "1 year labour"
+        assert row["warranty_duration"] == ""
+
+    def test_the_service_warranty_has_its_own_columns(self) -> None:
+        row = build_item_row(_item(warranty={"duration": 24, "description": "2 year"}))
+        assert row["warranty_duration"] == "24"
+        assert row["warranty_description"] == "2 year"
+        assert row["manufacturer_warranty_duration"] == ""
+
+    def test_the_other_money_columns_follow_the_same_blank_rule(self) -> None:
+        assert build_item_row(_item(memberPrice=None))["member_price"] == ""
+        assert build_item_row(_item(memberPrice=0))["member_price"] == "0"
+        assert build_item_row(_item(commissionBonus=None))["commission_bonus"] == ""
+        assert build_item_row(_item(commissionBonus=0))["commission_bonus"] == "0"
+
+    def test_the_other_boolean_columns_follow_the_same_blank_rule(self) -> None:
+        assert build_item_row(_item(taxable=True))["taxable"] == "true"
+        assert build_item_row(_item(taxable=False))["taxable"] == "false"
+        assert build_item_row(_item(taxable=None))["taxable"] == ""
+        assert build_item_row(_item())["is_labor"] == ""
+
+    def test_a_field_a_resource_does_not_have_is_simply_blank(self) -> None:
+        # The union column set is what lets one parser read all three tabs.
+        service = build_item_row(
+            {"id": 1, "displayName": "Tune-Up", "price": 129, "hours": 1.5, "isLabor": True}
+        )
+        assert service["is_labor"] == "true"
+        assert service["cost"] == ""
+        assert service["unit_of_measure"] == ""
+
+    def test_no_cell_is_ever_a_json_blob(self) -> None:
+        # The failure this flattening exists to avoid: a dict or list stringified
+        # into a cell, which reads as data and parses as nothing.
+        row = build_item_row(
+            _item(
+                primaryVendor={"vendorId": 1, "vendorName": "One"},
+                otherVendors=[{"vendorId": 2, "vendorName": "Two"}],
+                warranty={"duration": 1, "description": "d"},
+            )
+        )
+        for column, value in row.items():
+            assert "{" not in value and "[" not in value, column
+
+    def test_external_data_is_never_exported(self) -> None:
+        # An arbitrary key/value bag any other integration can write to. It is the
+        # one field here that could plausibly carry a token, and the Export Store
+        # is not the place to find that out.
+        row = build_item_row(
+            _item(externalData=[{"key": "api_token", "value": "sk-live-do-not-publish"}])
+        )
+        assert "sk-live-do-not-publish" not in "".join(row.values())
+        assert not any("external_data" in column for column in ITEM_COLUMNS)
+
+    def test_a_bill_of_materials_is_never_flattened_to_bare_ids(self) -> None:
+        # {skuId, quantity} per entry. A CSV of sku ids would look exactly like a
+        # usable BOM while silently dropping every quantity.
+        row = build_item_row(
+            _item(equipmentMaterials=[{"skuId": 5, "quantity": 3}], recommendations=[{"skuId": 6}])
+        )
+        assert "5" not in row["other_vendor_ids"]
+        assert not any(
+            column.endswith(("_materials", "_equipment", "recommendations", "upgrades"))
+            for column in ITEM_COLUMNS
+        )
+
+
+class TestCategoryFullPayload:
+    def test_a_list_of_scalars_becomes_one_comma_separated_cell(self) -> None:
+        row = build_category_row({"id": 10, "name": "Doors", "businessUnitIds": [1, 2, 3]})
+        assert row["business_unit_ids"] == "1,2,3"
+
+    def test_blank_entries_are_dropped_from_a_scalar_list(self) -> None:
+        row = build_category_row({"id": 10, "name": "Doors", "skuImages": ["a.jpg", None, "b.jpg"]})
+        assert row["sku_image_refs"] == "a.jpg,b.jpg"
+
+    def test_the_recursive_subcategory_tree_is_not_exported(self) -> None:
+        # parent_id already carries every edge in it, one row at a time.
+        row = build_category_row(
+            {"id": 10, "name": "Doors", "subcategories": [{"id": 11, "name": "Steel"}]}
+        )
+        assert all("subcategor" not in column for column in row)
+
+    def test_position_is_blank_when_absent_and_zero_when_zero(self) -> None:
+        assert build_category_row({"id": 10, "name": "D"})["position"] == ""
+        assert build_category_row({"id": 10, "name": "D", "position": 0})["position"] == "0"
+
+
 class TestImageRefs:
     def test_identifiers_only_never_bytes(self) -> None:
         refs = image_refs([{"id": "a1", "url": "https://cdn.example.com/a1.jpg"}])
@@ -221,7 +427,12 @@ class TestCategoryRows:
     def test_parent_id_is_blank_at_the_top_level(self) -> None:
         grid = build_category_grid([{"id": 10, "name": "Doors", "active": True, "parentId": None}])
         row = dict(zip(CATEGORY_COLUMNS, grid[1]))
-        assert row == {"st_id": "10", "name": "Doors", "active": "true", "parent_id": ""}
+        assert row["parent_id"] == ""
+        assert row["st_id"] == "10"
+        assert row["name"] == "Doors"
+        assert row["active"] == "true"
+        # Everything the record did not carry is blank, never invented.
+        assert all(row[column] == "" for column in CATEGORY_COLUMNS[4:])
 
     def test_child_category_carries_its_parent(self) -> None:
         grid = build_category_grid([{"id": 11, "name": "Steel", "active": False, "parentId": 10}])

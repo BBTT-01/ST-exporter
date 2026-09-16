@@ -23,16 +23,59 @@ therefore enforced here in one place:
 - ``image_refs`` carries identifiers only — never bytes — deduped by asset id,
   because assets repeat within a single payload.
 
-- ``cost`` and ``hours`` come from ServiceTitan's own ``cost`` and ``hours``
-  fields on the pricebook item. ``hours`` exists on all three item resources;
-  ``cost`` exists on ``equipment`` and ``materials`` and **not on ``services``**
-  (ServiceTitan's ``Pricebook.V2.ServiceResponse`` has no cost field at all — a
-  service's cost is its labour). So ``pricebook.services.cost`` is blank on
-  every row of every tenant, by construction rather than by accident, and
-  ``blank_columns`` exempts it for that reason.
+**Why the tabs carry the whole payload and not a chosen subset.** `pricebook.v1`
+emitted twelve hand-picked columns. ``cost`` and ``hours`` were sitting in the same
+JSON response, unpicked, and Profit Wizard imported 35,138 items it could not price
+a single one of. The cost of a field nobody picked is a round trip through an
+exporter change, a re-run and three redeploys; the cost of a field nobody wants is
+one more mostly-blank column in a Sheet. Those are not close, so `pricebook.v2`
+emits **every scalar ServiceTitan returns**, and the judgement moves to the
+consumer, where it is cheap to change.
+
+``cost`` and ``hours`` are the two that matter most and the reason for the change:
+both are read straight off ServiceTitan's fields of those names. ``hours`` exists
+on all three item resources; ``cost`` exists on ``equipment`` and ``materials`` and
+**not on ``services``** (``Pricebook.V2.ServiceResponse`` has no cost field at all —
+a service's cost is its labour). So ``pricebook.services.cost`` is blank on every
+row of every tenant, by construction rather than by accident, and ``blank_columns``
+exempts it for that reason.
+
+Flattening rules, all of them the tab's existing conventions rather than new ones:
+
+- a **scalar** becomes its own column, named in snake_case after the ServiceTitan
+  field;
+- a **nested object** is flattened into one column per scalar, prefixed with the
+  object's name (``primaryVendor.vendorPart`` -> ``primary_vendor_part``). The two
+  equipment warranties keep separate columns from the service warranty: folding
+  them together would put a manufacturer's warranty and a service provider's in
+  one cell, which is wrong in a way no consumer could detect;
+- a **list of objects** becomes index-aligned CSV columns, exactly as
+  ``category_ids`` / ``category_names`` already did (``_aligned``);
+- a **list of scalars** becomes one comma-separated cell, as ``image_refs``
+  already did (``_scalar_list``).
+
+Four things are deliberately NOT emitted, and the reason is the same each time —
+a cell that cannot carry the fact honestly is worse than an absent column:
+
+- ``externalData`` — an arbitrary key/value bag any other integration can write to
+  this tenant's SKUs. It is the one field on these payloads that could plausibly
+  hold a token or an internal identifier somebody would not choose to publish into
+  a spreadsheet, and the Export Store is not the place to find that out.
+- ``serviceMaterials`` / ``serviceEquipment`` / ``equipmentMaterials`` — a bill of
+  materials, ``{skuId, quantity}`` per entry. A CSV of sku ids would look exactly
+  like a usable BOM while silently dropping every quantity, which is the precise
+  failure mode this whole contract exists to prevent. It needs its own tab at its
+  own grain, not a column.
+- ``recommendations`` / ``upgrades`` — cross-sell links, same objection, no costing
+  value.
+- ``subcategories`` on the category tab — a recursive tree. ``parent_id`` already
+  carries every edge in it, one row at a time.
 
 ``services``, ``equipment`` and ``materials`` share one shape and therefore one
-code path: the tab name carries the meaning, the parser does not have to.
+code path: the tab name carries the meaning, the parser does not have to. That
+holds at v2 too — the column set is the UNION of the three resources' fields, so a
+column a resource does not have is blank on every one of its rows (``is_labor`` on
+equipment, ``manufacturer`` on services). One header, one parser, three tabs.
 """
 
 from __future__ import annotations
@@ -56,11 +99,57 @@ ITEM_COLUMNS: tuple[str, ...] = (
     "model",
     "image_refs",
     "modified_on",
+    # --- appended at pricebook.v2: the rest of the payload ---------------------
+    # The first twelve are frozen above, in their original order. Everything from
+    # here down is new, and is APPENDED so nothing a consumer already reads moves.
     "cost",
     "hours",
+    "member_price",
+    "add_on_price",
+    "add_on_member_price",
+    "taxable",
+    "is_labor",
+    "is_inventory",
+    "deduct_as_job_cost",
+    "pays_commission",
+    "commission_bonus",
+    "unit_of_measure",
+    "cross_sale_group",
+    "account",
+    "cost_of_sale_account",
+    "asset_account",
+    "warranty_duration",
+    "warranty_description",
+    "manufacturer_warranty_duration",
+    "manufacturer_warranty_description",
+    "service_provider_warranty_duration",
+    "service_provider_warranty_description",
+    "primary_vendor_id",
+    "primary_vendor_name",
+    "primary_vendor_part",
+    "primary_vendor_cost",
+    "other_vendor_ids",
+    "other_vendor_names",
+    "source",
+    "external_id",
 )
 
-CATEGORY_COLUMNS: tuple[str, ...] = ("st_id", "name", "active", "parent_id")
+CATEGORY_COLUMNS: tuple[str, ...] = (
+    "st_id",
+    "name",
+    "active",
+    "parent_id",
+    # --- appended at pricebook.v2 ---------------------------------------------
+    "description",
+    "image",
+    "position",
+    "category_type",
+    "business_unit_ids",
+    "sku_image_refs",
+    "sku_video_refs",
+    "source",
+    "external_id",
+)
 
 
 def build_item_grid(records: list[dict[str, Any]]) -> list[list[str]]:
@@ -89,7 +178,10 @@ def build_category_grid(records: list[dict[str, Any]]) -> list[list[str]]:
 
 def build_item_row(record: dict[str, Any]) -> dict[str, str]:
     """Map one ServiceTitan pricebook item onto the item-tab columns."""
-    category_ids, category_names = _categories(record.get("categories"))
+    category_ids, category_names = _aligned(record.get("categories"), "id", "name")
+    other_vendor_ids, other_vendor_names = _aligned(
+        record.get("otherVendors"), "vendorId", "vendorName"
+    )
     return {
         "st_id": to_cell_text(record.get("id")),
         "code": to_cell_text(record.get("code")),
@@ -105,6 +197,42 @@ def build_item_row(record: dict[str, Any]) -> dict[str, str]:
         "modified_on": to_cell_text(record.get("modifiedOn")),
         "cost": _numeric(record.get("cost")),
         "hours": _numeric(record.get("hours")),
+        "member_price": _numeric(record.get("memberPrice")),
+        "add_on_price": _numeric(record.get("addOnPrice")),
+        "add_on_member_price": _numeric(record.get("addOnMemberPrice")),
+        "taxable": _bool_text(record.get("taxable")),
+        "is_labor": _bool_text(record.get("isLabor")),
+        "is_inventory": _bool_text(record.get("isInventory")),
+        "deduct_as_job_cost": _bool_text(record.get("deductAsJobCost")),
+        "pays_commission": _bool_text(record.get("paysCommission")),
+        "commission_bonus": _numeric(record.get("commissionBonus")),
+        "unit_of_measure": to_cell_text(record.get("unitOfMeasure")),
+        "cross_sale_group": to_cell_text(record.get("crossSaleGroup")),
+        "account": to_cell_text(record.get("account")),
+        "cost_of_sale_account": to_cell_text(record.get("costOfSaleAccount")),
+        "asset_account": to_cell_text(record.get("assetAccount")),
+        "warranty_duration": _numeric(_nested(record.get("warranty"), "duration")),
+        "warranty_description": to_cell_text(_nested(record.get("warranty"), "description")),
+        "manufacturer_warranty_duration": _numeric(
+            _nested(record.get("manufacturerWarranty"), "duration")
+        ),
+        "manufacturer_warranty_description": to_cell_text(
+            _nested(record.get("manufacturerWarranty"), "description")
+        ),
+        "service_provider_warranty_duration": _numeric(
+            _nested(record.get("serviceProviderWarranty"), "duration")
+        ),
+        "service_provider_warranty_description": to_cell_text(
+            _nested(record.get("serviceProviderWarranty"), "description")
+        ),
+        "primary_vendor_id": to_cell_text(_nested(record.get("primaryVendor"), "vendorId")),
+        "primary_vendor_name": to_cell_text(_nested(record.get("primaryVendor"), "vendorName")),
+        "primary_vendor_part": to_cell_text(_nested(record.get("primaryVendor"), "vendorPart")),
+        "primary_vendor_cost": _numeric(_nested(record.get("primaryVendor"), "cost")),
+        "other_vendor_ids": other_vendor_ids,
+        "other_vendor_names": other_vendor_names,
+        "source": to_cell_text(record.get("source")),
+        "external_id": to_cell_text(record.get("externalId")),
     }
 
 
@@ -119,6 +247,15 @@ def build_category_row(record: dict[str, Any]) -> dict[str, str]:
         "name": to_cell_text(record.get("name")),
         "active": _bool_text(record.get("active")),
         "parent_id": to_cell_text(record.get("parentId")),
+        "description": to_cell_text(record.get("description")),
+        "image": to_cell_text(record.get("image")),
+        "position": _numeric(record.get("position")),
+        "category_type": to_cell_text(record.get("categoryType")),
+        "business_unit_ids": _scalar_list(record.get("businessUnitIds")),
+        "sku_image_refs": _scalar_list(record.get("skuImages")),
+        "sku_video_refs": _scalar_list(record.get("skuVideos")),
+        "source": to_cell_text(record.get("source")),
+        "external_id": to_cell_text(record.get("externalId")),
     }
 
 
@@ -174,8 +311,24 @@ def _bool_text(value: Any) -> str:
     return ""
 
 
-def _categories(categories: Any) -> tuple[str, str]:
-    """Return ``(category_ids, category_names)`` as index-aligned CSV strings.
+def _nested(container: Any, key: str) -> Any:
+    """One scalar out of a nested ServiceTitan object, or ``None``.
+
+    ``None`` rather than ``""`` so the caller's blank-when-null rule still gets to
+    decide: an absent ``primaryVendor`` and a vendor with a null ``cost`` both end
+    up blank, and neither is ever confused with a real ``0``.
+    """
+    if not isinstance(container, dict):
+        return None
+    return container.get(key)
+
+
+def _aligned(entries: Any, id_key: str, name_key: str) -> tuple[str, str]:
+    """Return ``(ids, names)`` as index-aligned CSV strings, from a list of objects.
+
+    The convention the tab already used for ``category_ids`` / ``category_names``,
+    now shared with ``other_vendor_ids`` / ``other_vendor_names``: one style for
+    both rather than a second one invented alongside it.
 
     An entry with no id is skipped entirely rather than contributing a name with
     no id beside it — the two columns must stay in the same order, index for
@@ -191,17 +344,38 @@ def _categories(categories: Any) -> tuple[str, str]:
     """
     ids: list[str] = []
     names: list[str] = []
-    for entry in categories or []:
+    for entry in entries or []:
+        # A BARE id, not an object — the shape `equipment` and `materials`
+        # actually return. Kept through the rename of this parameter: the
+        # docstring above still promises it, and dropping it is what blanked
+        # category_ids/category_names on 15031 rows of run 35134016237.
         if isinstance(entry, (int, str)) and not isinstance(entry, bool):
             entry = {"id": entry}
         if not isinstance(entry, dict):
             continue
-        identifier = to_cell_text(entry.get("id")).strip()
+        identifier = to_cell_text(entry.get(id_key)).strip()
         if not identifier:
             continue
         ids.append(identifier)
-        names.append(to_cell_text(entry.get("name")).strip())
+        names.append(to_cell_text(entry.get(name_key)).strip())
     return ",".join(ids), ",".join(names)
+
+
+def _scalar_list(values: Any) -> str:
+    """A list of plain scalars as a comma-separated cell, blanks dropped.
+
+    Same comma convention as every other list-shaped cell on these tabs. Only for
+    lists of scalars: a list of OBJECTS goes through :func:`_aligned` so its parts
+    stay in named, index-aligned columns rather than becoming an opaque blob.
+    """
+    out: list[str] = []
+    for value in values or []:
+        if isinstance(value, (dict, list)):
+            continue
+        text = to_cell_text(value).strip()
+        if text:
+            out.append(text)
+    return ",".join(out)
 
 
 def asset_identifier(asset: dict[str, Any]) -> str:

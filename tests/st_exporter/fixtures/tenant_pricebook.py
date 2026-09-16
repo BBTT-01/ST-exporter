@@ -29,6 +29,23 @@ SERVICE_1 = {
     "description": "Yearly service",
     "price": 129,
     "hours": 1.5,
+    "memberPrice": 99,
+    "addOnPrice": 79,
+    "addOnMemberPrice": None,
+    "taxable": True,
+    "isLabor": True,
+    "paysCommission": True,
+    "account": "Service Income",
+    "crossSaleGroup": "Maintenance",
+    "warranty": {"duration": 12, "description": "One year on the work"},
+    "source": "Pricebook",
+    "externalId": "EXT-SVC-1",
+    # Never exported: an arbitrary bag another integration writes to, and the one
+    # field here that could plausibly carry a credential.
+    "externalData": [{"key": "legacy_ref", "value": "do-not-publish"}],
+    # Never exported: {skuId, quantity}. A CSV of ids would read as a usable bill
+    # of materials with every quantity silently dropped.
+    "serviceMaterials": [{"skuId": 200, "quantity": 2}],
     "active": True,
     "categories": [{"id": 10, "name": "Service"}],
     "manufacturer": None,
@@ -57,6 +74,34 @@ EQUIPMENT_1 = {
     "price": 1299.5,
     "cost": 640,
     "hours": 3,
+    "memberPrice": 1199.5,
+    "addOnPrice": None,
+    "taxable": True,
+    "isInventory": False,
+    "paysCommission": True,
+    "commissionBonus": 25,
+    "unitOfMeasure": "Each",
+    "crossSaleGroup": "Doors",
+    "account": "Equipment Income",
+    "costOfSaleAccount": "Cost of Goods Sold",
+    "assetAccount": "Inventory Asset",
+    # Two DIFFERENT warranties; folding them into one pair of columns would be
+    # wrong in a way no consumer could detect.
+    "manufacturerWarranty": {"duration": 120, "description": "Ten year on panels"},
+    "serviceProviderWarranty": {"duration": 12, "description": "One year on labour"},
+    "primaryVendor": {
+        "vendorId": 501,
+        "vendorName": "Fixture Supply Co",
+        "vendorPart": "FS-16x7",
+        "cost": 610,
+    },
+    "otherVendors": [
+        {"vendorId": 502, "vendorName": "Second Supply Ltd", "cost": 625},
+        # No vendorId: dropped from BOTH columns, so the two stay index-aligned.
+        {"vendorName": "Nameless Supply"},
+    ],
+    "source": "Pricebook",
+    "externalId": None,
     "active": True,
     # Bare ids, no names: the real `EquipmentResponse.categories` shape.
     "categories": [10, 11],
@@ -77,6 +122,21 @@ MATERIAL_1 = {
     "price": 0,
     "cost": 0,
     "hours": None,
+    "memberPrice": 0,
+    "taxable": False,
+    "isInventory": True,
+    "deductAsJobCost": True,
+    "paysCommission": False,
+    "commissionBonus": 0,
+    "unitOfMeasure": "Each",
+    "account": "Material Income",
+    "costOfSaleAccount": "Cost of Goods Sold",
+    "assetAccount": None,
+    # No vendor at all: every primary_vendor_* column blank, none invented.
+    "primaryVendor": None,
+    "otherVendors": [],
+    "source": "Pricebook",
+    "externalId": "EXT-MAT-1",
     "active": True,
     # Bare ids, no names: the real `MaterialResponse.categories` shape.
     "categories": [11],
@@ -85,8 +145,31 @@ MATERIAL_1 = {
     "assets": [],
     "modifiedOn": "2026-09-04T00:00:00Z",
 }
-CATEGORY_10 = {"id": 10, "name": "Service", "active": True, "parentId": None}
-CATEGORY_11 = {"id": 11, "name": "Doors", "active": True, "parentId": 10}
+CATEGORY_10 = {
+    "id": 10,
+    "name": "Service",
+    "active": True,
+    "parentId": None,
+    "description": "Labour and maintenance",
+    "image": "Images/Pricebook/cat-10.jpg",
+    "position": 0,
+    "categoryType": "Services",
+    "businessUnitIds": [1, 2],
+    "skuImages": ["Images/Pricebook/sku-a.jpg", None, "Images/Pricebook/sku-b.jpg"],
+    "skuVideos": [],
+    "source": "Pricebook",
+    "externalId": "EXT-CAT-10",
+    # Never exported: parent_id already carries every edge in this tree.
+    "subcategories": [{"id": 11, "name": "Doors"}],
+}
+CATEGORY_11 = {
+    "id": 11,
+    "name": "Doors",
+    "active": True,
+    "parentId": 10,
+    "categoryType": "Materials",
+    "position": 1,
+}
 
 
 def _envelope(data: list[dict]) -> httpx.Response:

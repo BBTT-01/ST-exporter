@@ -28,22 +28,22 @@
       "tabs": {
         "pricebook.services": {
           "path": "pricebook.v2/pricebook.services.json",
-          "sha256": "b47525d1584e42b20dce6f6e5bd078d5d34bb8961d80ea8e30cca2839fae0f21",
+          "sha256": "b037b3522c5f46dd95d69bb842454de70fdc2b853b35f1716f2e941dfdd70e34",
           "row_count": 3
         },
         "pricebook.equipment": {
           "path": "pricebook.v2/pricebook.equipment.json",
-          "sha256": "1da39c1641787e40af8a0c0718d329e0b46711bd38045208b5985b285938329c",
+          "sha256": "b1f5140d037e2ba7f0523e2c46a50cde0a03e0d5899e5eb8dc89eb29fc0faae5",
           "row_count": 1
         },
         "pricebook.materials": {
           "path": "pricebook.v2/pricebook.materials.json",
-          "sha256": "6e8b6b7127066ac53483574bf9c6bbdd1d9fc698e139bbdeb6cb41f4c5e5a444",
+          "sha256": "0e3f76ae290aeef4dbac106c58fc5864aae9a63f79d5cf2413e9fcb2b1b09d29",
           "row_count": 2
         },
         "pricebook.categories": {
           "path": "pricebook.v2/pricebook.categories.json",
-          "sha256": "514caabf7bbbbe460d5e345460d24f9dec178c1e0dad6e2df25ddf5dc3e5145f",
+          "sha256": "40c33f6596e885e8fa6ad1090eeaaf59d694f6ab16e02cfcaade5df3de611c9b",
           "row_count": 2
         }
       }

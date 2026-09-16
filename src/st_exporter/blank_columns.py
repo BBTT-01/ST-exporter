@@ -52,31 +52,301 @@ ALL_BLANK_OK: dict[str, dict[str, str]] = {
         "summary": "Free-text job summary; many tenants never fill it in.",
     },
     "pricebook.services": {
-        "cost": (
-            "ServiceTitan's Pricebook.V2.ServiceResponse carries no cost field at "
-            "all, so this column is blank on every row of every tenant by "
-            "construction. It is in the contract so the three item tabs keep one "
-            "shape and one parser."
+        "account": ("Optional upstream; frequently unset across a whole catalogue."),
+        "add_on_member_price": ("Optional upstream; frequently unset across a whole catalogue."),
+        "add_on_price": ("Optional upstream; frequently unset across a whole catalogue."),
+        "asset_account": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no `assetAccount` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
         ),
-        "description": "Optional catalogue prose; commonly empty catalogue-wide.",
-        "manufacturer": "Meaningless for labour/service items.",
-        "model": "Meaningless for labour/service items.",
-        "image_refs": "A catalogue with no images attached is ordinary.",
+        "commission_bonus": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no "
+            "`commissionBonus` field, so this column is blank on every row of "
+            "every tenant. The three item tabs share one column set (the union "
+            "of the three resources' fields) so they can share one parser; a "
+            "column a resource does not have is the price of that."
+        ),
+        "cost": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no `cost` field, "
+            "so this column is blank on every row of every tenant. The three "
+            "item tabs share one column set (the union of the three resources' "
+            "fields) so they can share one parser; a column a resource does not "
+            "have is the price of that."
+        ),
+        "cost_of_sale_account": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no "
+            "`costOfSaleAccount` field, so this column is blank on every row of "
+            "every tenant. The three item tabs share one column set (the union "
+            "of the three resources' fields) so they can share one parser; a "
+            "column a resource does not have is the price of that."
+        ),
+        "cross_sale_group": ("Optional upstream; frequently unset across a whole catalogue."),
+        "deduct_as_job_cost": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no "
+            "`deductAsJobCost` field, so this column is blank on every row of "
+            "every tenant. The three item tabs share one column set (the union "
+            "of the three resources' fields) so they can share one parser; a "
+            "column a resource does not have is the price of that."
+        ),
+        "description": ("Optional upstream; frequently unset across a whole catalogue."),
+        "external_id": ("Optional upstream; frequently unset across a whole catalogue."),
+        "image_refs": ("Optional upstream; frequently unset across a whole catalogue."),
+        "is_inventory": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no `isInventory` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "manufacturer": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no `manufacturer` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "manufacturer_warranty_description": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no "
+            "`manufacturerWarranty` field, so this column is blank on every row "
+            "of every tenant. The three item tabs share one column set (the "
+            "union of the three resources' fields) so they can share one "
+            "parser; a column a resource does not have is the price of that."
+        ),
+        "manufacturer_warranty_duration": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no "
+            "`manufacturerWarranty` field, so this column is blank on every row "
+            "of every tenant. The three item tabs share one column set (the "
+            "union of the three resources' fields) so they can share one "
+            "parser; a column a resource does not have is the price of that."
+        ),
+        "member_price": ("Optional upstream; frequently unset across a whole catalogue."),
+        "model": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no `model` field, "
+            "so this column is blank on every row of every tenant. The three "
+            "item tabs share one column set (the union of the three resources' "
+            "fields) so they can share one parser; a column a resource does not "
+            "have is the price of that."
+        ),
+        "other_vendor_ids": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no `otherVendors` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "other_vendor_names": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no `otherVendors` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "primary_vendor_cost": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no `primaryVendor` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "primary_vendor_id": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no `primaryVendor` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "primary_vendor_name": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no `primaryVendor` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "primary_vendor_part": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no `primaryVendor` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "service_provider_warranty_description": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no "
+            "`serviceProviderWarranty` field, so this column is blank on every "
+            "row of every tenant. The three item tabs share one column set (the "
+            "union of the three resources' fields) so they can share one "
+            "parser; a column a resource does not have is the price of that."
+        ),
+        "service_provider_warranty_duration": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no "
+            "`serviceProviderWarranty` field, so this column is blank on every "
+            "row of every tenant. The three item tabs share one column set (the "
+            "union of the three resources' fields) so they can share one "
+            "parser; a column a resource does not have is the price of that."
+        ),
+        "source": ("Optional upstream; frequently unset across a whole catalogue."),
+        "unit_of_measure": (
+            "ServiceTitan's Pricebook.V2.ServiceResponse has no `unitOfMeasure` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "warranty_description": ("Optional upstream; frequently unset across a whole catalogue."),
+        "warranty_duration": ("Optional upstream; frequently unset across a whole catalogue."),
     },
     "pricebook.equipment": {
-        "description": "Optional catalogue prose; commonly empty catalogue-wide.",
-        "manufacturer": "Optional; frequently unset across a whole catalogue.",
-        "model": "Optional; frequently unset across a whole catalogue.",
-        "image_refs": "A catalogue with no images attached is ordinary.",
+        "account": ("Optional upstream; frequently unset across a whole catalogue."),
+        "add_on_member_price": ("Optional upstream; frequently unset across a whole catalogue."),
+        "add_on_price": ("Optional upstream; frequently unset across a whole catalogue."),
+        "asset_account": ("Optional upstream; frequently unset across a whole catalogue."),
+        "commission_bonus": ("Optional upstream; frequently unset across a whole catalogue."),
+        "cost_of_sale_account": ("Optional upstream; frequently unset across a whole catalogue."),
+        "cross_sale_group": ("Optional upstream; frequently unset across a whole catalogue."),
+        "deduct_as_job_cost": (
+            "ServiceTitan's Pricebook.V2.EquipmentResponse has no "
+            "`deductAsJobCost` field, so this column is blank on every row of "
+            "every tenant. The three item tabs share one column set (the union "
+            "of the three resources' fields) so they can share one parser; a "
+            "column a resource does not have is the price of that."
+        ),
+        "description": ("Optional upstream; frequently unset across a whole catalogue."),
+        "external_id": ("Optional upstream; frequently unset across a whole catalogue."),
+        "image_refs": ("Optional upstream; frequently unset across a whole catalogue."),
+        "is_labor": (
+            "ServiceTitan's Pricebook.V2.EquipmentResponse has no `isLabor` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "manufacturer": ("Optional upstream; frequently unset across a whole catalogue."),
+        "manufacturer_warranty_description": (
+            "Optional upstream; frequently unset across a whole catalogue."
+        ),
+        "manufacturer_warranty_duration": (
+            "Optional upstream; frequently unset across a whole catalogue."
+        ),
+        "member_price": ("Optional upstream; frequently unset across a whole catalogue."),
+        "model": ("Optional upstream; frequently unset across a whole catalogue."),
+        "other_vendor_ids": ("Optional upstream; frequently unset across a whole catalogue."),
+        "other_vendor_names": ("Optional upstream; frequently unset across a whole catalogue."),
+        "primary_vendor_cost": ("Optional upstream; frequently unset across a whole catalogue."),
+        "primary_vendor_id": ("Optional upstream; frequently unset across a whole catalogue."),
+        "primary_vendor_name": ("Optional upstream; frequently unset across a whole catalogue."),
+        "primary_vendor_part": ("Optional upstream; frequently unset across a whole catalogue."),
+        "service_provider_warranty_description": (
+            "Optional upstream; frequently unset across a whole catalogue."
+        ),
+        "service_provider_warranty_duration": (
+            "Optional upstream; frequently unset across a whole catalogue."
+        ),
+        "source": ("Optional upstream; frequently unset across a whole catalogue."),
+        "unit_of_measure": ("Optional upstream; frequently unset across a whole catalogue."),
+        "warranty_description": (
+            "ServiceTitan's Pricebook.V2.EquipmentResponse has no `warranty` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "warranty_duration": (
+            "ServiceTitan's Pricebook.V2.EquipmentResponse has no `warranty` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
     },
     "pricebook.materials": {
-        "description": "Optional catalogue prose; commonly empty catalogue-wide.",
-        "manufacturer": "Optional; frequently unset across a whole catalogue.",
-        "model": "Optional; frequently unset across a whole catalogue.",
-        "image_refs": "A catalogue with no images attached is ordinary.",
+        "account": ("Optional upstream; frequently unset across a whole catalogue."),
+        "add_on_member_price": ("Optional upstream; frequently unset across a whole catalogue."),
+        "add_on_price": ("Optional upstream; frequently unset across a whole catalogue."),
+        "asset_account": ("Optional upstream; frequently unset across a whole catalogue."),
+        "commission_bonus": ("Optional upstream; frequently unset across a whole catalogue."),
+        "cost_of_sale_account": ("Optional upstream; frequently unset across a whole catalogue."),
+        "cross_sale_group": (
+            "ServiceTitan's Pricebook.V2.MaterialResponse has no "
+            "`crossSaleGroup` field, so this column is blank on every row of "
+            "every tenant. The three item tabs share one column set (the union "
+            "of the three resources' fields) so they can share one parser; a "
+            "column a resource does not have is the price of that."
+        ),
+        "description": ("Optional upstream; frequently unset across a whole catalogue."),
+        "external_id": ("Optional upstream; frequently unset across a whole catalogue."),
+        "image_refs": ("Optional upstream; frequently unset across a whole catalogue."),
+        "is_labor": (
+            "ServiceTitan's Pricebook.V2.MaterialResponse has no `isLabor` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "manufacturer": ("Optional upstream; frequently unset across a whole catalogue."),
+        "manufacturer_warranty_description": (
+            "ServiceTitan's Pricebook.V2.MaterialResponse has no "
+            "`manufacturerWarranty` field, so this column is blank on every row "
+            "of every tenant. The three item tabs share one column set (the "
+            "union of the three resources' fields) so they can share one "
+            "parser; a column a resource does not have is the price of that."
+        ),
+        "manufacturer_warranty_duration": (
+            "ServiceTitan's Pricebook.V2.MaterialResponse has no "
+            "`manufacturerWarranty` field, so this column is blank on every row "
+            "of every tenant. The three item tabs share one column set (the "
+            "union of the three resources' fields) so they can share one "
+            "parser; a column a resource does not have is the price of that."
+        ),
+        "member_price": ("Optional upstream; frequently unset across a whole catalogue."),
+        "model": ("Optional upstream; frequently unset across a whole catalogue."),
+        "other_vendor_ids": ("Optional upstream; frequently unset across a whole catalogue."),
+        "other_vendor_names": ("Optional upstream; frequently unset across a whole catalogue."),
+        "primary_vendor_cost": ("Optional upstream; frequently unset across a whole catalogue."),
+        "primary_vendor_id": ("Optional upstream; frequently unset across a whole catalogue."),
+        "primary_vendor_name": ("Optional upstream; frequently unset across a whole catalogue."),
+        "primary_vendor_part": ("Optional upstream; frequently unset across a whole catalogue."),
+        "service_provider_warranty_description": (
+            "ServiceTitan's Pricebook.V2.MaterialResponse has no "
+            "`serviceProviderWarranty` field, so this column is blank on every "
+            "row of every tenant. The three item tabs share one column set (the "
+            "union of the three resources' fields) so they can share one "
+            "parser; a column a resource does not have is the price of that."
+        ),
+        "service_provider_warranty_duration": (
+            "ServiceTitan's Pricebook.V2.MaterialResponse has no "
+            "`serviceProviderWarranty` field, so this column is blank on every "
+            "row of every tenant. The three item tabs share one column set (the "
+            "union of the three resources' fields) so they can share one "
+            "parser; a column a resource does not have is the price of that."
+        ),
+        "source": ("Optional upstream; frequently unset across a whole catalogue."),
+        "unit_of_measure": ("Optional upstream; frequently unset across a whole catalogue."),
+        "warranty_description": (
+            "ServiceTitan's Pricebook.V2.MaterialResponse has no `warranty` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "warranty_duration": (
+            "ServiceTitan's Pricebook.V2.MaterialResponse has no `warranty` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
     },
     "pricebook.categories": {
-        "parent_id": "Blank at the top level by contract; a flat tree is all blanks.",
+        "business_unit_ids": ("Optional upstream; frequently unset across a whole catalogue."),
+        "description": ("Optional upstream; frequently unset across a whole catalogue."),
+        "external_id": ("Optional upstream; frequently unset across a whole catalogue."),
+        "image": ("Optional upstream; frequently unset across a whole catalogue."),
+        "parent_id": ("Blank at the top level by contract; a flat tree is all blanks."),
+        "sku_image_refs": ("Optional upstream; frequently unset across a whole catalogue."),
+        "sku_video_refs": ("Optional upstream; frequently unset across a whole catalogue."),
+        "source": ("Optional upstream; frequently unset across a whole catalogue."),
     },
     "settings.businessUnits": {
         # NOT a tenant that left a field empty: `code` does not exist on this

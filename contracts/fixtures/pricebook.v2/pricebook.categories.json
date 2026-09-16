@@ -10,10 +10,19 @@
     "st_id",
     "name",
     "active",
-    "parent_id"
+    "parent_id",
+    "description",
+    "image",
+    "position",
+    "category_type",
+    "business_unit_ids",
+    "sku_image_refs",
+    "sku_video_refs",
+    "source",
+    "external_id"
   ],
   "rows": [
-    ["10", "Service", "true", ""],
-    ["11", "Doors", "true", "10"]
+    ["10", "Service", "true", "", "Labour and maintenance", "Images/Pricebook/cat-10.jpg", "0", "Services", "1,2", "Images/Pricebook/sku-a.jpg,Images/Pricebook/sku-b.jpg", "", "Pricebook", "EXT-CAT-10"],
+    ["11", "Doors", "true", "10", "", "", "1", "Materials", "", "", "", "", ""]
   ]
 }

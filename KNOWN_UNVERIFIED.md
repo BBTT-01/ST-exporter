@@ -667,15 +667,23 @@ Unverified, and worth knowing before trusting the quiet half:
 
 Also unverified: that the four tabs' row counts are small enough that a full
 replace every run stays well inside a Sheets write. A very large catalogue has
-never been measured.
+never been measured — and `pricebook.v2` widened the item tabs from 12 columns to
+42, so the arithmetic moved. Google Sheets caps a spreadsheet at 10,000,000 cells
+across all tabs; the pilot tenant's 35,138 items now come to ~1.48M (was ~0.42M),
+around 15% of the cap, with room for roughly 238,000 item rows before the
+pricebook tabs alone reach it. Still comfortable, no longer irrelevant. What has
+never been tested is a single `values.update` write of that size, or the write
+time for a six-figure catalogue.
 
-## Pricebook `cost` and `hours` — verified against the spec, not against a tenant
+## Pricebook full payload — spellings verified against the spec, not a tenant
 
 `src/st_exporter/pricebook.py`
 
-`cost` and `hours` are read straight off ServiceTitan's own fields of those names.
-Both spellings are taken from the published Pricebook v2 OpenAPI document, not
-guessed and not taken from a consumer's client type:
+Every column `pricebook.v2` added is named after a field in the published Pricebook
+v2 OpenAPI document — `Pricebook.V2.{Service,Equipment,Material,Category}Response`
+and the nested `SkuWarrantyResponse` / `SkuVendorResponse` — rather than guessed or
+copied from a consumer's client type. `cost` and `hours` are the two that matter
+most:
 
 - `Pricebook.V2.MaterialResponse` and `Pricebook.V2.EquipmentResponse` both
   declare `cost` (decimal, "The cost paid to acquire the material") and `hours`
@@ -690,6 +698,20 @@ live tenant's payload matches its own document. The tripwire is in place either
 way — `cost` is NOT exempted on `pricebook.equipment` or `pricebook.materials`, so
 a wrong spelling there fires the whole-column-blank warning above 25 rows, and
 `hours` is exempted on no tab at all.
+
+The wider column set makes that detector work harder, and the exemption list is
+where it can be blunted. Two kinds of entry now sit in
+`blank_columns.ALL_BLANK_OK` for the item tabs and they are NOT the same strength
+of claim:
+
+- **structurally absent** — the resource's schema has no such field, so the column
+  is blank on every row of every tenant forever (`cost` on services, `is_labor` on
+  equipment). Certain, from the spec.
+- **optional upstream** — the field exists and is commonly unset catalogue-wide
+  (`cross_sale_group`, `external_id`, `account`). A guess about contractor
+  behaviour, and the weaker one: if a spelling in that group is wrong, the
+  exemption is what hides it. Every money and hours column is deliberately left
+  OUT of both groups on every tab that has the field.
 
 Deliberately NOT copied from Profit Wizard's direct integration: its
 `item.price || item.memberPrice || item.addOnPrice` price fallback. Those are three
