@@ -118,6 +118,21 @@ class TestDiscovery:
         with pytest.raises(JobCostingReportAmbiguousError):
             find_job_costing_summary(client)
 
+    def test_the_ambiguous_refusal_names_the_reports_not_just_their_ids(self) -> None:
+        client = _client(
+            [{"id": 7}, {"id": 8}],
+            {
+                "7": [{"id": 42, "name": "Job Costing Summary"}],
+                "8": [{"id": 43, "name": "job  costing  summary"}],
+            },
+        )
+        with pytest.raises(JobCostingReportAmbiguousError) as excinfo:
+            find_job_costing_summary(client)
+        message = str(excinfo.value)
+        assert "category 7/report 42" in message
+        assert "category 8/report 43" in message
+        assert "'job  costing  summary'" in message
+
     def test_every_refusal_is_one_catchable_family(self) -> None:
         assert issubclass(JobCostingReportNotFoundError, ReportUnavailableError)
         assert issubclass(JobCostingReportAmbiguousError, ReportUnavailableError)
@@ -323,3 +338,110 @@ class TestTheDataPostIsTreatedAsAReadByTheRetryGate:
 
         assert rows == [{"JobNumber": "J1"}]
         assert route.call_count == 2
+
+
+class TestNotFoundDiagnostics:
+    """A failed lookup has to say what it DID see.
+
+    `reporting.jobCosts` failed on a live tenant with nothing but "no built-in
+    report named 'Job Costing Summary' is visible to this tenant", which cannot
+    distinguish "the scope is not really granted" from "it is named differently
+    here" from "it genuinely is not there". These pin the evidence that settles
+    that in one run.
+    """
+
+    def test_the_refusal_names_the_category_and_report_counts(self) -> None:
+        client = _client(
+            [{"id": 7, "name": "Accounting"}, {"id": 8, "name": "Operations"}],
+            {
+                "7": [{"id": 1, "name": "Invoice Aging"}, {"id": 2, "name": "Payroll Summary"}],
+                "8": [{"id": 3, "name": "Technician Scorecard"}],
+            },
+        )
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+        message = str(excinfo.value)
+        assert "2 categories" in message
+        assert "3 reports" in message
+        assert "Invoice Aging" in message
+        assert "Technician Scorecard" in message
+
+    def test_successful_enumeration_does_not_blame_the_permission(self) -> None:
+        client = _client([{"id": 7}], {"7": [{"id": 1, "name": "Invoice Aging"}]})
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+        message = str(excinfo.value)
+        # The permission evidently works — saying "grant it" would send the
+        # contractor down the wrong path a second time.
+        assert "Grant the Reporting permission" not in message
+        assert "permission is in place" in message
+
+    def test_zero_categories_is_its_own_distinct_message(self) -> None:
+        client = _client([], {})
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+        message = str(excinfo.value)
+        assert "0 report categories and 0 reports" in message
+        assert "Grant the Reporting permission" in message
+        assert "permission is in place" not in message
+
+    def test_categories_with_no_reports_is_also_distinct(self) -> None:
+        client = _client([{"id": 7}, {"id": 8}], {})
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+        message = str(excinfo.value)
+        assert "2 report categories" in message
+        assert "contained 0 reports" in message
+        assert "Grant the Reporting permission" in message
+
+    @pytest.mark.parametrize(
+        "near_miss",
+        ["Job Cost Summary", "Job Costing Summary (Detail)", "Job Costs", "Costing Summary"],
+    )
+    def test_a_near_miss_name_is_highlighted_separately(self, near_miss) -> None:
+        client = _client(
+            [{"id": 7}],
+            {"7": [{"id": 1, "name": "Invoice Aging"}, {"id": 2, "name": near_miss}]},
+        )
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+        message = str(excinfo.value)
+        similar, _, other = message.partition("Other report names seen")
+        assert "Similarly named reports seen" in similar
+        assert near_miss in similar
+        assert "Invoice Aging" in other
+
+    def test_the_sample_is_capped_so_a_big_tenant_cannot_flood_the_log(self) -> None:
+        reports = [{"id": n, "name": f"Report Number {n:04d}"} for n in range(500)]
+        client = _client([{"id": 7}], {"7": reports})
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+        message = str(excinfo.value)
+        assert "500 reports" in message
+        assert f"of {len(reports)}" in message
+        assert message.count("Report Number ") <= 18
+        assert len(message) < 2000
+
+    def test_one_absurdly_long_report_name_is_clipped(self) -> None:
+        client = _client([{"id": 7}], {"7": [{"id": 1, "name": "X" * 5000}]})
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+        assert len(str(excinfo.value)) < 1000
+
+    def test_the_custom_report_path_keeps_its_own_distinct_message(self) -> None:
+        client = _client(
+            [{"id": 7}],
+            {
+                "7": [
+                    {"id": 42, "name": "Job Costing Summary", "isCustom": True},
+                    {"id": 43, "name": "Invoice Aging"},
+                ]
+            },
+        )
+        with pytest.raises(JobCostingReportNotFoundError) as excinfo:
+            find_job_costing_summary(client)
+        message = str(excinfo.value)
+        assert "are custom reports, which are never used" in message
+        # ...and still carries the census.
+        assert "1 category" in message
+        assert "2 reports" in message
