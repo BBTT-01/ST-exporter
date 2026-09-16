@@ -292,8 +292,9 @@ def st_jpm_jobs_list(
     page_size: int = 50,
     max_results: int = _DEFAULT_MAX_RESULTS,
 ) -> dict[str, Any]:
-    """List jobs. Filter by status, customer_id, or date range. Optional `sort`,
-    e.g. `-completedOn` (newest first) or `+createdOn`."""
+    """List jobs. Filter by status, customer_id, or date range. Optional `sort` —
+    the endpoint accepts only Id, ModifiedOn, CreatedOn and Priority, so e.g.
+    `-Id` (newest first) or `+createdOn`; `-completedOn` is rejected with a 400."""
     params: dict[str, Any] = {}
     if status:
         params["jobStatus"] = status

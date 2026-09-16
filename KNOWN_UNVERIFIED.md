@@ -15,8 +15,15 @@ Paul's ServiceTitan environment (or any real tenant) is available, before trusti
 
 Assumed `invoicedOnOrAfter` on `accounting/v2/.../invoices` (Profit Wizard uses
 this exact spelling, so it is well-evidenced) and `completedOnOrAfter` on
-`jpm/v2/.../jobs` (inferred — Profit Wizard filters its own local `completed_date`
-column rather than ServiceTitan's parameter, so nothing confirms the API spelling).
+`jpm/v2/.../jobs`.
+
+**`completedOnOrAfter` is now CONFIRMED** (2026-09-16): the published
+`tenant-jpm-v2` OpenAPI description of `GET /tenant/{tenant}/jobs` carries both
+`completedOnOrAfter` and `completedBefore` — *"Return jobs that are completed
+after a certain date/time (in UTC)"*. The spelling the feed sends is the right
+one; the tripwire below stays as a standing check. `invoicedOnOrAfter` remains
+inferred.
+
 A wrong parameter name is the dangerous kind of wrong here: ServiceTitan ignores
 unknown query parameters rather than rejecting them, so the feed would quietly
 export the **entire** invoice or job history instead of the window. Check the
@@ -28,9 +35,19 @@ predates the window start (`warn_if_older_than_window`). It **only logs** — it
 deliberately does not filter the rows out locally, because doing so would hide
 the one symptom that proves the parameter name is wrong.
 
-`sort: "-completedOn"` on the job list is likewise inferred; if it is rejected or
-ignored, the `max_jobs` cap would truncate to an arbitrary set of jobs rather than
-the most recently completed ones.
+`sort: "-completedOn"` on the job list was inferred and was **WRONG** — RESOLVED
+2026-09-16. Run `35034278334` on `tr-pioneer-overhead-door` answered:
+
+```
+HTTP 400 {"errors":{"sort":["The value '-completedOn' is not valid for Sort."]}}
+```
+
+which cost the whole `payroll.timesheets` tab (the job list drives the per-job
+timesheet calls). The endpoint's own description names the closed list —
+*"Available fields are: Id, ModifiedOn, CreatedOn, Priority."* — so completion
+date is not sortable at all. The feed now sends `sort: "-Id"` (`JOB_SORT`), the
+stable proxy for "newest first"; the `max_jobs` cap therefore keeps the newest
+jobs in the window rather than the oldest.
 
 ## Financial feed: how ServiceTitan marks a report as custom
 

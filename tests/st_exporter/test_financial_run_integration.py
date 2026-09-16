@@ -111,6 +111,91 @@ def test_the_window_is_sent_to_servicetitan_not_applied_locally(
     assert route.calls.last.request.url.params["invoicedOnOrAfter"] == "2026-06-16T00:00:00Z"
 
 
+#: The fields `jpm/v2/.../jobs` will sort by, from its own published description:
+#: "Available fields are: Id, ModifiedOn, CreatedOn, Priority." Anything else is
+#: a 400 — `-completedOn` was, on a live tenant, and it cost the whole
+#: `payroll.timesheets` tab because the job list is what drives the per-job
+#: timesheet calls.
+_SORTABLE_JOB_FIELDS = {"id", "modifiedon", "createdon", "priority"}
+
+
+def _servicetitan_job_list(request: httpx.Request) -> httpx.Response:
+    """The real endpoint's `sort` validation, transcribed from the live 400."""
+    sort = request.url.params.get("sort")
+    if sort is not None and sort.lstrip("+-").lower() not in _SORTABLE_JOB_FIELDS:
+        return httpx.Response(
+            400,
+            json={
+                "errors": {"sort": [f"The value '{sort}' is not valid for Sort."]},
+                "title": "One or more validation errors occurred.",
+                "status": 400,
+            },
+        )
+    return httpx.Response(
+        200,
+        json={"data": tenant_financial.COMPLETED_JOBS, "hasMore": False, "totalCount": 2},
+    )
+
+
+@respx.mock
+def test_the_job_list_sort_is_one_servicetitan_accepts(st_settings, exporter_settings) -> None:
+    """Regression for run 35034278334 on `tr-pioneer-overhead-door` (0.2.11).
+
+    The exporter sent `sort=-completedOn` and ServiceTitan answered
+    `400 {"errors":{"sort":["The value '-completedOn' is not valid for Sort."]}}`,
+    so `payroll.timesheets` was skipped on every run. Here the fixture endpoint
+    validates `sort` exactly as the live one does: the old value fails this
+    test, the new one writes the tab.
+    """
+    mock_auth_token(st_settings.auth_url)
+    tenant_financial.register(st_settings.api_base)
+    route = respx.get(f"{st_settings.api_base}/jpm/v2/tenant/12345/jobs").mock(
+        side_effect=_servicetitan_job_list
+    )
+    export_store = InMemorySheetsStore()
+
+    summary = _run(st_settings, exporter_settings, export_store)
+
+    params = dict(route.calls.last.request.url.params)
+    print(f"\njpm/v2/tenant/12345/jobs request params: {params}")
+    assert params == {
+        "completedOnOrAfter": "2026-06-16T00:00:00Z",
+        "sort": "-Id",
+        "page": "1",
+        "pageSize": "200",
+    }
+    # Not rejected, and the tab is written from a real answer rather than skipped.
+    assert route.calls.last.response.status_code == 200
+    assert FINANCIAL_TIMESHEETS_TAB not in summary.financial_failures
+    assert summary.financial_row_counts[FINANCIAL_TIMESHEETS_TAB] == 3
+
+
+@respx.mock
+def test_the_400_sort_still_costs_only_its_own_tab(st_settings, exporter_settings) -> None:
+    """The deliberate failure behaviour the live run showed, pinned.
+
+    If the job list ever 400s again, the run must stay green, warn, skip only
+    `payroll.timesheets`, and let the other three tabs through — never write an
+    empty tab. This is the behaviour the fix preserves, not replaces.
+    """
+    mock_auth_token(st_settings.auth_url)
+    tenant_financial.register(st_settings.api_base)
+    respx.get(f"{st_settings.api_base}/jpm/v2/tenant/12345/jobs").mock(
+        return_value=httpx.Response(
+            400, json={"errors": {"sort": ["The value '-completedOn' is not valid for Sort."]}}
+        )
+    )
+    export_store = InMemorySheetsStore()
+
+    summary = _run(st_settings, exporter_settings, export_store)
+
+    assert FINANCIAL_TIMESHEETS_TAB in summary.financial_failures
+    assert FINANCIAL_TIMESHEETS_TAB not in summary.financial_row_counts
+    assert FINANCIAL_TIMESHEETS_TAB not in export_store.tabs
+    assert export_store.tabs[FINANCIAL_BUSINESS_UNITS_TAB][0] == list(BUSINESS_UNIT_COLUMNS)
+    assert export_store.tabs[FINANCIAL_JOB_COSTS_TAB][0] == list(JOB_COST_COLUMNS)
+
+
 @respx.mock
 def test_the_report_is_run_with_profit_wizards_own_parameters(
     st_settings, exporter_settings

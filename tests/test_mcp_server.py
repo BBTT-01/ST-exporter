@@ -263,8 +263,10 @@ class TestJPMTools:
         from st_cli.mcp_server import st_jpm_jobs_list
 
         mock_client.get.return_value = make_envelope([{"id": 1}])
-        st_jpm_jobs_list(mock_ctx, sort="-completedOn")
-        assert mock_client.get.call_args[1]["params"]["sort"] == "-completedOn"
+        # `-Id`, not `-completedOn`: jpm/jobs sorts only by Id, ModifiedOn,
+        # CreatedOn or Priority and 400s on anything else.
+        st_jpm_jobs_list(mock_ctx, sort="-Id")
+        assert mock_client.get.call_args[1]["params"]["sort"] == "-Id"
 
     def test_jobs_get(self, mock_ctx, mock_client):
         from st_cli.mcp_server import st_jpm_jobs_get
