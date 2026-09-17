@@ -10,16 +10,29 @@ see the plan's "raw-cache placement" decision for why those live separately.
 from __future__ import annotations
 
 import json
-from typing import Any, Protocol, cast
+import time
+from typing import Any, Callable, Protocol, cast
 
 import gspread
 from gspread.utils import rowcol_to_a1
 
 from st_cli.exceptions import ConfigError
+from st_exporter.logging_setup import logger
 
 _SPREADSHEET_SCOPES = ("https://www.googleapis.com/auth/spreadsheets",)
 _NEW_WORKSHEET_ROWS = 1
 _NEW_WORKSHEET_COLS = 1
+
+#: Google answers these for reasons that have nothing to do with the request —
+#: `500 Internal error encountered` on a large ``batchUpdate`` (Pro Garage Doors,
+#: run 35248585567, a 9917-row services tab), 502/503 during an incident, 429 when
+#: the per-minute write quota is momentarily spent. Google's own guidance for all
+#: four is "back off and retry". Anything else — 400 for a malformed range, 403 for
+#: a Sheet the writer cannot edit, 404 for a spreadsheet id that is wrong — is the
+#: request's fault and retrying it would only repeat the same answer four times.
+_TRANSIENT_SHEETS_CODES = frozenset({429, 500, 502, 503})
+_SHEETS_WRITE_ATTEMPTS = 4
+_SHEETS_BACKOFF_BASE_SECONDS = 2.0
 
 
 def get_gspread_client(raw_service_account_json: str) -> gspread.Client:
@@ -49,8 +62,9 @@ class SheetsPort(Protocol):
 class SheetsClient:
     """Wraps one Google Spreadsheet: read a tab as a grid, or fully replace one."""
 
-    def __init__(self, spreadsheet: Any) -> None:
+    def __init__(self, spreadsheet: Any, *, sleep: Callable[[float], None] = time.sleep) -> None:
         self._spreadsheet = spreadsheet
+        self._sleep = sleep
 
     @classmethod
     def open(cls, client: gspread.Client, sheet_id: str) -> "SheetsClient":
@@ -90,7 +104,10 @@ class SheetsClient:
         max_col_count = max(old_col_count, new_col_count)
 
         if old_row_count < new_row_count or old_col_count < new_col_count:
-            worksheet.resize(rows=max_row_count, cols=max_col_count)
+            self._retry_transient(
+                lambda: worksheet.resize(rows=max_row_count, cols=max_col_count),
+                what=f"resize {tab_name} to {max_row_count}x{max_col_count}",
+            )
 
         updates: list[dict[str, Any]] = [
             {
@@ -117,7 +134,39 @@ class SheetsClient:
             end_a1 = rowcol_to_a1(new_row_count, max_col_count)
             updates.append({"range": f"{start_a1}:{end_a1}", "values": blank_grid})
 
-        worksheet.batch_update(updates, raw=True)
+        cells = sum(len(row) for row in grid)
+        self._retry_transient(
+            lambda: worksheet.batch_update(updates, raw=True),
+            what=f"write {tab_name} ({new_row_count} rows x {new_col_count} cols, {cells} cells)",
+        )
+
+    def _retry_transient(self, op: Callable[[], Any], *, what: str) -> Any:
+        """Run one Sheets call, retrying only Google's transient answers.
+
+        The single-call full replace is kept: this retries the SAME ``batchUpdate``,
+        it does not split it, so a reader still never sees a half-written tab. The
+        grid's size is in the message on purpose — if a tab starts failing on every
+        attempt, the first question is whether it is a transient or a size problem,
+        and the run log should be able to answer it.
+        """
+        for attempt in range(1, _SHEETS_WRITE_ATTEMPTS + 1):
+            try:
+                return op()
+            except gspread.exceptions.APIError as exc:
+                code = _sheets_status(exc)
+                if code not in _TRANSIENT_SHEETS_CODES or attempt == _SHEETS_WRITE_ATTEMPTS:
+                    raise
+                wait = _SHEETS_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    "Google Sheets answered %s on %s — retrying in %.0fs (attempt %d of %d)",
+                    code,
+                    what,
+                    wait,
+                    attempt,
+                    _SHEETS_WRITE_ATTEMPTS,
+                )
+                self._sleep(wait)
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _get_or_create_worksheet(self, tab_name: str, rows: int, cols: int) -> Any:
         try:
@@ -128,6 +177,20 @@ class SheetsClient:
                 rows=max(rows, _NEW_WORKSHEET_ROWS),
                 cols=max(cols, _NEW_WORKSHEET_COLS),
             )
+
+
+def _sheets_status(exc: gspread.exceptions.APIError) -> int:
+    """The HTTP status behind a gspread ``APIError``.
+
+    gspread reads ``code`` out of the JSON error body and falls back to ``-1`` when
+    the body is not JSON — which is exactly what a 502/503 from a Google front end
+    looks like — so the response's own status code is preferred when it is there.
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return status
+    return int(getattr(exc, "code", -1))
 
 
 class InMemorySheetsStore:
