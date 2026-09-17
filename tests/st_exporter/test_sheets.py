@@ -31,6 +31,7 @@ def _fake_private_key_pem() -> str:
 @pytest.fixture()
 def worksheet():
     ws = MagicMock()
+    ws.title = "jobs"
     ws.row_count = 1
     ws.col_count = 1
     return ws
@@ -40,6 +41,9 @@ def worksheet():
 def spreadsheet(worksheet):
     ss = MagicMock()
     ss.worksheet.return_value = worksheet
+    # No OTHER tabs by default — most tests care only about the tab under
+    # test's own size against the cap, not about sibling tabs' contribution.
+    ss.worksheets.return_value = [worksheet]
     return ss
 
 
@@ -264,3 +268,181 @@ class TestReplaceGridRetriesTransientGoogleErrors:
         import time
 
         assert SheetsClient(spreadsheet)._sleep is time.sleep
+
+
+def _wide_grid(rows: int, cols: int) -> list[list[str]]:
+    header = [f"c{i}" for i in range(cols)]
+    return [header] + [[f"r{r}c{c}" for c in range(cols)] for r in range(rows - 1)]
+
+
+class TestReplaceGridChunksLargeWrites:
+    """Run 35260724032: pw-pro-garage-doors' `pricebook.services` tab is 99,179
+    rows x 42 cols = 4,165,518 cells. Google answered a 500 on the single
+    `batchUpdate` carrying all of it, then, once retried, `APIError: [400]:
+    Unable to parse range` — the request was too large for Google to service in
+    one call. Above `_MAX_CELLS_PER_WRITE`, the write is split into row-chunks
+    instead, each its own retried `batchUpdate`."""
+
+    def _client(self, spreadsheet) -> tuple[SheetsClient, list[float]]:
+        waits: list[float] = []
+        return SheetsClient(spreadsheet, sleep=waits.append), waits
+
+    def test_a_grid_under_the_cell_threshold_is_still_one_call(
+        self, spreadsheet, worksheet
+    ) -> None:
+        worksheet.row_count = 10
+        worksheet.col_count = 10
+        client, _ = self._client(spreadsheet)
+
+        client.replace_grid("jobs", _wide_grid(rows=100, cols=10))
+
+        worksheet.batch_update.assert_called_once()
+
+    def test_a_grid_over_the_cell_threshold_is_split_into_row_chunks(
+        self, spreadsheet, worksheet
+    ) -> None:
+        # 42 cols x ~5000 rows/chunk at the 200_000-cell budget: 12,000 rows
+        # forces 3 chunks (12000 / 4761 rounded => ceil(12000/4761)=3).
+        worksheet.row_count = 1
+        worksheet.col_count = 1
+        client, _ = self._client(spreadsheet)
+        grid = _wide_grid(rows=12_000, cols=42)
+
+        client.replace_grid("pricebook.services", grid)
+
+        assert worksheet.batch_update.call_count > 1
+        for (call_updates,), kwargs in worksheet.batch_update.call_args_list:
+            assert kwargs == {"raw": True}
+            assert len(call_updates) == 1  # one range per call while chunking
+            update = call_updates[0]
+            cells = len(update["values"]) * (len(update["values"][0]) if update["values"] else 0)
+            assert cells <= 200_000
+
+    def test_chunks_cover_every_row_exactly_once_and_in_order(self, spreadsheet, worksheet) -> None:
+        worksheet.row_count = 1
+        worksheet.col_count = 1
+        client, _ = self._client(spreadsheet)
+        grid = _wide_grid(rows=12_000, cols=42)
+
+        client.replace_grid("pricebook.services", grid)
+
+        reassembled: list[list[str]] = []
+        for (call_updates,), _ in worksheet.batch_update.call_args_list:
+            reassembled.extend(call_updates[0]["values"])
+        assert reassembled == grid
+
+    def test_resize_still_happens_exactly_once_before_the_chunked_writes(
+        self, spreadsheet, worksheet
+    ) -> None:
+        worksheet.row_count = 1
+        worksheet.col_count = 1
+        client, _ = self._client(spreadsheet)
+        grid = _wide_grid(rows=12_000, cols=42)
+
+        client.replace_grid("pricebook.services", grid)
+
+        worksheet.resize.assert_called_once_with(rows=12_000, cols=42)
+        assert worksheet.batch_update.call_count > 1
+
+    def test_a_500_on_one_chunk_is_retried_and_that_chunk_then_succeeds(
+        self, spreadsheet, worksheet
+    ) -> None:
+        worksheet.row_count = 1
+        worksheet.col_count = 1
+        # 3 chunks total; chunk 2 fails once transiently then succeeds:
+        # chunk1 (1 call) + chunk2 (fail, retry succeeds: 2 calls) + chunk3 (1 call).
+        worksheet.batch_update.side_effect = [None, _api_error(500), None, None]
+        client, waits = self._client(spreadsheet)
+        grid = _wide_grid(rows=12_000, cols=42)
+
+        client.replace_grid("pricebook.services", grid)
+
+        assert worksheet.batch_update.call_count == 4
+        assert waits == [2.0]
+
+    def test_a_chunk_failing_past_retries_raises_and_stops_further_chunks(
+        self, spreadsheet, worksheet
+    ) -> None:
+        worksheet.row_count = 1
+        worksheet.col_count = 1
+        worksheet.batch_update.side_effect = [None] + [_api_error(500)] * 4
+        client, _ = self._client(spreadsheet)
+        grid = _wide_grid(rows=12_000, cols=42)
+
+        with pytest.raises(gspread.exceptions.APIError):
+            client.replace_grid("pricebook.services", grid)
+
+        # First chunk wrote; the second exhausted its retries and stopped the
+        # run — a later, third chunk is never attempted.
+        assert worksheet.batch_update.call_count == 1 + 4
+
+
+class TestReplaceGridEnforcesTheSpreadsheetCap:
+    """Google Sheets caps a whole SPREADSHEET at 10,000,000 cells, shared across
+    every tab. Writing a tab that would push the spreadsheet over that cap must
+    fail with a clear, named error rather than a resize/write producing gspread's
+    opaque "Unable to parse range"."""
+
+    def test_a_write_that_would_exceed_the_cap_raises_a_named_error(
+        self, spreadsheet, worksheet
+    ) -> None:
+        from st_cli.exceptions import SheetsCapacityError
+
+        other = MagicMock()
+        other.title = "pricebook.equipment"
+        other.row_count = 9_900_000
+        other.col_count = 1
+        spreadsheet.worksheets.return_value = [worksheet, other]
+        client = SheetsClient(spreadsheet)
+
+        with pytest.raises(SheetsCapacityError) as exc_info:
+            client.replace_grid("pricebook.services", _wide_grid(rows=99_179, cols=42))
+
+        message = str(exc_info.value)
+        assert "pricebook.services" in message
+        assert "99179" in message or "99,179" in message
+        assert "42" in message
+        assert "10,000,000" in message or "10000000" in message
+
+    def test_the_cap_check_happens_before_any_write(self, spreadsheet, worksheet) -> None:
+        from st_cli.exceptions import SheetsCapacityError
+
+        other = MagicMock()
+        other.title = "pricebook.equipment"
+        other.row_count = 9_900_000
+        other.col_count = 1
+        spreadsheet.worksheets.return_value = [worksheet, other]
+        client = SheetsClient(spreadsheet)
+
+        with pytest.raises(SheetsCapacityError):
+            client.replace_grid("pricebook.services", _wide_grid(rows=99_179, cols=42))
+
+        worksheet.resize.assert_not_called()
+        worksheet.batch_update.assert_not_called()
+
+    def test_a_write_that_fits_within_the_cap_is_not_refused(self, spreadsheet, worksheet) -> None:
+        other = MagicMock()
+        other.title = "pricebook.equipment"
+        other.row_count = 100
+        other.col_count = 42
+        spreadsheet.worksheets.return_value = [worksheet, other]
+        client = SheetsClient(spreadsheet)
+
+        client.replace_grid("jobs", [["h1"], ["a"]])  # does not raise
+
+    def test_this_tabs_own_previous_size_is_excluded_from_the_projection(
+        self, spreadsheet, worksheet
+    ) -> None:
+        # The tab being rewritten already holds a huge chunk of the cap under
+        # its OLD size; that size is going away, so it must not be counted
+        # twice (old + new) when judging whether the NEW size fits. Exercised
+        # directly against the cap check (not the full `replace_grid`) so the
+        # test isn't also building a ~10M-cell blank-region grid in memory.
+        huge_self = MagicMock()
+        huge_self.title = "pricebook.services"
+        huge_self.row_count = 9_999_000
+        huge_self.col_count = 1
+        spreadsheet.worksheets.return_value = [huge_self]
+        client = SheetsClient(spreadsheet)
+
+        client._check_spreadsheet_capacity("pricebook.services", 2, 1)  # does not raise
