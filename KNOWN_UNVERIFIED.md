@@ -938,33 +938,44 @@ TrueQuote ever moves the transform to *before* the enqueue, this exporter would
 double-transform and every booking would lose its contacts. That is the one
 change on their side that would silently break this lane.
 
-## Profit Wizard's items: three of the four still cannot be performed
+## Profit Wizard's items: three of the four are now performed; `update_job` is not
 
-`src/st_exporter/outbox/profitwizard.py`, `perform_profitwizard_item`
+`src/st_exporter/outbox/profitwizard.py`, `src/st_exporter/outbox/profitwizard_writes.py`
 
 The lane is real and drained: claim, ledger, report, isolation and the
-`matched: false` handling are all exercised. Three of the four ServiceTitan
-**writes** its items carry — `push_estimate`, `update_job`, `push_prices` —
-belong to ticket 15, which is blocked by this ticket, so their request bodies
-are not knowable here. Each is raised as a named `UnsupportedOutboxKindError`
-that says which write is missing and which ticket owns it, and is reported
-`failed`.
+`matched: false` handling are all exercised. `update_job` has no Profit Wizard
+producer at all yet (`lib/outbox/types.ts` names the kind but nothing enqueues
+it), so it still raises a named `UnsupportedOutboxKindError` and is reported
+`failed` — that message now says explicitly that no producer exists yet,
+rather than pointing at a ticket.
 
-`assign_technician` is implemented (`_perform_assign_technician`): resolve the
-job's appointment (`jpm` appointments-list), read its active assignments
-(`dispatch` appointment-assignments), and POST `assign-technicians` /
-`unassign-technicians` for the authorized diff — copied from Profit Wizard's
-own `setAppointmentTechnicianSet` (`lib/crm/servicetitan.ts`). One caveat
-carries over from that source: the `unassign-technicians` body shape was never
-confirmed against a live ServiceTitan tenant (their own TODO says ServiceTitan's
-developer-portal page for it renders client-side); `assign-technicians` IS
-confirmed live.
+`assign_technician`, `push_prices` and `push_estimate` are all implemented,
+each copied from Profit Wizard's own direct-CRM client
+(`lib/crm/servicetitan.ts`) so a Hosted company and a Direct one land on the
+same ServiceTitan state for the same decision:
 
-The queue is empty by construction until ticket 15 also builds the enqueue side
-for the remaining three, so nothing burns attempts today on those — but **do
-not set `PROFITWIZARD_*` on a contractor whose Profit Wizard is already
-enqueueing** `push_estimate`, `update_job` or `push_prices` items until those
-three performers exist.
+* `assign_technician` (`_perform_assign_technician`, in `profitwizard.py`):
+  resolve the job's appointment (`jpm` appointments-list), read its active
+  assignments (`dispatch` appointment-assignments), and POST
+  `assign-technicians` / `unassign-technicians` for the authorized diff —
+  copied from `setAppointmentTechnicianSet`. One caveat carries over from that
+  source: the `unassign-technicians` body shape was never confirmed against a
+  live ServiceTitan tenant (their own TODO says ServiceTitan's developer-portal
+  page for it renders client-side); `assign-technicians` IS confirmed live.
+* `push_prices` (`perform_push_prices`, in `profitwizard_writes.py`): PATCH
+  `pricebook/.../services/{id}` (for a `svc_`-prefixed `crm_item_id`, prefix
+  stripped) or `pricebook/.../materials/{id}` otherwise, body
+  `{"price": new_price}` — copied from `pushPrices`. No equipment branch
+  exists on PW's own direct client either.
+* `push_estimate` (`perform_push_estimate`, in `profitwizard_writes.py`): POST
+  `sales/v2/tenant/{id}/estimates` with `{jobId, name, items}` — copied from
+  `pushEstimate`. Unlike the other two, this is a plain create with no
+  idempotent semantics on ServiceTitan's side, and the created estimate's id is
+  assumed to come back under `id` (unverified against a live tenant).
+
+**Do not set `PROFITWIZARD_*` on a contractor whose Profit Wizard is already
+enqueueing `update_job` items** until that performer exists — the other three
+kinds are safe to drain today, modulo the two `unverified` items above.
 
 Also unverified: Profit Wizard's **claim response field names**. The client reads
 several spellings for each field (`item_id`/`itemId`/`id`, `payload`/`body`/`data`,

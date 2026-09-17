@@ -59,6 +59,36 @@ See `KNOWN_UNVERIFIED.md` for the full writeup and the suggested next step (a
 per-delta list-endpoint lookup). Neither column is added to `ALL_BLANK_OK` —
 the blank-column detector firing on them is correct, not noise.
 
+### Added: two more of the four ServiceTitan writes ticket 15 owns
+
+`push_prices` and `push_estimate` are now performed for real (in the new
+`profitwizard_writes.py`), leaving only `update_job` unbuilt — and `update_job`
+now raises a message that says why: Profit Wizard has no producer for it yet
+(`lib/outbox/types.ts` names the kind but nothing enqueues it), rather than the
+old generic "ticket 15 owns the write bodies" text that no longer fits once two
+of the three graduated.
+
+`push_prices` mirrors `ServiceTitanClient.pushPrices` (`lib/crm/servicetitan.ts`):
+a `crm_item_id` prefixed `svc_` PATCHes `pricebook/v2/tenant/{id}/services/{id}`
+(prefix stripped); anything else PATCHes `.../materials/{id}`, both with body
+`{"price": new_price}`. There is no equipment branch on PW's own direct client,
+so there is none here — PATCH is naturally idempotent, and the returned `st_id`
+is the pricebook item's own id.
+
+`push_estimate` mirrors `pushEstimate`: POST `sales/v2/tenant/{id}/estimates`
+with `{jobId, name, items}` — PW's own enqueue (`push-estimate/route.ts`)
+already ships `items` in ServiceTitan's exact per-line shape
+(`skuId`/`description`/`quantity`/`price`/`total`), so only the top-level
+`crmJobId` → `jobId` rename happens here. Estimate creation is a plain POST, so
+a redelivered item is NOT deduplicated on ServiceTitan's side — unlike
+`push_prices`, this one is not idempotent at the API layer.
+
+**Unverified against a live ServiceTitan tenant:** both writes are built from
+Profit Wizard's own direct-CRM client and this repo's registry, not from a real
+call. `push_estimate`'s response is assumed to carry the created estimate's id
+under `id` (the same assumption `salestech.estimates` list/get responses make
+elsewhere in this repo).
+
 ## [Unreleased] · `mypy src/` passes, and CI now runs it
 
 ### Fixed: 91 strict-mode findings, none of them a behaviour change
