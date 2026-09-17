@@ -705,6 +705,33 @@ the other five, and a 404/400 from it is announced and falls back to the
 per-customer route for that run. Flipping it on once is how the question gets
 answered.
 
+### Added: Profit Wizard's `assign_technician` outbox write is implemented
+
+One of the four ServiceTitan writes ticket 15 owns — the other three
+(`push_estimate`, `update_job`, `push_prices`) still raise
+`UnsupportedOutboxKindError` and remain that ticket's to build.
+`perform_profitwizard_item` now resolves the job's target appointment (`jpm`
+appointments-list, filtered by `jobId`), reads its current active technician
+assignments (`dispatch` appointment-assignments, filtered by
+`appointmentId`), and applies the intended crew via `dispatch`
+appointment-assignments `assign-technicians` / `unassign-technicians` — the
+same endpoints, body shapes and appointment-selection rule Profit Wizard's own
+direct-CRM client (`setAppointmentTechnicianSet` in `lib/crm/servicetitan.ts`)
+uses, so a Hosted company and a Direct one land on the same ServiceTitan state
+for the same dispatch decision.
+
+Unassignment is authorized, never inferred: a currently-assigned technician is
+only ever removed when the item's `authorizedRemovalCrmIds` explicitly names
+them. A technician a dispatcher added directly in ServiceTitan that Profit
+Wizard simply hasn't synced yet is left alone. An intended-and-current set
+that already matches makes no ServiceTitan write at all.
+
+**Unverified:** the `unassign-technicians` request body (`{jobAppointmentId,
+technicianIds}`) is carried over from Profit Wizard's own client, which itself
+flags it as unconfirmed against a live ServiceTitan tenant (ServiceTitan's
+developer-portal page for it renders client-side). `assign-technicians` uses
+the identical shape and IS confirmed live.
+
 ## [0.2.10] — 2026-09-15 · A feed that fails is a run that fails
 
 Three changes, all about the same thing: a feed that did not export must not end
