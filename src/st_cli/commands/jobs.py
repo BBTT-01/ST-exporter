@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 
@@ -67,7 +67,7 @@ def jobs_list(
     """List jobs."""
     client = ctx.obj["client"]
     as_json = ctx.obj["json"]
-    params: dict = {}
+    params: dict[str, Any] = {}
     if status:
         params["jobStatus"] = status
     if customer_id:
@@ -138,7 +138,7 @@ def appointments_list(
 ) -> None:
     """List appointments."""
     client = ctx.obj["client"]
-    params: dict = {}
+    params: dict[str, Any] = {}
     if job_id:
         params["jobId"] = job_id
     envelope = fetch_page(client, MODULE, "appointments", params, page=page, page_size=page_size)

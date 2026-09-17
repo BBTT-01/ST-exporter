@@ -4,6 +4,21 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · `mypy src/` passes, and CI now runs it
+
+### Fixed: 91 strict-mode findings, none of them a behaviour change
+
+`pyproject.toml` has said `strict = true` since the start and nothing ran mypy in
+CI, so the count only ever grew: 41 tools in `mcp_server.py` were "untyped"
+because the `_handle_errors` decorator they all wear had no annotations (it now
+carries a `ParamSpec`, so each tool keeps its exact signature for FastMCP's
+schema introspection); 24 functions promised `dict[str, Any]` while returning the
+client's `Any` (now an explicit `cast` at each call site — the client keeps
+returning `Any`, because it hands back whatever JSON ServiceTitan sent and
+`feeds/reporting.py` checks the shape); 21 bare `dict` annotations are now
+`dict[str, Any]`; two stale `# type: ignore`s are gone; three functions gained
+annotations. No runtime path changed. `mypy src/` is a CI step from here on.
+
 ## [Unreleased] · Profit Wizard hosted parity: callback flags, sold estimates
 
 ### Added: 6 columns on `jobs`, 7 on `technicians`, and a new `sales.estimates` tab

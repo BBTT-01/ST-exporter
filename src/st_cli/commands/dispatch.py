@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 
@@ -63,7 +63,7 @@ def shifts_list(
     """List technician shifts."""
     client = ctx.obj["client"]
     as_json = ctx.obj["json"]
-    params: dict = {}
+    params: dict[str, Any] = {}
     apply_date_params(
         params,
         range_val,
@@ -102,7 +102,7 @@ def assignments_list(
     """List appointment assignments (technician → appointment mapping)."""
     client = ctx.obj["client"]
     as_json = ctx.obj["json"]
-    params: dict = {}
+    params: dict[str, Any] = {}
     if technician_id:
         params["technicianId"] = technician_id
     if all_pages:
@@ -156,7 +156,7 @@ def who_busy(
     as_json = ctx.obj["json"]
 
     # Both shifts and appointments use the same startsOnOrAfter/startsBefore keys
-    date_params: dict = {}
+    date_params: dict[str, Any] = {}
     apply_date_params(
         date_params,
         range_val,
@@ -232,7 +232,7 @@ def zones_list(
     """List dispatch zones."""
     client = ctx.obj["client"]
     as_json = ctx.obj["json"]
-    params: dict = {}
+    params: dict[str, Any] = {}
     if active is not None:
         params["active"] = active
     if all_pages:
@@ -270,7 +270,7 @@ def teams_list(
     """List dispatch teams."""
     client = ctx.obj["client"]
     as_json = ctx.obj["json"]
-    params: dict = {}
+    params: dict[str, Any] = {}
     if active is not None:
         params["active"] = active
     if all_pages:
@@ -338,7 +338,7 @@ def capacity(
     client = ctx.obj["client"]
     as_json = ctx.obj["json"] or json_output
 
-    date_params: dict = {}
+    date_params: dict[str, Any] = {}
     apply_date_params(
         date_params,
         range_val,
@@ -349,7 +349,7 @@ def capacity(
     )
     validate_max_range(date_params, "startsOnOrAfter", "endsOnOrBefore", _CAPACITY_MAX_DAYS)
 
-    body: dict = {
+    body: dict[str, Any] = {
         **date_params,
         "skillBasedAvailability": skill_based,
     }

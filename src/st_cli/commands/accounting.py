@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 
@@ -51,7 +51,7 @@ def invoices_list(
     """List invoices."""
     client = ctx.obj["client"]
     as_json = ctx.obj["json"]
-    params: dict = {}
+    params: dict[str, Any] = {}
     if status:
         params["status"] = status
     apply_date_params(params, range_val, from_date, to_date)
@@ -97,7 +97,7 @@ def payments_list(
     """List payments."""
     client = ctx.obj["client"]
     as_json = ctx.obj["json"]
-    params: dict = {}
+    params: dict[str, Any] = {}
     apply_date_params(params, range_val, from_date, to_date)
 
     if all_pages:

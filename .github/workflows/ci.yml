@@ -94,3 +94,9 @@ jobs:
           # code" under which that half deserves less scrutiny.
           ruff check src/ tests/
           ruff format --check src/ tests/
+
+      - name: Type check
+        # `mypy src/` was strict on paper and 91 errors in practice, and nothing
+        # ran it, so the count only ever grew. It is clean now; this step is what
+        # keeps it clean.
+        run: mypy src/

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 
@@ -75,7 +75,7 @@ def customers_list(
     """List customers."""
     client = ctx.obj["client"]
     as_json = ctx.obj["json"]
-    params: dict = {}
+    params: dict[str, Any] = {}
     if name:
         params["name"] = name
     if email:
@@ -115,7 +115,7 @@ def customers_create(
 ) -> None:
     """Create a new customer."""
     client = ctx.obj["client"]
-    body: dict = {"name": name}
+    body: dict[str, Any] = {"name": name}
     if data:
         body.update(json.loads(data))
     result = client.post(MODULE, "customers", json_body=body)
@@ -131,7 +131,7 @@ def customers_update(
 ) -> None:
     """Update an existing customer."""
     client = ctx.obj["client"]
-    body: dict = {}
+    body: dict[str, Any] = {}
     if name:
         body["name"] = name
     if data:

@@ -10,7 +10,7 @@ signature construction is involved.
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 import typer
 from fastmcp import Context
@@ -400,7 +400,7 @@ def _make_get_tool(module: str, resource: Resource, deps: McpDeps) -> Callable[.
     label = _title(resource)
 
     def _tool(ctx: Context, record_id: int) -> dict[str, Any]:
-        return deps.get_client(ctx).get(module, f"{path}/{record_id}")
+        return cast(dict[str, Any], deps.get_client(ctx).get(module, f"{path}/{record_id}"))
 
     _tool.__doc__ = f"Get a single {label.lower()} by ID."
     return _tool
@@ -411,7 +411,7 @@ def _make_create_tool(module: str, resource: Resource, deps: McpDeps) -> Callabl
     label = _title(resource)
 
     def _tool(ctx: Context, data: dict[str, Any]) -> dict[str, Any]:
-        return deps.get_client(ctx).post(module, path, json_body=data)
+        return cast(dict[str, Any], deps.get_client(ctx).post(module, path, json_body=data))
 
     _tool.__doc__ = f"Create a {label.lower()}."
     return _tool
@@ -426,7 +426,10 @@ def _make_write_tool(
     word = "Update" if verb == "PATCH" else "Replace"
 
     def _tool(ctx: Context, record_id: int, data: dict[str, Any]) -> dict[str, Any]:
-        return getattr(deps.get_client(ctx), method)(module, f"{path}/{record_id}", json_body=data)
+        client = deps.get_client(ctx)
+        return cast(
+            dict[str, Any], getattr(client, method)(module, f"{path}/{record_id}", json_body=data)
+        )
 
     _tool.__doc__ = f"{word} a {label.lower()}."
     return _tool
