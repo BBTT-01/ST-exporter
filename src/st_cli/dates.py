@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import re
 from datetime import date, timedelta
+from typing import Any
 
 from st_cli.exceptions import DateParseError
 
 
 def apply_date_params(
-    params: dict,
+    params: dict[str, Any],
     range_val: str | None,
     from_date: str | None,
     to_date: str | None,
@@ -147,7 +148,7 @@ def parse_date_range(value: str) -> tuple[date, date]:
 
 
 def validate_max_range(
-    params: dict,
+    params: dict[str, Any],
     start_key: str,
     end_key: str,
     max_days: int,

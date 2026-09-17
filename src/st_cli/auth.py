@@ -6,6 +6,7 @@ import json
 import time
 from pathlib import Path
 from threading import Lock
+from typing import Any
 
 import httpx
 
@@ -84,7 +85,7 @@ class TokenManager:
         self._token = data["access_token"]
         self._expires_at = time.time() + data["expires_in"]
         self._save_to_file()
-        return self._token  # type: ignore[return-value]
+        return self._token
 
     def _load_from_file(self) -> None:
         if not _CACHE_FILE.exists():
@@ -101,7 +102,7 @@ class TokenManager:
 
     def _save_to_file(self) -> None:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        raw: dict = {}
+        raw: dict[str, Any] = {}
         if _CACHE_FILE.exists():
             try:
                 raw = json.loads(_CACHE_FILE.read_text())

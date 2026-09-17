@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 
@@ -60,7 +60,7 @@ class _LazyClient:
             self._client = ServiceTitanClient(settings)
         return self._client
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> Any:
         return getattr(self._init(), name)
 
 

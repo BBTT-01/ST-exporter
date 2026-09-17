@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 
@@ -38,7 +38,7 @@ def business_units_list(
     """List business units."""
     client = ctx.obj["client"]
     as_json = ctx.obj["json"]
-    params: dict = {}
+    params: dict[str, Any] = {}
     if active is not None:
         params["active"] = active
     if all_pages:
