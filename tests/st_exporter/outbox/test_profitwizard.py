@@ -20,10 +20,11 @@ from st_cli.config import Settings
 from st_exporter.outbox.actions import UnsupportedOutboxKindError
 from st_exporter.outbox.client import OutboxItem
 from st_exporter.outbox.profitwizard import (
-    KINDS,
+    _UNIMPLEMENTED_KINDS,
     ProfitWizardOutboxClient,
     perform_profitwizard_item,
 )
+from tests.st_exporter.conftest import mock_auth_token
 
 BASE = "https://profitwizard.test/api/outbox"
 TOKEN = "pwm_servicetitan_outbox"
@@ -235,13 +236,17 @@ class TestReport:
 
 
 class TestPerform:
-    """The four writes belong to ticket 15, which is blocked by this ticket. The
-    LANE is real; the ServiceTitan request bodies are not knowable here yet."""
+    """Three of the four writes still belong to ticket 15, which is blocked by
+    this ticket. The LANE is real; their ServiceTitan request bodies are not
+    knowable here yet. `assign_technician` is implemented — see
+    `TestAssignTechnician` below."""
 
-    def test_each_known_kind_names_itself_and_its_ticket(self, st_settings: Settings) -> None:
+    def test_each_unimplemented_kind_names_itself_and_its_ticket(
+        self, st_settings: Settings
+    ) -> None:
         client = ServiceTitanClient(st_settings)
         try:
-            for kind in KINDS:
+            for kind in _UNIMPLEMENTED_KINDS:
                 with pytest.raises(UnsupportedOutboxKindError) as exc:
                     perform_profitwizard_item(client, _item(kind=kind))
                 assert kind in str(exc.value)
@@ -296,3 +301,222 @@ class TestClaimIdentityGuardMatchesTrueQuote:
             assert client.claim() == []
         finally:
             client.close()
+
+
+def _assign_item(**overrides) -> OutboxItem:
+    payload = {
+        "crmJobId": "9001",
+        "jobScheduledStart": None,
+        "technicianCrmIds": [],
+        "authorizedRemovalCrmIds": [],
+    }
+    payload.update(overrides.pop("payload", {}))
+    defaults = dict(
+        id="item-assign",
+        idempotency_key="assign_technician:9001",
+        kind="assign_technician",
+        payload=payload,
+    )
+    defaults.update(overrides)
+    return OutboxItem(**defaults)
+
+
+def _appointments_route(st_settings: Settings, records: list[dict]) -> respx.Route:
+    return respx.get(
+        f"{st_settings.api_base}/jpm/v2/tenant/{st_settings.tenant_id}/appointments"
+    ).mock(return_value=httpx.Response(200, json={"data": records, "hasMore": False}))
+
+
+def _assignments_route(st_settings: Settings, records: list[dict]) -> respx.Route:
+    return respx.get(
+        f"{st_settings.api_base}/dispatch/v2/tenant/{st_settings.tenant_id}/appointment-assignments"
+    ).mock(return_value=httpx.Response(200, json={"data": records, "hasMore": False}))
+
+
+def _assign_route(st_settings: Settings) -> respx.Route:
+    return respx.post(
+        f"{st_settings.api_base}/dispatch/v2/tenant/{st_settings.tenant_id}"
+        "/appointment-assignments/assign-technicians"
+    ).mock(return_value=httpx.Response(200, json={}))
+
+
+def _unassign_route(st_settings: Settings) -> respx.Route:
+    return respx.post(
+        f"{st_settings.api_base}/dispatch/v2/tenant/{st_settings.tenant_id}"
+        "/appointment-assignments/unassign-technicians"
+    ).mock(return_value=httpx.Response(200, json={}))
+
+
+def _assignment_row(appointment_id: int, technician_id: int, *, active: bool = True) -> dict:
+    return {
+        "id": technician_id * 100,
+        "technicianId": technician_id,
+        "appointmentId": appointment_id,
+        "active": active,
+        "status": "Active" if active else "Removed",
+    }
+
+
+class TestAssignTechnician:
+    """`assign_technician` mirrors PW's own direct-CRM write
+    (`setAppointmentTechnicianSet` in `lib/crm/servicetitan.ts`): resolve the
+    job's appointment, diff the intended crew against who's currently active,
+    and unassign ONLY ids the payload's `authorizedRemovalCrmIds` names."""
+
+    @respx.mock
+    def test_assign_only_when_nothing_needs_removing(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        _appointments_route(
+            st_settings, [{"id": 555, "start": "2026-01-01T10:00:00Z", "status": "Scheduled"}]
+        )
+        _assignments_route(st_settings, [])
+        assign_route = _assign_route(st_settings)
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            st_id = perform_profitwizard_item(
+                client,
+                _assign_item(
+                    payload={"technicianCrmIds": ["10", "20"], "authorizedRemovalCrmIds": []}
+                ),
+            )
+        finally:
+            client.close()
+
+        assert st_id == "555"
+        assert assign_route.called
+        body = json.loads(assign_route.calls.last.request.content)
+        assert body == {"jobAppointmentId": 555, "technicianIds": [10, 20]}
+
+    @respx.mock
+    def test_unassign_only_when_authorized_and_currently_assigned(
+        self, st_settings: Settings
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        _appointments_route(
+            st_settings, [{"id": 555, "start": "2026-01-01T10:00:00Z", "status": "Scheduled"}]
+        )
+        _assignments_route(st_settings, [_assignment_row(555, 30)])
+        unassign_route = _unassign_route(st_settings)
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            st_id = perform_profitwizard_item(
+                client,
+                _assign_item(payload={"technicianCrmIds": [], "authorizedRemovalCrmIds": ["30"]}),
+            )
+        finally:
+            client.close()
+
+        assert st_id == "555"
+        assert unassign_route.called
+        body = json.loads(unassign_route.calls.last.request.content)
+        assert body == {"jobAppointmentId": 555, "technicianIds": [30]}
+
+    @respx.mock
+    def test_mixed_assign_and_unassign(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        _appointments_route(
+            st_settings, [{"id": 555, "start": "2026-01-01T10:00:00Z", "status": "Scheduled"}]
+        )
+        _assignments_route(st_settings, [_assignment_row(555, 30), _assignment_row(555, 40)])
+        assign_route = _assign_route(st_settings)
+        unassign_route = _unassign_route(st_settings)
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            perform_profitwizard_item(
+                client,
+                _assign_item(
+                    payload={
+                        "technicianCrmIds": ["10"],
+                        "authorizedRemovalCrmIds": ["30"],
+                    }
+                ),
+            )
+        finally:
+            client.close()
+
+        assert json.loads(assign_route.calls.last.request.content) == {
+            "jobAppointmentId": 555,
+            "technicianIds": [10],
+        }
+        assert json.loads(unassign_route.calls.last.request.content) == {
+            "jobAppointmentId": 555,
+            "technicianIds": [30],
+        }
+        # Technician 40 is neither intended nor authorized for removal — never
+        # named in either call.
+        assert 40 not in json.loads(unassign_route.calls.last.request.content)["technicianIds"]
+
+    @respx.mock
+    def test_no_op_makes_no_servicetitan_write_call(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        _appointments_route(
+            st_settings, [{"id": 555, "start": "2026-01-01T10:00:00Z", "status": "Scheduled"}]
+        )
+        _assignments_route(st_settings, [_assignment_row(555, 10)])
+        # No assign/unassign routes registered at all: if the exporter posts to
+        # either, respx raises on the unmatched request and this test fails.
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            st_id = perform_profitwizard_item(
+                client,
+                _assign_item(payload={"technicianCrmIds": ["10"], "authorizedRemovalCrmIds": []}),
+            )
+        finally:
+            client.close()
+
+        assert st_id == "555"
+
+    @respx.mock
+    def test_no_eligible_appointment_raises_a_clear_error(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        _appointments_route(st_settings, [])
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(ValueError, match="no ServiceTitan appointment found for job 9001"):
+                perform_profitwizard_item(
+                    client,
+                    _assign_item(
+                        payload={"technicianCrmIds": ["10"], "authorizedRemovalCrmIds": []}
+                    ),
+                )
+        finally:
+            client.close()
+
+    @respx.mock
+    def test_an_unauthorized_currently_assigned_technician_is_never_removed(
+        self, st_settings: Settings
+    ) -> None:
+        """The safety-critical invariant: a technician who is currently
+        assigned, is NOT in the intended set, but was never named in
+        `authorizedRemovalCrmIds`, must stay assigned. No unassign route is
+        registered — a call to it fails the test."""
+        mock_auth_token(st_settings.auth_url)
+        _appointments_route(
+            st_settings, [{"id": 555, "start": "2026-01-01T10:00:00Z", "status": "Scheduled"}]
+        )
+        _assignments_route(st_settings, [_assignment_row(555, 10), _assignment_row(555, 99)])
+        assign_route = _assign_route(st_settings)
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            perform_profitwizard_item(
+                client,
+                _assign_item(
+                    payload={
+                        "technicianCrmIds": ["10", "20"],
+                        "authorizedRemovalCrmIds": [],
+                    }
+                ),
+            )
+        finally:
+            client.close()
+
+        assert json.loads(assign_route.calls.last.request.content) == {
+            "jobAppointmentId": 555,
+            "technicianIds": [20],
+        }
