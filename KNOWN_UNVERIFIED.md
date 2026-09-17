@@ -471,6 +471,62 @@ The contract describes `modified_on` only as "for drift debugging" without
 specifying which entity's timestamp it should reflect. This mapping is a
 reasonable guess, not a confirmed requirement.
 
+## Profit Wizard hosted-parity columns (jobs, technicians, sales.estimates)
+
+`src/st_exporter/denormalize.py`, `src/st_exporter/format.py`, `src/st_exporter/sales.py`,
+`src/st_exporter/feeds/sales.py`
+
+Six columns appended to `jobs`, seven appended to `technicians`, and a new
+`sales.estimates` tab — all read straight from `export-columns-spec.md`, built for
+Profit Wizard's hosted (Export Store) path to reach parity with its existing
+Direct ServiceTitan path. Each field's confidence is different:
+
+- **`jobs.recall_for_id`, `jobs.warranty_id`** — well evidenced, not guessed:
+  Profit Wizard's own Direct path already reads `job.recallForId` / `job.warrantyId` off this exact JPM job
+  object in production (`profitwizard/lib/crm/servicetitan.ts`), which is the
+  strongest evidence short of a recorded response. What is NOT confirmed is that
+  the **export change-feed** (`jpm/v2/.../export/jobs`, which is what actually
+  fills `_raw_jobs`) spells these identically to the object the Direct path's list
+  call returns — the same open question `completed_on`'s sibling PRs on this repo
+  already flag.
+- **`jobs.no_charge`, `jobs.total`, `jobs.business_unit_id`, `jobs.sold_by_id`** —
+  read from the spec's literal field names (`noCharge`, `total`, `businessUnitId`,
+  `soldById`) with no fallback spelling, because the spec gives exactly one name
+  for each and a widened guess without a second candidate is just a guess dressed
+  up. `jobs.total` is deliberately narrower than the `total_revenue` column
+  that precedes it: that column widens to `job.invoiceTotal` as a fallback, this
+  one does not — the spec asks for `job.total` verbatim, nothing else.
+- **`technicians.phone`, `technicians.business_unit_id`, `technicians.role_ids`,
+  `technicians.home_address`, `technicians.home_latitude`,
+  `technicians.home_longitude`** — genuinely unverified. `phone` widens
+  `phoneNumber`/`phone`, matching `settings.businessUnits.Phone`'s existing
+  widen. `businessUnitId` is a single guess (ServiceTitan's technician list
+  sometimes nests `businessUnit: {name}` instead — see
+  `docs/integrations/servicetitan-api.md` in the Profit Wizard repo — so a flat
+  `businessUnitId` may not exist on every tenant's response; if it doesn't, the
+  column is blank, not wrong). `roleIds` is assumed to be a bare array of ids.
+  The technician's home address object's own key is unknown — `homeAddress` is
+  tried first, `home` second, and either shape's `latitude`/`longitude` read the
+  same way `denormalize._coordinate` reads a job location's. If the blank-column
+  detector fires on any of these six on a real tenant, that is the answer.
+- **`sales.estimates` — every column beyond `EstimateId`.** There was no real
+  ServiceTitan tenant to record an Estimates API response from, so every field
+  name in `src/st_exporter/sales.py` is inferred from the shape ServiceTitan uses
+  for the SAME fact elsewhere in this exporter (an item's `sku` object mirrors an
+  invoice line's; `qty` mirrors the Estimates API's documented request body) with
+  a flatter fallback tried second. The date-filter parameter on the fetch side
+  (`feeds/sales.py`, `ESTIMATE_DATE_PARAM = "modifiedOnOrAfter"`) is likewise a
+  guess, guarded by the same `warn_if_older_than_window` tripwire the invoices
+  and job-completion filters already use. **Check this whole tab first** once a
+  real tenant with estimates is available — a wrong guess here costs blank
+  `Item*` columns and/or an unbounded window, not wrong money (every money/hours
+  cell still goes through `_money`, blank when null). Two shapes are read
+  deliberately wider than the first draft: `soldBy` is accepted as a bare
+  employee id as well as `{id}` (the bare id is what this repo's own
+  `estimates-sell` examples send), and `Total` falls back to `subtotal + tax`
+  when the response has no `total` — the Estimates response is believed to
+  carry those two separately and no total of its own.
+
 ## ~~CRM Outbox response envelope~~ — RESOLVED 2026-09-14
 
 `src/st_exporter/outbox/client.py`, `TradeRatedOutboxClient.claim`

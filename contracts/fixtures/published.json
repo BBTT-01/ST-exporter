@@ -22,6 +22,9 @@
       "pricebook.materials.json": "0e3f76ae290aeef4dbac106c58fc5864aae9a63f79d5cf2413e9fcb2b1b09d29",
       "pricebook.services.json": "b037b3522c5f46dd95d69bb842454de70fdc2b853b35f1716f2e941dfdd70e34"
     },
+    "sales.v1": {
+      "sales.estimates.json": "50b1dee4ebefdfd226673477e1b4f7077b7c760686f00ac06dab6d9228d17dad"
+    },
     "technicians.v1": {
       "technicians.json": "3e9eeb3433a53750e1cf0469495d52004731b3c66cc20d60dfb743b999b98d8a"
     }

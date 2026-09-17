@@ -1043,3 +1043,60 @@ def test_no_job_ever_reaches_the_sheet_carrying_a_zero_revenue_cell() -> None:
 
     assert cells == ["1250.5", "", ""]
     assert "0" not in cells
+
+
+class TestHostedParityJobColumns:
+    """The 6 columns appended to `jobs`, after `completed_on`/`total_revenue`, for
+    Profit Wizard hosted parity.
+
+    Read straight off the JOB record and never defaulted — a job that never
+    completed, was never a recall, carries no warranty, or was never marked
+    no-charge must stay ``None`` (blank), never a guessed ``"0"``/``"false"``.
+    """
+
+    def _row(self, job: dict) -> dict:
+        jobs = _cache({"id": 1, "jobNumber": "J-1", **job})
+        appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+        result = build_job_rows(jobs, appointments, _cache(), _cache(), _cache())
+        return result.rows[0]
+
+    def test_all_six_populate_from_the_job_record(self) -> None:
+        row = self._row(
+            {
+                "recallForId": 2,
+                "warrantyId": 9,
+                "noCharge": False,
+                "total": 1250.5,
+                "businessUnitId": 3,
+                "soldById": 901,
+            }
+        )
+        assert row["recall_for_id"] == 2
+        assert row["warranty_id"] == 9
+        assert row["no_charge"] is False
+        assert row["total"] == 1250.5
+        assert row["business_unit_id"] == 3
+        assert row["sold_by_id"] == 901
+
+    def test_all_six_are_blank_when_the_job_carries_none_of_them(self) -> None:
+        row = self._row({})
+        for column in (
+            "recall_for_id",
+            "warranty_id",
+            "no_charge",
+            "total",
+            "business_unit_id",
+            "sold_by_id",
+        ):
+            assert row[column] is None
+
+    def test_no_charge_false_is_not_the_same_as_absent(self) -> None:
+        """A real ``False`` must survive as ``False``, not collapse to blank —
+        `to_cell_text` renders it `"false"`; only an absent field is blank."""
+        row = self._row({"noCharge": False})
+        assert row["no_charge"] is False
+
+    def test_a_real_zero_total_is_not_blank(self) -> None:
+        row = self._row({"total": 0})
+        assert row["total"] == 0
+        assert row["total"] is not None

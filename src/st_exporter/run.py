@@ -51,6 +51,7 @@ from st_exporter.feeds.pricebook import (
 )
 from st_exporter.feeds.raw_cache import RawCache
 from st_exporter.feeds.reference import fetch_business_units, fetch_job_types, fetch_technicians
+from st_exporter.feeds.sales import fetch_estimates
 from st_exporter.financial import (
     CONTRACT_VERSION as FINANCIAL_CONTRACT_VERSION,
 )
@@ -82,6 +83,8 @@ from st_exporter.meta import (
     parse_meta_grid,
 )
 from st_exporter.pricebook import CONTRACT_VERSION, build_category_grid, build_item_grid
+from st_exporter.sales import CONTRACT_VERSION as SALES_CONTRACT_VERSION
+from st_exporter.sales import build_estimate_grid
 from st_exporter.scopes import ScopeLedger, is_permission_denied
 from st_exporter.sheets import SheetsClient, SheetsPort, get_gspread_client
 from st_exporter.window import DEFAULT_WINDOW_DAYS, FINANCIAL_WINDOW_DAYS, in_window
@@ -136,18 +139,27 @@ PRICEBOOK_TABS: dict[str, str] = {f"pricebook.{resource}": resource for resource
 PRICEBOOK_CATEGORIES_TAB = "pricebook.categories"
 PRICEBOOK_FEED_NAMES: tuple[str, ...] = tuple(PRICEBOOK_TABS) + (PRICEBOOK_CATEGORIES_TAB,)
 
-# The four tabs the single `financial` feed writes. The names are Profit Wizard's,
-# not this exporter's — its reader (`lib/hosted/tabs.ts`) addresses these exact
+# The tabs the single `financial` feed writes. The names are Profit Wizard's, not
+# this exporter's — its reader (`lib/hosted/tabs.ts`) addresses these exact
 # strings, so they are part of the contract, dots and camelCase included.
 FINANCIAL_INVOICES_TAB = "accounting.invoices"
 FINANCIAL_TIMESHEETS_TAB = "payroll.timesheets"
 FINANCIAL_BUSINESS_UNITS_TAB = "settings.businessUnits"
 FINANCIAL_JOB_COSTS_TAB = "reporting.jobCosts"
+#: `sales.estimates` for Profit Wizard hosted parity (sold estimates / quotes).
+#: Wired into the `financial` feed's run cadence deliberately — same six-hourly
+#: window as `reporting.jobCosts` — even though it carries its OWN contract
+#: version (`sales.v1`, see `contracts.SALES`): a wholly new tab is a new
+#: version regardless of which feed's schedule refreshes it, and estimates are
+#: exactly the "grows without bound, six-hourly is plenty" shape the rest of
+#: this feed already exists for.
+FINANCIAL_ESTIMATES_TAB = "sales.estimates"
 FINANCIAL_FEED_NAMES: tuple[str, ...] = (
     FINANCIAL_INVOICES_TAB,
     FINANCIAL_TIMESHEETS_TAB,
     FINANCIAL_BUSINESS_UNITS_TAB,
     FINANCIAL_JOB_COSTS_TAB,
+    FINANCIAL_ESTIMATES_TAB,
 )
 
 # Every export tab this exporter can write — the unit a ServiceTitan permission is
@@ -195,7 +207,7 @@ class ExportSummary:
     images: ImageUploadSummary | None = None
     # Row count per successfully-written `financial` tab, or None when the feed
     # wasn't selected. A tab that FAILED is absent from this dict and present in
-    # `financial_failures` — the two together always name all four tabs, so
+    # `financial_failures` — the two together always name every tab, so
     # "wrote 0 rows" can never be confused with "didn't manage to write".
     financial_row_counts: dict[str, int] | None = None
     # Tab name -> why it was skipped, for the financial tabs that failed. Its
@@ -255,11 +267,12 @@ def run_export(
     (`pricebook.services`/`equipment`/`materials`/`categories`), each with its own
     `_meta` row — see ``pricebook.py`` for the frozen column contract.
 
-    ``financial`` is likewise one selectable feed writing four tabs
+    ``financial`` is likewise one selectable feed writing several tabs
     (`accounting.invoices`, `payroll.timesheets`, `settings.businessUnits`,
-    `reporting.jobCosts`) for Profit Wizard — see ``financial.py``. Its four tabs
-    are independent: one failing leaves the other three written and keeps the
-    failed tab's previous contents and `_meta` row.
+    `reporting.jobCosts`, `sales.estimates`) for Profit Wizard — see
+    ``financial.py``/``sales.py``. Its tabs are independent: one failing leaves
+    the others written and keeps the failed tab's previous contents and
+    `_meta` row.
 
     ``client``/``export_store``/``raw_cache_store`` can be injected (used by tests
     with fixtures and an in-memory Sheets double); left as ``None`` in production,
@@ -1117,9 +1130,15 @@ def _run_technicians_feed(
     Returns the number of rows WRITTEN, derived from the grid rather than from the
     fetched records — ``build_technician_grid`` dedupes, so counting the records
     would report rows the tab does not contain (the same rule ``_TabGuard`` keeps).
+
+    ``business_units`` is the same optional, degrading reference lookup the
+    `jobs` feed already uses for its own ``business_unit`` column — a 403 here
+    costs two blank columns (``business_unit_name`` and, transitively, nothing
+    else), never the whole tab. See ``_optional_reference``.
     """
     technicians = fetch_technicians(client)
-    technicians_grid = build_technician_grid(technicians)
+    business_units = _optional_reference("business units", lambda: fetch_business_units(client))
+    technicians_grid = build_technician_grid(technicians, business_units)
     # The header row is not data — a tab with only a header is zero rows.
     row_count = max(len(technicians_grid) - 1, 0)
     check_blank_columns("technicians", technicians_grid)
@@ -1192,7 +1211,7 @@ class _TabGuard:
         self.row_counts: dict[str, int] = {}
         self.failures: dict[str, str] = {}
 
-    def attempt(self, tab_name: str, build: Any) -> Any:
+    def attempt(self, tab_name: str, build: Any, *, contract_version: str | None = None) -> Any:
         """Build one tab's grid behind the guard. Returns whatever ``build`` did.
 
         Every tab is attempted, always. A sibling's 403 never short-circuits this
@@ -1200,6 +1219,12 @@ class _TabGuard:
         says nothing at all about `pricebook.categories`, and skipping the rest of
         the feed to save four requests is what cost a TrueQuote-only tenant the
         categories tab it had paid for.
+
+        ``contract_version`` overrides the guard's own version for this ONE tab —
+        `sales.estimates` runs on the `financial` feed's cadence but is a wholly
+        new tab with its own version (`sales.v1`), never `financial.v1`. Every
+        other caller leaves it unset and gets the guard's shared version, as
+        before.
         """
         try:
             grid, carried = build()
@@ -1233,7 +1258,7 @@ class _TabGuard:
                 last_cursor="",
                 row_count=self.row_counts[tab_name],
                 exporter_version=EXPORTER_VERSION,
-                contract_version=self._contract_version,
+                contract_version=contract_version or self._contract_version,
             )
         )
         return carried
@@ -1336,9 +1361,9 @@ def _run_financial_feed(
     scopes: ScopeLedger | None = None,
     dry_run: bool,
 ) -> tuple[dict[str, int], dict[str, str]]:
-    """Write the four `financial` tabs; append one MetaRow per tab that succeeded.
+    """Write the `financial` feed's tabs; append one MetaRow per tab that succeeded.
 
-    **The four tabs are independent, and that is the point.** ``reporting.jobCosts``
+    **The tabs are independent, and that is the point.** ``reporting.jobCosts``
     depends on a report that may be absent, ambiguous or throttled, and
     ``payroll.timesheets`` costs one request per completed job — either can fail on
     a tenant where invoices and business units are perfectly readable. So each tab
@@ -1400,6 +1425,16 @@ def _run_financial_feed(
             ),
             None,
         ),
+    )
+    guard.attempt(
+        FINANCIAL_ESTIMATES_TAB,
+        lambda: (
+            build_estimate_grid(fetch_estimates(client, today=today, window_days=window_days)),
+            None,
+        ),
+        # A wholly new tab, not an appended column — its own version. See
+        # `contracts.SALES` and `_TabGuard.attempt`'s docstring.
+        contract_version=SALES_CONTRACT_VERSION,
     )
 
     logger.info(

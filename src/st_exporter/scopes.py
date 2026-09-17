@@ -98,6 +98,7 @@ TAB_PERMISSIONS: dict[str, str] = {
     "payroll.timesheets": "Payroll -> Timesheets (plus JPM -> Jobs, to list the completed jobs)",
     "settings.businessUnits": "Settings -> Business Units",
     "reporting.jobCosts": "Reporting -> Reports (report categories, reports, report data)",
+    "sales.estimates": "Sales & Estimates -> Estimates",
 }
 
 
