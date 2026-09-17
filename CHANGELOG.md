@@ -4,6 +4,26 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · A Google 500 on a Sheets write is retried, not fatal
+
+### Fixed: one transient Google error no longer reds a whole feed
+
+Pro Garage Doors run 35248585567 fetched its entire pricebook cleanly — 9917
+services, 816 materials, 57 equipment, 16 categories — and then died on the one
+`batchUpdate` carrying the services tab: `APIError: [500]: Internal error
+encountered.` Nothing was tried twice. The ServiceTitan side of this exporter has
+retried 429s with backoff since the start; the Google side had no retry at all.
+
+`SheetsClient.replace_grid` now retries a **transient** Google answer — 429, 500,
+502, 503 — up to four attempts with 2s/4s/8s backoff, and re-raises anything
+else (400, 403, 404) at once, because those are the request's fault and the
+answer would not change. It retries the SAME single `batchUpdate`: the
+full-replace-in-one-call design is kept, so a reader still never sees a
+half-written tab. The retry line names the tab and the grid's size in rows,
+columns and cells, so if a tab starts failing on every attempt the log can say
+whether it is a transient or a size problem. The worksheet `resize` that
+precedes a growing write is retried the same way.
+
 ## [Unreleased] · `mypy src/` passes, and CI now runs it
 
 ### Fixed: 91 strict-mode findings, none of them a behaviour change
