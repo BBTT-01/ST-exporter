@@ -133,7 +133,7 @@ def _items_of(body: Any) -> list[dict[str, Any]]:
         return [row for row in body if isinstance(row, dict)]
     if not isinstance(body, dict):
         return []
-    for key in ("items", "results", "rows", "data"):
+    for key in ("items", "results", "rows", "data", "jobs"):
         value = body.get(key)
         if isinstance(value, list):
             return [row for row in value if isinstance(row, dict)]

@@ -140,13 +140,18 @@ def fetch_contacts_per_customer(
     tab's own deterministic row order), because many jobs share one customer and
     an un-deduped pull would be one request per ROW rather than per customer.
 
-    A 404 on one customer is skipped rather than raised — a customer can be
-    merged or deleted between the export feed and this call, and losing both
-    contact columns for the whole tenant over one missing customer would be a
-    self-inflicted outage that repeats every run. Every other error (a 403 on a
-    missing CRM permission above all) is re-raised for the caller's degradation
-    guard, so the failure is visible instead of presenting as "this contractor
-    has no phone numbers".
+    A 404 OR a 409 on one customer is skipped rather than raised. A 404 means a
+    customer can be merged or deleted between the export feed and this call; a
+    409 is ServiceTitan's answer for an INACTIVE customer ("Customer ID = <id>
+    is not active"), observed live against the Door Serv Pro tenant. Either
+    way, losing both contact columns for the WHOLE tenant over one customer
+    would be a self-inflicted outage that repeats every run — exactly what
+    happened before this fix, when a single inactive customer's 409 escaped
+    per-customer handling, propagated out of this loop, and made the caller's
+    degradation guard blank `customer_phone`/`customer_email` on every row.
+    Every other error (a 403 on a missing CRM permission above all) is
+    re-raised for the caller's degradation guard, so THAT failure stays
+    visible instead of presenting as "this contractor has no phone numbers".
     """
     wanted = list(dict.fromkeys(str(cid) for cid in customer_ids if cid is not None and cid != ""))
     if len(wanted) > max_customers:
@@ -168,19 +173,29 @@ def fetch_contacts_per_customer(
 
     contacts: dict[str, list[dict[str, Any]]] = {}
     missing = 0
+    inactive = 0
     for customer_id in wanted:
         try:
             records = list(
                 fetch_all(client, MODULE, f"customers/{customer_id}/contacts", page_size=_PAGE_SIZE)
             )
         except APIError as exc:
-            if exc.status_code != 404:
-                raise
-            missing += 1
-            continue
+            if exc.status_code == 404:
+                missing += 1
+                continue
+            if exc.status_code == 409:
+                inactive += 1
+                continue
+            raise
         contacts[customer_id] = [dict(record) for record in records if isinstance(record, Mapping)]
     if missing:
         logger.info("contacts: %d customer(s) answered 404 and keep blank contact cells", missing)
+    if inactive:
+        logger.info(
+            "contacts: %d customer(s) answered 409 (inactive customer) and keep blank "
+            "contact cells",
+            inactive,
+        )
     logger.info("contacts: fetched contacts for %d customer(s) (per-customer route)", len(contacts))
     return contacts
 

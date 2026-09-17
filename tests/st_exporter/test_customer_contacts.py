@@ -307,6 +307,38 @@ def test_a_403_on_contacts_costs_two_cells_not_the_jobs_feed(
 
 
 @respx.mock
+def test_a_409_on_one_inactive_customer_does_not_blank_every_rows_contacts(
+    st_settings, exporter_settings
+) -> None:
+    """Live evidence from Door Serv Pro: ServiceTitan answers 409 "Customer ID =
+    <id> is not active" for one inactive customer's contacts. Before this fix
+    that single 409 escaped `fetch_contacts_per_customer` entirely, was caught
+    by `_customer_contacts`'s degradation guard, and blanked
+    customer_phone/customer_email on EVERY row of the run — not just the
+    inactive customer's row(s). Job 2 (customer 11, active) must still resolve
+    its own contacts."""
+    export_store = InMemorySheetsStore()
+    mock_auth_token(st_settings.auth_url)
+    _register_run1(st_settings.api_base)
+    respx.get(
+        f"{st_settings.api_base}/crm/v2/tenant/{tenant_run1.TENANT_ID}/customers/10/contacts"
+    ).mock(return_value=httpx.Response(409, text="Customer ID = 10 is not active"))
+
+    with _frozen_now():
+        run_export(
+            st_settings,
+            exporter_settings,
+            export_store=export_store,
+            raw_cache_store=InMemorySheetsStore(),
+        )
+
+    row = export_store.tabs["jobs"][1]
+    # Customer 10's row falls back to the flat customer-record scalar (the 409
+    # cost only that customer's contacts overlay, not the whole run).
+    assert row[PHONE_COL] == tenant_run1.CUSTOMER_10["phone"]
+
+
+@respx.mock
 def test_the_bulk_route_is_used_when_it_is_asked_for(st_settings, monkeypatch) -> None:
     monkeypatch.setenv("EXPORTER_CONTACTS_ROUTE", "export")
     settings = ExporterSettings(

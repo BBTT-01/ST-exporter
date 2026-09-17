@@ -114,6 +114,24 @@ class TestClaim:
         assert [item.id for item in items] == ["pw-2"]
 
     @respx.mock
+    def test_an_envelope_keyed_jobs_is_read_too(self) -> None:
+        """Profit Wizard's claim endpoint used to answer under `jobs`; now fixed
+        to also return `items`, but the exporter must tolerate either — their
+        contract widens only, so a key this reader once missed must not be read
+        as an empty queue."""
+        respx.post(f"{BASE}/claim").mock(
+            return_value=httpx.Response(
+                200,
+                json={"jobs": [{"id": "pw-4", "idempotency_key": "k4", "kind": "update_job"}]},
+            )
+        )
+        client = _client()
+        try:
+            assert [item.id for item in client.claim()] == ["pw-4"]
+        finally:
+            client.close()
+
+    @respx.mock
     def test_a_bare_array_body_is_read_too(self) -> None:
         """Their contract widens; so does this reader. An envelope that is not
         `{"items": [...]}` must not be read as an empty queue."""
