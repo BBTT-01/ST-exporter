@@ -17,6 +17,7 @@ import respx
 
 from st_cli.client import ServiceTitanClient
 from st_cli.config import Settings
+from st_cli.exceptions import APIError
 from st_exporter.outbox.actions import UnsupportedOutboxKindError
 from st_exporter.outbox.client import OutboxItem
 from st_exporter.outbox.profitwizard import (
@@ -254,12 +255,11 @@ class TestReport:
 
 
 class TestPerform:
-    """Three of the four writes still belong to ticket 15, which is blocked by
-    this ticket. The LANE is real; their ServiceTitan request bodies are not
-    knowable here yet. `assign_technician` is implemented — see
-    `TestAssignTechnician` below."""
+    """`update_job` has no Profit Wizard producer yet. `assign_technician`,
+    `push_prices` and `push_estimate` are implemented — see
+    `TestAssignTechnician`, `TestPushPrices` and `TestPushEstimate` below."""
 
-    def test_each_unimplemented_kind_names_itself_and_its_ticket(
+    def test_each_unimplemented_kind_names_itself_as_producerless(
         self, st_settings: Settings
     ) -> None:
         client = ServiceTitanClient(st_settings)
@@ -268,7 +268,7 @@ class TestPerform:
                 with pytest.raises(UnsupportedOutboxKindError) as exc:
                     perform_profitwizard_item(client, _item(kind=kind))
                 assert kind in str(exc.value)
-                assert "ticket 15" in str(exc.value)
+                assert "no Profit Wizard producer yet" in str(exc.value)
         finally:
             client.close()
 
@@ -538,3 +538,216 @@ class TestAssignTechnician:
             "jobAppointmentId": 555,
             "technicianIds": [20],
         }
+
+
+def _push_prices_item(**overrides) -> OutboxItem:
+    payload = {"crm_item_id": "svc_501", "new_price": 249.99}
+    payload.update(overrides.pop("payload", {}))
+    defaults = dict(
+        id="item-price",
+        idempotency_key="push_prices:svc_501:249.99",
+        kind="push_prices",
+        payload=payload,
+    )
+    defaults.update(overrides)
+    return OutboxItem(**defaults)
+
+
+class TestPushPrices:
+    """Mirrors `ServiceTitanClient.pushPrices` (`lib/crm/servicetitan.ts`):
+    a ``svc_``-prefixed `crm_item_id` PATCHes `pricebook/.../services/{id}`
+    with the prefix stripped; anything else PATCHes `.../materials/{id}`."""
+
+    @respx.mock
+    def test_a_service_item_patches_the_services_endpoint(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        route = respx.patch(
+            f"{st_settings.api_base}/pricebook/v2/tenant/{st_settings.tenant_id}/services/501"
+        ).mock(return_value=httpx.Response(200, json={"id": 501, "price": 249.99}))
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            st_id = perform_profitwizard_item(client, _push_prices_item())
+        finally:
+            client.close()
+
+        assert st_id == "501"
+        assert json.loads(route.calls.last.request.content) == {"price": 249.99}
+
+    @respx.mock
+    def test_a_non_service_item_patches_the_materials_endpoint(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        route = respx.patch(
+            f"{st_settings.api_base}/pricebook/v2/tenant/{st_settings.tenant_id}/materials/900"
+        ).mock(return_value=httpx.Response(200, json={"id": 900, "price": 12.5}))
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            st_id = perform_profitwizard_item(
+                client, _push_prices_item(payload={"crm_item_id": "900", "new_price": 12.5})
+            )
+        finally:
+            client.close()
+
+        assert st_id == "900"
+        assert json.loads(route.calls.last.request.content) == {"price": 12.5}
+
+    def test_a_missing_crm_item_id_raises(self, st_settings: Settings) -> None:
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(ValueError, match="crm_item_id"):
+                perform_profitwizard_item(client, _push_prices_item(payload={"crm_item_id": None}))
+        finally:
+            client.close()
+
+    def test_a_non_numeric_new_price_raises(self, st_settings: Settings) -> None:
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(ValueError, match="new_price"):
+                perform_profitwizard_item(
+                    client, _push_prices_item(payload={"new_price": "not-a-number"})
+                )
+        finally:
+            client.close()
+
+    @respx.mock
+    def test_a_servicetitan_api_error_propagates(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.patch(
+            f"{st_settings.api_base}/pricebook/v2/tenant/{st_settings.tenant_id}/services/501"
+        ).mock(return_value=httpx.Response(404, json={"message": "not found"}))
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(APIError):
+                perform_profitwizard_item(client, _push_prices_item())
+        finally:
+            client.close()
+
+
+def _push_estimate_item(**overrides) -> OutboxItem:
+    payload = {
+        "crmJobId": "9001",
+        "name": "Repair Proposal (GOOD)",
+        "items": [
+            {
+                "skuId": "sku-1",
+                "description": "Compressor replacement",
+                "quantity": 1,
+                "price": 1200.0,
+                "total": 1200.0,
+            }
+        ],
+    }
+    payload.update(overrides.pop("payload", {}))
+    defaults = dict(
+        id="item-estimate",
+        idempotency_key="push_estimate:proposal-1",
+        kind="push_estimate",
+        payload=payload,
+    )
+    defaults.update(overrides)
+    return OutboxItem(**defaults)
+
+
+class TestPushEstimate:
+    """Mirrors `ServiceTitanClient.pushEstimate` (`lib/crm/servicetitan.ts`):
+    POST `sales/v2/tenant/{id}/estimates` with ``{jobId, name, items}``, the
+    outbox's ``crmJobId`` renamed to ``jobId`` and its items forwarded as-is."""
+
+    @respx.mock
+    def test_posts_the_estimate_and_returns_its_id(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        route = respx.post(
+            f"{st_settings.api_base}/sales/v2/tenant/{st_settings.tenant_id}/estimates"
+        ).mock(return_value=httpx.Response(200, json={"id": 77001}))
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            st_id = perform_profitwizard_item(client, _push_estimate_item())
+        finally:
+            client.close()
+
+        assert st_id == "77001"
+        body = json.loads(route.calls.last.request.content)
+        assert body == {
+            "jobId": "9001",
+            "name": "Repair Proposal (GOOD)",
+            "items": [
+                {
+                    "skuId": "sku-1",
+                    "description": "Compressor replacement",
+                    "quantity": 1.0,
+                    "price": 1200.0,
+                    "total": 1200.0,
+                }
+            ],
+        }
+
+    @respx.mock
+    def test_a_missing_total_is_computed_from_quantity_times_price(
+        self, st_settings: Settings
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        route = respx.post(
+            f"{st_settings.api_base}/sales/v2/tenant/{st_settings.tenant_id}/estimates"
+        ).mock(return_value=httpx.Response(200, json={"id": 77002}))
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            perform_profitwizard_item(
+                client,
+                _push_estimate_item(
+                    payload={
+                        "items": [
+                            {"description": "Filter", "quantity": 2, "price": 15.0},
+                        ]
+                    }
+                ),
+            )
+        finally:
+            client.close()
+
+        body = json.loads(route.calls.last.request.content)
+        assert body["items"][0]["total"] == 30.0
+
+    def test_a_missing_job_id_raises(self, st_settings: Settings) -> None:
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(ValueError, match="crmJobId"):
+                perform_profitwizard_item(client, _push_estimate_item(payload={"crmJobId": None}))
+        finally:
+            client.close()
+
+    def test_an_empty_items_list_raises(self, st_settings: Settings) -> None:
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(ValueError, match="items"):
+                perform_profitwizard_item(client, _push_estimate_item(payload={"items": []}))
+        finally:
+            client.close()
+
+    def test_an_item_missing_description_raises(self, st_settings: Settings) -> None:
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(ValueError, match="description"):
+                perform_profitwizard_item(
+                    client,
+                    _push_estimate_item(payload={"items": [{"quantity": 1, "price": 5.0}]}),
+                )
+        finally:
+            client.close()
+
+    @respx.mock
+    def test_a_servicetitan_api_error_propagates(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.post(
+            f"{st_settings.api_base}/sales/v2/tenant/{st_settings.tenant_id}/estimates"
+        ).mock(return_value=httpx.Response(500, json={"message": "boom"}))
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(APIError):
+                perform_profitwizard_item(client, _push_estimate_item())
+        finally:
+            client.close()

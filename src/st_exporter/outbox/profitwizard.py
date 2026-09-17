@@ -41,20 +41,23 @@ from st_cli.pagination import fetch_all
 from st_exporter.logging_setup import logger
 from st_exporter.outbox.actions import UnsupportedOutboxKindError
 from st_exporter.outbox.client import OutboxItem, drop_unidentified
+from st_exporter.outbox.profitwizard_writes import perform_push_estimate, perform_push_prices
 from st_exporter.outbox.routes import PROFITWIZARD_ROUTES, LaneRoutes
 
 _DEFAULT_TIMEOUT = 30.0
 
 # The four writes Profit Wizard loses under Hosted mode. Naming them here, even
-# though only one is performed yet, is what makes a claimed item's failure
-# message say which write is missing rather than "unknown kind".
+# though one is still unbuilt, is what makes a claimed item's failure message
+# say which write is missing rather than "unknown kind".
 KINDS = ("push_estimate", "update_job", "push_prices", "assign_technician")
 
-# The three still owned by ticket 15, which `perform_profitwizard_item` still
-# raises `UnsupportedOutboxKindError` for. `assign_technician` graduated out of
-# this tuple once PW's own `crm/index.ts` and `crm/servicetitan.ts` gave a
-# knowable payload and endpoint shapes to copy.
-_UNIMPLEMENTED_KINDS = ("push_estimate", "update_job", "push_prices")
+# `update_job` has no Profit Wizard producer yet (`lib/outbox/types.ts` names
+# the kind but nothing enqueues it) — nothing to perform, so it still raises
+# `UnsupportedOutboxKindError`. `assign_technician`, `push_prices` and
+# `push_estimate` all graduated out of this tuple once PW's own
+# `crm/index.ts` / `crm/servicetitan.ts` gave knowable payload and endpoint
+# shapes to copy.
+_UNIMPLEMENTED_KINDS = ("update_job",)
 
 # Field-name candidates, in the order they are tried. Their contract accepts
 # several spellings per field, so their claim response may plausibly use any of
@@ -188,29 +191,32 @@ def _matched(resp: httpx.Response) -> bool:
 
 
 def perform_profitwizard_item(client: ServiceTitanClient, item: OutboxItem) -> str:
-    """Perform one Profit Wizard item. Three of the four writes still don't exist.
+    """Perform one Profit Wizard item.
 
-    Ticket 15 ("Profit Wizard: write outbox") owns the four ServiceTitan writes
-    — push estimate, update job, push prices, assign technician — and it is
-    blocked by this ticket, so the request bodies for the first three are not
-    knowable here. `assign_technician` is the exception: PW's own direct-CRM
-    implementation (`lib/crm/servicetitan.ts`'s `setAppointmentTechnicianSet`)
-    already states its payload and its ServiceTitan endpoints, so that one
-    write is performed for real below. Ticket 12 owns the *lane*: claim,
-    ledger, report, isolation. Those are real and exercised for all four kinds.
+    `assign_technician`, `push_prices` and `push_estimate` are implemented —
+    the first here, the other two in `profitwizard_writes.py` — each copying
+    PW's own direct-CRM payload and ServiceTitan endpoint shapes
+    (`lib/crm/servicetitan.ts`). `update_job` has no Profit Wizard producer
+    yet, so it still raises. Ticket 12 owns the *lane*: claim, ledger, report,
+    isolation. Those are real and exercised for all four kinds.
 
     Each unimplemented kind is named individually rather than falling through
     to "unknown kind", so the failure a maintainer reads says which write is
-    missing and which ticket owns it — and so a genuinely unrecognised kind
-    still looks different from a known-but-unbuilt one.
+    missing — and so a genuinely unrecognised kind still looks different from
+    a known-but-unbuilt one.
     """
     if item.kind == "assign_technician":
         return _perform_assign_technician(client, item)
+    if item.kind == "push_prices":
+        return perform_push_prices(client, item)
+    if item.kind == "push_estimate":
+        return perform_push_estimate(client, item)
     if item.kind in _UNIMPLEMENTED_KINDS:
         raise UnsupportedOutboxKindError(
-            f"{item.kind} is a known Profit Wizard write with no ServiceTitan "
-            "implementation in the exporter yet (ticket 15 owns the write "
-            "bodies). The lane claimed and reported it correctly."
+            f"{item.kind} is a known Profit Wizard write kind with no Profit "
+            "Wizard producer yet — nothing enqueues it, so its ServiceTitan "
+            "request body is not knowable here. The lane claimed and reported "
+            "it correctly."
         )
     raise UnsupportedOutboxKindError(f"unknown profitwizard outbox kind: {item.kind!r}")
 
