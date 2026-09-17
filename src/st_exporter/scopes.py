@@ -95,9 +95,14 @@ TAB_PERMISSIONS: dict[str, str] = {
     "pricebook.materials": "Pricebook -> Materials",
     "pricebook.categories": "Pricebook -> Categories",
     "accounting.invoices": "Accounting -> Invoices",
-    "payroll.timesheets": "Payroll -> Timesheets (plus JPM -> Jobs, to list the completed jobs)",
+    "payroll.timesheets": (
+        "Payroll -> Jobs (Read); the Developer Portal has no Timesheets row "
+        "(plus JPM -> Jobs, to list the completed jobs)"
+    ),
     "settings.businessUnits": "Settings -> Business Units",
-    "reporting.jobCosts": "Reporting -> Reports (report categories, reports, report data)",
+    "reporting.jobCosts": (
+        "Reporting -> Report Categories (Read) and Reports within the category (Read)"
+    ),
     "sales.estimates": "Sales & Estimates -> Estimates",
 }
 
