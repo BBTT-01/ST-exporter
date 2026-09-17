@@ -352,6 +352,47 @@ absent`) and falls back to the per-customer route for that run rather than
 blanking two columns. Flip it on a live tenant once, read the annotation, and
 record the answer here.
 
+### RESOLVED (2026-09-17): a single inactive customer's 409 blanked the WHOLE run
+
+`src/st_exporter/feeds/contacts.py`, `fetch_contacts_per_customer`
+
+The RESOLVED entry above fixed the READING side and was correct as far as it
+went, but exporter-v0.2.32 hit a second bug on the same tenant (Door Serv Pro,
+2471 job rows, live run today): `customer_phone`/`customer_email` were blank on
+**every** row again, and this time every customer involved was active.
+
+Root cause: `fetch_contacts_per_customer` only treated a **404** on one
+customer as skippable; every other status — a **409**, which ServiceTitan
+answers for an inactive customer ("Customer ID = &lt;id&gt; is not active") —
+was re-raised. That `APIError` propagated out of the per-customer loop,
+through `run._customer_contacts`'s degradation guard, and was logged as
+"DEGRADED: could not read customer contacts", which returns `{}` for **every**
+customer in the run, not just the one that 409'd. One inactive customer among
+2471 job rows was enough to blank the contacts overlay for the whole tenant —
+the exact "self-inflicted outage that repeats every run" the function's own
+docstring already warned a 404 would cause if mishandled, just for a status
+code the fix didn't cover yet.
+
+Fixed by treating 409 the same as 404 in `fetch_contacts_per_customer`: skipped
+per-customer, counted, and logged once per run with a count (`"%d customer(s)
+answered 409 (inactive customer) and keep blank contact cells"`) rather than
+once per occurrence. Every other status (403 above all) still propagates for
+`_customer_contacts`'s degradation guard, unchanged. See
+`tests/st_exporter/feeds/test_contacts.py::TestPerCustomerFetch::test_a_409_on_one_customer_does_not_lose_the_others`
+and the run-level
+`tests/st_exporter/test_customer_contacts.py::test_a_409_on_one_inactive_customer_does_not_blank_every_rows_contacts`.
+
+**This fully explains today's blank `customer_phone`/`customer_email` columns.**
+The field-reading side (`denormalize._contact_detail`/`_typed_contact`,
+`apply_customer_contacts`) needed no change: it already matches Profit Wizard's
+direct client (`lib/crm/servicetitan.ts`, `phoneSettings[].phone` /
+`emailSettings[].email`, with `contacts[]` selected by `type` beneath it) and
+already matches the ordering `KNOWN_UNVERIFIED.md`'s RESOLVED entry above
+records. With the 409 no longer aborting the whole fetch, the per-customer
+contacts overlay reaches every active customer's row again, and only the
+handful of genuinely inactive customers fall back to the (usually blank)
+customer-record scalars — which is correct, not a bug.
+
 ### Still open: the CLI table lags the exporter
 
 `st crm customers-list`'s Phone/Email columns resolve through the `a|b`
@@ -481,14 +522,48 @@ Six columns appended to `jobs`, seven appended to `technicians`, and a new
 Profit Wizard's hosted (Export Store) path to reach parity with its existing
 Direct ServiceTitan path. Each field's confidence is different:
 
-- **`jobs.recall_for_id`, `jobs.warranty_id`** — well evidenced, not guessed:
-  Profit Wizard's own Direct path already reads `job.recallForId` / `job.warrantyId` off this exact JPM job
-  object in production (`profitwizard/lib/crm/servicetitan.ts`), which is the
-  strongest evidence short of a recorded response. What is NOT confirmed is that
-  the **export change-feed** (`jpm/v2/.../export/jobs`, which is what actually
-  fills `_raw_jobs`) spells these identically to the object the Direct path's list
-  call returns — the same open question `completed_on`'s sibling PRs on this repo
-  already flag.
+- **`jobs.recall_for_id`, `jobs.warranty_id`** — well evidenced on the DIRECT
+  path, still unconfirmed on the EXPORT feed, and now with live signal pointing
+  at a real gap rather than a wrong spelling. Profit Wizard's own Direct path
+  reads `job.recallForId` / `job.warrantyId` off the JPM job object in
+  production (`profitwizard/lib/crm/servicetitan.ts`), but it reads that object
+  from `GET jpm/v2/tenant/{tenant}/jobs` (the **list** endpoint, filtered by
+  `ids`/`page`) — never from `jpm/v2/tenant/{tenant}/export/jobs` (the change-feed
+  that actually fills `_raw_jobs` here). What is NOT confirmed is that the export
+  feed spells these fields identically to the list endpoint's response, or
+  carries them at all — the same open question `completed_on`'s sibling PRs on
+  this repo already flag.
+
+  **Live evidence (2026-09-17, Door Serv Pro, exporter-v0.2.32, 2471 job rows):**
+  `recall_for_id` is populated on exactly **1** of 2471 export-feed rows, while
+  Profit Wizard's Direct path (reading the list endpoint for the same tenant)
+  marks **111** of ~6000 jobs as recalls. `warranty_id` is blank on **all**
+  2471 rows. Both point the same way: the export feed is very likely missing
+  or misnaming these two fields relative to the list endpoint, rather than this
+  tenant genuinely having almost no recalls and zero warranty jobs — 1-in-2471
+  is far below the 111-in-6000 direct-path rate for the same population, and a
+  literal 0 for warranty across every row is the same shape of "wrong field
+  name" signal `job_number` and `customer_phone`/`customer_email` gave before
+  they were fixed.
+
+  **Not fixed here, deliberately.** There is no ServiceTitan documentation
+  confirming what the export feed's job record actually calls these two facts
+  (if it carries them at all), and guessing a second spelling risks the "widen
+  enough spellings and you stop being able to tell right from wrong" trap this
+  file's blank-column entries warn about elsewhere. A per-delta lookup against
+  the list endpoint (mirroring `outbox/profitwizard._resolve_job_appointment_id`'s
+  shape — fetch the export feed's job ids in batches of 50 against `jpm/.../jobs?ids=`)
+  would settle this without guessing, but it is a new API surface and a new
+  request budget, not a one-line field-name change, so it is left as the
+  documented next step rather than built speculatively. `recall_for_id` and
+  `warranty_id` stay OUT of `ALL_BLANK_OK` — the detector firing on them is
+  working as intended, not "crying wolf": there is no live-tenant confirmation
+  that either field is genuinely optional for every tenant (unlike, say,
+  `pricebook.services.cost`, which is absent from a documented schema).
+  **Action for whoever has ServiceTitan API access next:** capture one real
+  `export/jobs` response for a job known to be a recall or under warranty via
+  the Direct path, and diff its keys against the list endpoint's response for
+  the same job id.
 - **`jobs.no_charge`, `jobs.total`, `jobs.business_unit_id`, `jobs.sold_by_id`** —
   read from the spec's literal field names (`noCharge`, `total`, `businessUnitId`,
   `soldById`) with no fallback spelling, because the spec gives exactly one name

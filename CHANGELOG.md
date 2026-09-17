@@ -24,6 +24,41 @@ columns and cells, so if a tab starts failing on every attempt the log can say
 whether it is a transient or a size problem. The worksheet `resize` that
 precedes a growing write is retried the same way.
 
+### Fixed: a 409 on one customer no longer degrades `customer_phone`/`customer_email` for every row
+
+`fetch_contacts_per_customer` (`src/st_exporter/feeds/contacts.py`) only
+skipped a 404 per customer; ServiceTitan's 409 ("Customer ID = &lt;id&gt; is
+not active") escaped that handling, propagated through `run._customer_contacts`'s
+degradation guard, and returned `{}` contacts for the ENTIRE run — one
+inactive customer among 2471 job rows blanked both columns tenant-wide, on a
+live run against Door Serv Pro today. A 409 is now skipped per-customer,
+counted, and logged once per run with a count, exactly like a 404. Every other
+status (403 above all) still propagates for the caller's degradation guard.
+See `KNOWN_UNVERIFIED.md`'s "RESOLVED (2026-09-17)" entry for the full
+root-cause writeup — this is the sole cause of today's blank
+`customer_phone`/`customer_email` columns; the field-reading side needed no
+change.
+
+### Widened: the Profit Wizard outbox reader also accepts a `jobs`-keyed envelope
+
+`outbox/profitwizard._items_of` now also reads a claim response keyed
+`{"jobs": [...]}`, alongside the existing `items`/`results`/`rows`/`data`. Their
+claim endpoint answered under `jobs` on a live run today (now also fixed on
+their side to return `items` too); this keeps both shapes tolerated, per this
+client's own "widen, never narrow" rule for their contract.
+
+### Documented (not fixed): `jobs.recall_for_id`/`jobs.warranty_id` likely missing from the export feed
+
+Live evidence (Door Serv Pro, 2471 rows): `recall_for_id` populated on 1 row
+where Profit Wizard's Direct path marks 111 of ~6000 jobs from the same tenant
+as recalls; `warranty_id` blank on all 2471. Strong signal the
+`jpm/.../export/jobs` change-feed omits or misnames these fields relative to
+the `jpm/.../jobs` list endpoint Profit Wizard's Direct path actually reads —
+not a wrong spelling in THIS exporter, and not confirmed enough to guess a fix.
+See `KNOWN_UNVERIFIED.md` for the full writeup and the suggested next step (a
+per-delta list-endpoint lookup). Neither column is added to `ALL_BLANK_OK` —
+the blank-column detector firing on them is correct, not noise.
+
 ## [Unreleased] · `mypy src/` passes, and CI now runs it
 
 ### Fixed: 91 strict-mode findings, none of them a behaviour change

@@ -129,6 +129,42 @@ class TestPerCustomerFetch:
         assert contacts["11"] == [{"type": "Phone", "value": "555-1"}]
 
     @respx.mock
+    def test_a_409_on_one_customer_does_not_lose_the_others(self, st_settings) -> None:
+        """Live evidence from Door Serv Pro: ServiceTitan answers 409 "Customer
+        ID = <id> is not active" for an inactive customer. Before this fix that
+        escaped this loop entirely and blanked customer_phone/customer_email on
+        EVERY row of the run, not just the inactive customer's."""
+        mock_auth_token(st_settings.auth_url)
+        respx.get(_contacts_route(st_settings.api_base, 10)).mock(
+            return_value=httpx.Response(409, text="Customer ID = 10 is not active")
+        )
+        respx.get(_contacts_route(st_settings.api_base, 11)).mock(
+            return_value=httpx.Response(
+                200, json={"data": [{"type": "Phone", "value": "555-1"}], "hasMore": False}
+            )
+        )
+        contacts = fetch_contacts_per_customer(_client(st_settings), [10, 11])
+        assert "10" not in contacts
+        assert contacts["11"] == [{"type": "Phone", "value": "555-1"}]
+
+    @respx.mock
+    def test_a_409_is_logged_once_per_run_with_a_count_not_once_per_customer(
+        self, st_settings, caplog
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        for cid in (10, 11, 12):
+            respx.get(_contacts_route(st_settings.api_base, cid)).mock(
+                return_value=httpx.Response(409, text="Customer ID = %d is not active" % cid)
+            )
+        with caplog.at_level("INFO", logger="st_exporter"):
+            contacts = fetch_contacts_per_customer(_client(st_settings), [10, 11, 12])
+
+        assert contacts == {}
+        inactive_lines = [record.message for record in caplog.records if "409" in record.message]
+        assert len(inactive_lines) == 1
+        assert "3 customer" in inactive_lines[0]
+
+    @respx.mock
     def test_a_403_is_raised_for_the_callers_degradation_guard(self, st_settings) -> None:
         """Not swallowed here: silently returning {} is the blank-column bug again."""
         mock_auth_token(st_settings.auth_url)
