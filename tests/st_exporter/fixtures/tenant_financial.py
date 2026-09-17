@@ -102,6 +102,38 @@ TIMESHEETS_BY_JOB = {
     ],
 }
 
+ESTIMATE_1 = {
+    "id": 700,
+    "job": {"id": 7, "jobNumber": "J-7"},
+    "name": "Door replacement",
+    "status": {"value": 2, "name": "Sold"},
+    "active": True,
+    "soldOn": "2026-09-01T00:00:00Z",
+    "soldBy": {"id": 9},
+    "subtotal": 1000,
+    "total": 900,
+    "modifiedOn": "2026-09-01T00:00:00Z",
+    "items": [
+        {
+            "id": 7001,
+            "sku": {"id": 55, "type": "Service", "soldHours": 2.5},
+            "qty": 1,
+            "total": 300,
+            "unitCost": 40,
+            "totalCost": 40,
+        }
+    ],
+}
+ESTIMATE_2_UNSOLD_NO_ITEMS = {
+    "id": 701,
+    "jobId": 8,
+    "name": "Follow-up estimate",
+    "status": "Open",
+    "active": True,
+    "items": [],
+}
+ESTIMATES = [ESTIMATE_1, ESTIMATE_2_UNSOLD_NO_ITEMS]
+
 BUSINESS_UNITS = [
     {
         "id": 3,
@@ -182,6 +214,9 @@ def register(
     )
     respx.get(f"{base}/settings/v2/tenant/{TENANT_ID}/business-units").mock(
         return_value=httpx.Response(200, json=_envelope(BUSINESS_UNITS))
+    )
+    respx.get(f"{base}/sales/v2/tenant/{TENANT_ID}/estimates").mock(
+        return_value=httpx.Response(200, json=_envelope(ESTIMATES))
     )
 
     reporting = f"{base}/reporting/v2/tenant/{TENANT_ID}"

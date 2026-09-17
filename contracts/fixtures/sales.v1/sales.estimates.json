@@ -1,0 +1,36 @@
+{
+  "feed": "sales",
+  "contract_version": "sales.v1",
+  "tab": "sales.estimates",
+  "grain": "one row per estimate ITEM; an estimate with no items still writes one row with every Item* column blank",
+  "row_key": [
+    "EstimateId",
+    "ItemId"
+  ],
+  "columns": [
+    "EstimateId",
+    "JobId",
+    "JobNumber",
+    "EstimateName",
+    "Status",
+    "Active",
+    "SoldOn",
+    "SoldById",
+    "Subtotal",
+    "Total",
+    "ItemId",
+    "ItemSkuId",
+    "ItemSkuType",
+    "ItemSkuSoldHours",
+    "ItemQuantity",
+    "ItemTotal",
+    "ItemUnitCost",
+    "ItemTotalCost",
+    "ModifiedOn"
+  ],
+  "rows": [
+    ["700", "7", "J-7", "Door replacement", "Sold", "true", "2026-09-03T00:00:00Z", "901", "1000", "1000", "7001", "55", "Service", "2.5", "1", "300", "40", "40", "2026-09-03T00:00:00Z"],
+    ["700", "7", "J-7", "Door replacement", "Sold", "true", "2026-09-03T00:00:00Z", "901", "1000", "1000", "7002", "56", "Material", "", "4", "700", "", "", "2026-09-03T00:00:00Z"],
+    ["701", "8", "", "Follow-up estimate", "Open", "true", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+  ]
+}

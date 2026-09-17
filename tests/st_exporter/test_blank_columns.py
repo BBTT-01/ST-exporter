@@ -173,7 +173,10 @@ class TestHookedIntoTheFeeds:
         ]
         store = InMemorySheetsStore()
         new_meta_rows = MetaRowSet()
-        with patch("st_exporter.run.fetch_technicians", return_value=technicians):
+        with (
+            patch("st_exporter.run.fetch_technicians", return_value=technicians),
+            patch("st_exporter.run.fetch_business_units", return_value={}),
+        ):
             row_count = _run_technicians_feed(
                 Mock(),
                 store,

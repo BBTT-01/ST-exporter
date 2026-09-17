@@ -191,6 +191,9 @@ def test_not_selecting_pricebook_leaves_its_tabs_and_meta_untouched(
     respx.get(f"{st_settings.api_base}/settings/v2/tenant/12345/technicians").mock(
         return_value=httpx.Response(200, json={"data": [], "hasMore": False})
     )
+    respx.get(f"{st_settings.api_base}/settings/v2/tenant/12345/business-units").mock(
+        return_value=httpx.Response(200, json={"data": [], "hasMore": False})
+    )
     summary = _run(st_settings, exporter_settings, export_store, feeds=frozenset({"technicians"}))
 
     assert summary.pricebook_row_counts is None

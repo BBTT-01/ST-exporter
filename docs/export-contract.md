@@ -38,6 +38,7 @@ beside `exporter_version`.
 | `technicians` | **`technicians.v1`** | `technicians` |
 | `pricebook` | **`pricebook.v2`** | `pricebook.services`, `pricebook.equipment`, `pricebook.materials`, `pricebook.categories` |
 | `financial` | **`financial.v1`** | `accounting.invoices`, `payroll.timesheets`, `settings.businessUnits`, `reporting.jobCosts` |
+| `sales` | **`sales.v1`** | `sales.estimates` |
 
 The source of truth is `src/st_exporter/contracts.py`, and
 `contracts/fixtures/manifest.json` carries the same numbers in machine-readable
@@ -138,7 +139,14 @@ rows before the pricebook tabs alone would reach it — before the other feeds'
 share. Comfortable, but no longer irrelevant: a tenant with a six-figure catalogue
 is now worth checking rather than assuming.
 
-### A blank `contract_version`### A blank `contract_version`
+`sales.estimates` is written by the `--feeds financial` run (same six-hourly
+cadence as `reporting.jobCosts`) but carries its own version, `sales.v1`, rather
+than joining `financial.v1` — it is a wholly new tab, and a tab added to an
+already-published contract version is refused by
+`scripts/gen_contract_fixtures.py` (see that file). Which run schedule refreshes
+a tab and what version a consumer pins its reader against are independent.
+
+### A blank `contract_version`
 
 An exporter at 0.2.8 or older wrote `jobs` and `technicians` rows with a **blank**
 `contract_version`. Blank is its own case:
@@ -271,6 +279,7 @@ contracts/fixtures/pricebook.v2/pricebook.services.json
 contracts/fixtures/pricebook.v2/…          (equipment, materials, categories)
 contracts/fixtures/financial.v1/accounting.invoices.json
 contracts/fixtures/financial.v1/…          (timesheets, businessUnits, jobCosts)
+contracts/fixtures/sales.v1/sales.estimates.json
 ```
 
 **Format is JSON**, because three of the four codebases are TypeScript and one is

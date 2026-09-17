@@ -4,6 +4,47 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Profit Wizard hosted parity: callback flags, sold estimates
+
+### Added: 6 columns on `jobs`, 7 on `technicians`, and a new `sales.estimates` tab
+
+Closes the remaining gap between Profit Wizard's hosted (Export Store) path and
+its Direct ServiceTitan path: callback/recall detection, warranty jobs, booked
+job totals, technician phone/business-unit/home-location, and sold estimates
+were readable Direct but absent from every Sheet.
+
+* **`jobs`** gains `recall_for_id`, `warranty_id`, `no_charge`, `total`,
+  `business_unit_id`, `sold_by_id` — appended after the already-appended
+  `completed_on`/`total_revenue`, so `jobs.v2`'s
+  column list, grain and row key are untouched and the fixture regenerates with
+  the existing rows byte-identical plus the new trailing cells.
+* **`technicians`** gains `phone`, `business_unit_id`, `business_unit_name`,
+  `role_ids`, `home_address`, `home_latitude`, `home_longitude` — same rule,
+  `technicians.v1` unchanged. `business_unit_name` resolves against the SAME
+  `settings/business-units` reference table `jobs.business_unit` already joins,
+  so a business unit's name can never disagree between the two tabs.
+* **New tab `sales.estimates`**, one row per estimate ITEM (an estimate with no
+  items still writes one row with the `Item*` columns blank), fetched from the
+  Sales & Estimates API's `estimates` list and windowed like the rest of the
+  `financial` feed. It runs on the `financial` feed's six-hourly cadence and
+  behaves exactly like `reporting.jobCosts` for permissions — absent, not empty,
+  for a tenant that lacks the Estimates permission — but ships under its OWN
+  contract version, `sales.v1`, because it is a wholly new tab rather than an
+  appended column: adding a tab to an already-published version is refused by
+  `scripts/gen_contract_fixtures.py`.
+* Several of the new fields are unverified against a real tenant — see
+  `KNOWN_UNVERIFIED.md`, "Profit Wizard hosted-parity columns".
+  `jobs.recall_for_id` / `warranty_id` are the well-evidenced exception: Profit
+  Wizard's own Direct path already reads these exact JPM job fields in
+  production.
+* `sales.estimates.SoldById` accepts ServiceTitan's bare-integer `soldBy` (the
+  shape this repo's own `estimates-sell` docs use), not only a nested `{id}`.
+  `Total` falls back to `subtotal + tax` when the response carries no `total`,
+  and only when both parts are present — blank otherwise, never `0`.
+* **No contract bump on `jobs` or `technicians`.** `sales.estimates` is a brand
+  new tab under a brand new version, `sales.v1`; nothing published under
+  `jobs.v2`, `technicians.v1`, `pricebook.v1` or `financial.v1` changed shape.
+
 ## [Unreleased] · CI lints all of src/ and tests/, not half of it
 
 ### Fixed: `src/st_cli/` and most of `tests/` were never linted

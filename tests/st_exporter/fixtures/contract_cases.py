@@ -107,6 +107,9 @@ _APPOINTMENT_300_UNASSIGNED = {
 #: than sitting on the job, and whose location carries coordinates. Pins the
 #: `latitude`/`longitude`/`job_type`/`business_unit` columns as non-blank — a
 #: column blank on every fixture row is a column whose spelling nothing checks.
+#: Pins the 7 appended Profit Wizard hosted-parity columns as NON-blank — a
+#: column blank on every fixture row is a column whose spelling nothing checks.
+#: `_JOB_3_NO_LOCATION` (above) already pins the blank case for all seven.
 _JOB_4 = {
     "id": 4,
     "jobNumber": "J-4",
@@ -117,6 +120,12 @@ _JOB_4 = {
     "jobStatus": "Scheduled",
     "summary": "Install, whole crew",
     "modifiedOn": f"{_SECOND_DAY}T00:00:00Z",
+    "completedOn": f"{_SECOND_DAY}T16:00:00Z",
+    "recallForId": 2,
+    "warrantyId": 9,
+    "noCharge": False,
+    "total": 1250.5,
+    "soldById": 901,
 }
 _LOCATION_22 = {
     "id": 22,
@@ -175,10 +184,33 @@ def job_rows() -> list[dict[str, Any]]:
 
 # --- technicians --------------------------------------------------------------
 
-_TECHNICIAN_901 = {"id": 901, "name": "Tech Two", "email": "tech2@example.invalid", "active": True}
+#: Pins the 7 appended Profit Wizard hosted-parity columns as NON-blank.
+#: `_TECHNICIAN_902_UNKNOWN_ACTIVE` (below) pins the blank case for all seven.
+_TECHNICIAN_901 = {
+    "id": 901,
+    "name": "Tech Two",
+    "email": "tech2@example.invalid",
+    "active": True,
+    "phoneNumber": "555-0155",
+    "businessUnitId": 3,
+    "roleIds": [10, 11],
+    "homeAddress": {
+        "street": "9 Fixture Ln",
+        "city": "Springfield",
+        "state": "IL",
+        "zip": "62701",
+        "latitude": 39.79,
+        "longitude": -89.65,
+    },
+}
 #: No `active` field at all. Blank, never "false" — guessing false retires a live
-#: technician.
+#: technician. Also carries none of the seven appended columns, pinning them
+#: blank rather than a guessed default.
 _TECHNICIAN_902_UNKNOWN_ACTIVE = {"id": 902, "name": "Tech Three", "email": None}
+
+#: The reference table `technicians.business_unit_name` resolves against — the
+#: SAME shape `jobs.business_unit` already joins to (see `job_rows()` above).
+_TECHNICIAN_BUSINESS_UNITS: dict[str, Any] = {"3": {"name": "Doors"}}
 
 # --- pricebook ----------------------------------------------------------------
 
@@ -233,6 +265,62 @@ def _as_fetched(*records: dict[str, Any]) -> list[dict[str, Any]]:
     return apply_category_names([dict(record) for record in records], _CATEGORY_NAMES)
 
 
+# --- sales.estimates -----------------------------------------------------------
+
+#: A sold estimate with two items — a normal money-and-hours item next to one
+#: whose cost/hours are absent (blank, never "0"), pinning that distinction on
+#: the tab's own money/hours columns the way `tenant_financial.INVOICE_1` does
+#: for `accounting.invoices`.
+_ESTIMATE_1_SOLD = {
+    "id": 700,
+    "job": {"id": 7, "jobNumber": "J-7"},
+    "name": "Door replacement",
+    "status": {"value": 2, "name": "Sold"},
+    "active": True,
+    "soldOn": f"{_APPOINTMENT_DAY}T00:00:00Z",
+    # Bare employee id, as the Estimates API returns it (and as this repo's own
+    # `estimates-sell` docs send it) — not a nested `{id}`.
+    "soldBy": 901,
+    # No `total` on the response: `Total` is `subtotal + tax`, both present. Tax
+    # is a real 0 here so the derived cell still traces to a fixture literal
+    # (`test_every_fixture_cell_traces_back_to_a_synthetic_source_record`); the
+    # non-zero sum is pinned by `test_sales.py`.
+    "subtotal": 1000,
+    "tax": 0,
+    "modifiedOn": f"{_APPOINTMENT_DAY}T00:00:00Z",
+    "items": [
+        {
+            "id": 7001,
+            "sku": {"id": 55, "type": "Service", "soldHours": 2.5},
+            "qty": 1,
+            "total": 300,
+            "unitCost": 40,
+            "totalCost": 40,
+        },
+        {
+            "id": 7002,
+            "sku": {"id": 56, "type": "Material"},
+            "qty": 4,
+            "total": 700,
+            "unitCost": None,
+            "totalCost": None,
+        },
+    ],
+}
+#: Never sold — `SoldOn`/`SoldById` blank, not a guessed date — and no items at
+#: all, so it writes exactly one row with every `Item*` column blank.
+_ESTIMATE_2_UNSOLD_NO_ITEMS = {
+    "id": 701,
+    "jobId": 8,
+    "name": "Follow-up estimate",
+    "status": "Open",
+    "active": True,
+    "items": [],
+}
+#: No id: dropped entirely, same rule as a keyless pricebook item or invoice.
+_ESTIMATE_NO_ID = {"jobId": 9, "name": "Dropped", "items": []}
+
+
 def _report_rows() -> list[dict[str, Any]]:
     """The Job Costing Summary report's rows, keyed by its own field names.
 
@@ -278,6 +366,7 @@ SOURCE_RECORDS: dict[str, list[dict[str, Any]]] = {
     ),
     "settings.businessUnits": tenant_financial.BUSINESS_UNITS,
     "reporting.jobCosts": _report_rows(),
+    "sales.estimates": [_ESTIMATE_1_SOLD, _ESTIMATE_2_UNSOLD_NO_ITEMS, _ESTIMATE_NO_ID],
 }
 
 SOURCE_RECORDS["jobs"] = job_rows()

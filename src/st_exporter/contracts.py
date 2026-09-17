@@ -72,7 +72,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from st_exporter import financial, pricebook
+from st_exporter import financial, pricebook, sales
 from st_exporter import format as tab_format
 
 #: A callable that turns a list of source records into the exact grid (header row
@@ -220,8 +220,34 @@ FINANCIAL = FeedContract(
     ),
 )
 
+#: `sales.estimates` is a wholly NEW tab, not an appended column on an existing
+#: one, so it gets its OWN contract version rather than joining `financial.v1` —
+#: adding a tab to an already-published version is refused by
+#: `scripts/gen_contract_fixtures.py` (see its module docstring): the register
+#: pins the exact set of files released under a version, and only a genuinely
+#: NEW version may add one. It is wired into the `financial` FEED's run cadence
+#: (``run._run_financial_feed``) even though its contract version differs — the
+#: two are independent axes: which run refreshes a tab, and what a consumer
+#: pins its reader against.
+SALES = FeedContract(
+    feed="sales",
+    version=sales.CONTRACT_VERSION,
+    tabs=(
+        TabContract(
+            name="sales.estimates",
+            columns=sales.ESTIMATE_COLUMNS,
+            grain=(
+                "one row per estimate ITEM; an estimate with no items still "
+                "writes one row with every Item* column blank"
+            ),
+            row_key=sales.ESTIMATE_KEY_COLUMNS,
+            build=sales.build_estimate_grid,
+        ),
+    ),
+)
+
 #: Every feed that writes a versioned tab, in the order they appear in `_meta`.
-FEEDS: tuple[FeedContract, ...] = (JOBS, TECHNICIANS, PRICEBOOK, FINANCIAL)
+FEEDS: tuple[FeedContract, ...] = (JOBS, TECHNICIANS, PRICEBOOK, FINANCIAL, SALES)
 
 #: Feed name -> contract version, i.e. exactly what lands in `_meta.contract_version`.
 CONTRACT_VERSIONS: dict[str, str] = {contract.feed: contract.version for contract in FEEDS}

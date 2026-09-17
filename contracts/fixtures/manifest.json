@@ -72,6 +72,16 @@
           "row_count": 2
         }
       }
+    },
+    "sales": {
+      "contract_version": "sales.v1",
+      "tabs": {
+        "sales.estimates": {
+          "path": "sales.v1/sales.estimates.json",
+          "sha256": "50b1dee4ebefdfd226673477e1b4f7077b7c760686f00ac06dab6d9228d17dad",
+          "row_count": 3
+        }
+      }
     }
   }
 }
