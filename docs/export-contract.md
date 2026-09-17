@@ -36,8 +36,9 @@ beside `exporter_version`.
 |---|---|---|
 | `jobs` | **`jobs.v2`** | `jobs` |
 | `technicians` | **`technicians.v1`** | `technicians` |
-| `pricebook` | **`pricebook.v1`** | `pricebook.services`, `pricebook.equipment`, `pricebook.materials`, `pricebook.categories` |
+| `pricebook` | **`pricebook.v2`** | `pricebook.services`, `pricebook.equipment`, `pricebook.materials`, `pricebook.categories` |
 | `financial` | **`financial.v1`** | `accounting.invoices`, `payroll.timesheets`, `settings.businessUnits`, `reporting.jobCosts` |
+| `sales` | **`sales.v1`** | `sales.estimates` |
 
 The source of truth is `src/st_exporter/contracts.py`, and
 `contracts/fixtures/manifest.json` carries the same numbers in machine-readable
@@ -65,6 +66,86 @@ directory from `jobs.v2` onwards exists as files, and stays.
 
 `technicians` has never changed shape, so it is `technicians.v1`.
 
+### Why `pricebook` is v2 and not v1
+
+`pricebook.v2` APPENDS columns and removes none. The three item tabs go from 12
+columns to 42 and the category tab from 4 to 13; in every case the original
+columns keep their names, their meanings and their positions, and the tabs, the
+grain and the row key are untouched. By the rules below that is additive and would
+not force a bump.
+
+It is a bump anyway, because the published register forces it and should. A
+released fixture's bytes may never change (see "The fixture suite"), and appending
+a column changes every row of every fixture under that version. The alternatives
+were both worse: `--republish pricebook.v1` is refused structurally the moment
+`columns` moves, and relaxing that refusal to allow "additive" rewrites would hand
+the next person a way to reshape a released tab in place, which is the one thing
+the register exists to prevent.
+
+So a consumer still pinned to `pricebook.v1` keeps its frozen fixtures and its
+twelve columns, and a consumer that wants the rest widens its supported range to
+include `pricebook.v2`. Until it does, its contract check refuses the tab —
+loudly, which is the intended order of events.
+
+### Why the pricebook tabs carry the whole payload
+
+`pricebook.v1` emitted twelve hand-picked columns. `cost` and `hours` were sitting
+in the same JSON response, unpicked, and Profit Wizard imported 35,138 items it
+could not price a single one of. The same shape had already cost three other round
+trips.
+
+The asymmetry is the whole argument. A field nobody picked costs an exporter
+change, a re-run and a redeploy in every consumer. A field nobody wants costs one
+more mostly-blank column. So the item and category tabs now emit **every scalar
+ServiceTitan returns on the pricebook list endpoints**, and the judgement about
+which ones matter moves to the consumer, where it is cheap to change.
+
+That does not mean every byte of the response. The flattening rules, all of them
+conventions these tabs already used:
+
+- a **scalar** is its own column, named in snake_case after the ServiceTitan
+  field;
+- a **nested object** is flattened into one column per scalar, prefixed with the
+  object's name (`primaryVendor.vendorPart` → `primary_vendor_part`). The
+  equipment tab's two warranties keep separate column pairs from the service
+  warranty;
+- a **list of objects** becomes index-aligned CSV columns, exactly as
+  `category_ids` / `category_names` already did;
+- a **list of scalars** becomes one comma-separated cell, as `image_refs` did.
+
+And four things are deliberately absent, because a cell that cannot carry the fact
+honestly is worse than no column at all:
+
+| Not exported | Why |
+|---|---|
+| `externalData` | An arbitrary key/value bag any other integration can write to this tenant's SKUs — the one field here that could plausibly hold a token. The Export Store is not the place to find that out. |
+| `serviceMaterials`, `serviceEquipment`, `equipmentMaterials` | A bill of materials, `{skuId, quantity}` per entry. A CSV of sku ids would look like a usable BOM with every quantity silently dropped. It needs its own tab at its own grain. |
+| `recommendations`, `upgrades` | Cross-sell links; same objection, no costing value. |
+| `subcategories` | A recursive tree. `parent_id` already carries every edge in it, one row at a time. |
+
+**One column set across three tabs.** `pricebook.services`, `pricebook.equipment`
+and `pricebook.materials` share a single header — the UNION of the three
+resources' fields — so one parser still reads all three. A column a resource does
+not have is blank on every one of its rows: `is_labor` on equipment, `cost` and
+`manufacturer` on services, `cross_sale_group` on materials. That is
+by construction, not a gap in the data, and `blank_columns` exempts each one by
+name with that reason rather than warning about it on every run.
+
+**Size.** Google Sheets caps a spreadsheet at 10,000,000 cells, shared across every
+tab the exporter writes. At 42 columns the pilot tenant's 35,138 pricebook items
+come to ~1.48M cells (up from ~0.42M at 12 columns), and the category tab is
+negligible. That is about 15% of the cap, leaving room for roughly 238,000 item
+rows before the pricebook tabs alone would reach it — before the other feeds'
+share. Comfortable, but no longer irrelevant: a tenant with a six-figure catalogue
+is now worth checking rather than assuming.
+
+`sales.estimates` is written by the `--feeds financial` run (same six-hourly
+cadence as `reporting.jobCosts`) but carries its own version, `sales.v1`, rather
+than joining `financial.v1` — it is a wholly new tab, and a tab added to an
+already-published contract version is refused by
+`scripts/gen_contract_fixtures.py` (see that file). Which run schedule refreshes
+a tab and what version a consumer pins its reader against are independent.
+
 ### A blank `contract_version`
 
 An exporter at 0.2.8 or older wrote `jobs` and `technicians` rows with a **blank**
@@ -88,6 +169,47 @@ Bump the feed's contract version when any of these happens to one of its tabs:
 What does **not** force a bump: **appending** a new column at the end. Consumers
 look columns up by name and ignore the rest, so an appended column is additive.
 Note it in the CHANGELOG; do not bump.
+
+### What an appended column does to the fixture suite
+
+This rule and the published register used to contradict each other, and the
+register won. Appending a column changes the bytes of the released version's
+fixture, `gen_contract_fixtures.py` refused every byte change alike, and the only
+way out it offered was the bump this rule says not to make.
+
+Taking that bump is not a harmless over-signal. A consumer pinned to the old
+version MUST return `unsupported_contract` and stop parsing (see "What a consumer
+MUST do"), so bumping for an appended column takes a tab from *missing one cell*
+to *dark* — for every consumer — until each of them widens its range and deploys.
+For a column added to fix a live outage that inverts the fix.
+
+So a pure append is now recognised rather than refused, and
+`contracts.appended_columns` / `contracts.additive_refusals` are the one place
+that decides what "pure" means. Concretely, when you append a column:
+
+- the released fixture is **left exactly as it was published** — its bytes, its
+  `sha256` in `published.json`, and its `row_count` in `manifest.json` all stay
+  put, so `check_register_append_only.py` stays green and a consumer pinned to
+  that version keeps testing against the file it was released with;
+- the generator prints an `APPENDED COLUMN(S)` notice naming the new columns, and
+  writes nothing;
+- **the appended column has no committed fixture** until the next version bump
+  gives the tab a fresh directory.
+
+That last point is the honest cost of not bumping. It is bounded by what an
+appended column *is* — one no consumer of the current version reads, because the
+current version never promised it — but it does mean a consumer that starts
+reading an appended column is reading something the fixture suite does not cover.
+**If you need fixture coverage of a new column, that is the reason to bump**, and
+the bump should then be co-ordinated with the consumers rather than shipped ahead
+of them.
+
+Everything else is refused exactly as before, and each is pinned by a test: a
+rename, a removal, a **re-order** (`appended_columns` is positional, not
+set-based, precisely so `(a, b, c) -> (b, a, c, d)` is not mistaken for an
+append), a changed cell in a released column — including one riding along beside
+a legitimate append — a changed row count, and an append judged against a
+released file whose sha no longer matches the register.
 
 ## Cell rules that hold across every tab
 
@@ -128,7 +250,8 @@ These are part of the contract, not implementation detail:
 ## What a consumer MUST do
 
 1. **Declare the range you understand**, per feed — e.g. "this app reads
-   `pricebook.v1`". Keep it beside the code that parses, not in a README.
+   `pricebook.v1` and `pricebook.v2`". Keep it beside the code that parses, not
+   in a README.
 2. **Read `_meta.contract_version` for the tab before parsing it.**
 3. On a version **outside your range** (including blank), return a typed
    `unsupported_contract` outcome. Do **not** parse. Do **not** guess. Do **not**
@@ -151,10 +274,12 @@ contracts/fixtures/manifest.json          # versions + sha256 of every file
 contracts/fixtures/published.json         # sha256 of every file AS RELEASED
 contracts/fixtures/jobs.v2/jobs.json
 contracts/fixtures/technicians.v1/technicians.json
-contracts/fixtures/pricebook.v1/pricebook.services.json
-contracts/fixtures/pricebook.v1/…          (equipment, materials, categories)
+contracts/fixtures/pricebook.v1/…          (the frozen twelve-column shape)
+contracts/fixtures/pricebook.v2/pricebook.services.json
+contracts/fixtures/pricebook.v2/…          (equipment, materials, categories)
 contracts/fixtures/financial.v1/accounting.invoices.json
 contracts/fixtures/financial.v1/…          (timesheets, businessUnits, jobCosts)
+contracts/fixtures/sales.v1/sales.estimates.json
 ```
 
 **Format is JSON**, because three of the four codebases are TypeScript and one is
@@ -215,7 +340,7 @@ Each file:
 ```jsonc
 {
   "feed": "pricebook",
-  "contract_version": "pricebook.v1",
+  "contract_version": "pricebook.v2",
   "tab": "pricebook.services",
   "grain": "one row per pricebook item that has an st_id; …",
   "row_key": ["st_id"],
@@ -234,7 +359,18 @@ nothing else.
 The rows are not a happy path. They pin the cells that have already gone wrong, or
 are one careless edit from going wrong:
 
-- a **null price** next to a real **`0`** price, and a null cost next to a `0` cost;
+- a **null price** next to a real **`0`** price, a **null `cost`** next to a real
+  **`0`** cost and a **null `hours`** next to a real **`0`** hours, on the same
+  tab — a null cost read as zero prices an item at pure margin;
+- a `pricebook.services` row whose **`cost` is blank because the field does not
+  exist upstream**, beside equipment and material rows that carry one;
+- an item with **both equipment warranties populated and different**, so a
+  consumer that collapsed them into one pair of columns fails on it;
+- an item with **no `primaryVendor` at all** beside one that has a full vendor,
+  and an `otherVendors` entry with **no vendor id**, dropped from both of its
+  index-aligned columns;
+- a category carrying **`businessUnitIds` and `skuImages`** (a scalar list, one
+  entry of it null) beside one carrying neither;
 - an **absent `active`** flag (blank) next to explicit `true` and `false`;
 - `category_ids` / `category_names` **index-aligned**, including a two-category item;
 - an `image_refs` list **deduped**, including an asset that is an authenticated
@@ -264,7 +400,7 @@ the data:
   "supported": {
     "jobs": ["jobs.v2"],
     "technicians": ["technicians.v1"],
-    "pricebook": ["pricebook.v1"],
+    "pricebook": ["pricebook.v1", "pricebook.v2"],
     "financial": ["financial.v1"]
   }
 }

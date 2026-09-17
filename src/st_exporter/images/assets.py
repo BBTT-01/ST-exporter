@@ -32,6 +32,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from st_exporter.format import to_cell_text
 
@@ -64,6 +65,18 @@ class PricebookAsset:
     alias: str | None
     asset_type: str | None
     is_default: bool
+    # The owning ITEM's ``modifiedOn``, carried here because it is the only
+    # cheap validator the pass has: it is known from the catalogue listing,
+    # before a single byte is downloaded. See ``upload._is_still_fresh`` — an
+    # asset whose item has not been modified since the ledger last confirmed it
+    # is skipped without a download, which is the difference between a pass that
+    # converges and one that re-downloads 7,000 images on every run to
+    # rediscover they were already sent.
+    #
+    # Blank when ServiceTitan omits it, and blank means "cannot prove
+    # freshness", never "fresh": the skip requires a non-empty value. Defaulted
+    # so every existing construction of this dataclass keeps working.
+    modified_on: str = ""
 
     @property
     def identity(self) -> str:
@@ -134,6 +147,7 @@ def select_uploadable_asset(record: dict[str, Any]) -> PricebookAsset | None:
         alias=_text_or_none(chosen.get("alias")),
         asset_type=_text_or_none(chosen.get("type")),
         is_default=_is_default(chosen),
+        modified_on=to_cell_text(record.get("modifiedOn")).strip(),
     )
 
 
@@ -152,6 +166,66 @@ def sniff_content_type(payload: bytes) -> ContentType | None:
     if len(payload) >= 12 and payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
         return _WEBP
     return None
+
+
+# The floor below which a byte-valid image is treated as a PLACEHOLDER rather
+# than as a picture.
+#
+# ServiceTitan's web image endpoint takes a `default=Default%2F1.png` parameter
+# and, when the caller may not see the real asset, answers **200 OK** with a
+# blank placeholder instead of a 404. One measured by hand was a 179x179 WebP of
+# 246 bytes: a perfectly well-formed RIFF/WEBP file that sniffs clean, uploads
+# clean, and shows the contractor an empty grey square. Sixteen thousand of
+# those, reported as a clean run, is the silent success this lane keeps hitting.
+#
+# 1 KiB, not 246. The threshold is not the observed sample — one tenant's
+# placeholder is one data point and the next could be 300 bytes — it is the
+# floor below which no PHOTOGRAPH exists. A lossy-compressed image carrying any
+# real detail costs on the order of a kilobyte before it carries anything: the
+# smallest real pricebook assets seen are 2-4 KiB, and a deliberately tiny
+# 64x64 product thumbnail still lands above 1 KiB. Everything under it is a
+# solid fill, a 1x1, or a spacer. 1 KiB is ~4x the observed placeholder — wide
+# enough that a differently-sized placeholder is still caught — and still well
+# under the smallest genuine asset, so it cannot silently drop a real image.
+#
+# This is deliberately NOT part of `sniff_content_type`: the sniff answers "what
+# format is this", stays exactly as narrow as TrueQuote's, and must keep
+# answering it. This answers a different question — "is this a picture of
+# anything" — and its rejections are counted under their own name.
+#
+# KNOWN INSUFFICIENT, unchanged on purpose. Two things are now established that
+# were not when this number was chosen:
+#
+# 1. "the smallest real pricebook assets seen are 2-4 KiB" above is an
+#    ASSUMPTION, not a measurement. It was written alongside this constant and
+#    no live pricebook asset has ever been sized — the only payload anyone has
+#    measured is the 246-byte placeholder. `images/upload.py` now reports
+#    min/median/max over every upload, which is what will settle it.
+# 2. A BLANK placeholder can clear this floor easily. Measured 2026-09-16
+#    against ServiceTitan's web-app image proxy: `?size=1200&default=…` answers
+#    200 `image/webp` with 2,798 bytes of completely white 1200x1200 image.
+#    Its size scales with `size=`, so no CONSTANT can be both above every
+#    placeholder and below every photograph.
+#
+# The floor stays because it is the only thing standing between a contractor and
+# a catalogue of 246-byte grey squares, and because the replacement must be set
+# from evidence rather than guessed — see `image_dimensions` and
+# `BLANK_DENSITY_BYTES_PER_PIXEL` at the foot of this module, which MEASURE the
+# better signal without yet acting on it.
+MIN_PLAUSIBLE_IMAGE_BYTES = 1024
+
+
+def is_placeholder_image(payload: bytes) -> bool:
+    """True for a byte-valid image too small to contain a real picture.
+
+    Size alone, on purpose. A content-hash blocklist would only catch the exact
+    placeholder we have already seen, and ServiceTitan serves a different one
+    per `default=` value and per requested `size=`; the floor catches every one
+    of them, including the ones nobody has met yet. The sha256 of each rejected
+    payload is logged so a hash rule can be added later if the floor ever proves
+    too blunt for a specific tenant.
+    """
+    return len(payload) < MIN_PLAUSIBLE_IMAGE_BYTES
 
 
 def idempotency_key(asset: PricebookAsset, payload: bytes) -> str:
@@ -194,3 +268,272 @@ def _is_default(asset: dict[str, Any]) -> bool:
 def _text_or_none(value: Any) -> str | None:
     text = to_cell_text(value).strip()
     return text or None
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics for a payload the sniff REFUSED.
+#
+# `sniff_content_type` returning None is the single most opaque outcome the
+# image pass has: the bytes arrived, they were discarded, and the run said
+# `unsupported=N` and nothing else. Run 35142282102 on `BBTT-01/tr-doorservpro`
+# rejected all five assets it fetched that way, and the counter alone cannot
+# tell "ServiceTitan handed us an HTML error page" from "this tenant's images
+# are GIFs".
+#
+# Everything below is INFORMATION ONLY. Nothing here widens what is accepted:
+# the sniff is unchanged, the declared `Content-Type` is still never trusted,
+# and a payload these functions can name is still refused.
+# ---------------------------------------------------------------------------
+
+# How many leading bytes are ever rendered. Both caps are small on purpose: a
+# rejected payload may be an HTML body containing anything at all, so the line
+# shows a fingerprint, never a document.
+HEX_PREVIEW_BYTES = 16
+ASCII_PREVIEW_CHARS = 32
+
+_MAGIC_SHAPES: tuple[tuple[bytes, str], ...] = (
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+    (b"BM", "bmp"),
+    (b"II*\x00", "tiff"),
+    (b"MM\x00*", "tiff"),
+    (b"%PDF", "pdf"),
+    (b"\x00\x00\x01\x00", "ico"),
+    (b"PK\x03\x04", "zip"),
+)
+
+_TEXT_SHAPES: tuple[tuple[str, str], ...] = (
+    ("<!doctype html", "html"),
+    ("<html", "html"),
+    ("<svg", "svg"),
+    ("<?xml", "xml"),
+    ("{", "json"),
+    ("[", "json"),
+)
+
+
+def payload_shape(payload: bytes) -> str:
+    """A one-word guess at what a rejected payload actually is.
+
+    A PREFIX CHECK, not a parser: it never decodes the body, never allocates
+    more than the first few dozen bytes, and is wrong in the harmless direction
+    (``unknown``) whenever it is not sure. The point is that one summary line
+    can say ``html:5`` — "we are not downloading images at all" — or ``gif:5``
+    — "a format we do not accept" — which are opposite diagnoses.
+    """
+    if not payload:
+        return "empty"
+    head = payload[:64].lstrip(b"\xef\xbb\xbf").lstrip()
+    for magic, shape in _MAGIC_SHAPES:
+        if payload.startswith(magic):
+            return shape
+    if payload[4:8] == b"ftyp":
+        return "heic"
+    lowered = head[:32].lower()
+    for prefix, shape in _TEXT_SHAPES:
+        if lowered.startswith(prefix.encode()):
+            return shape
+    if head and all(0x20 <= byte < 0x7F or byte in (0x09, 0x0A, 0x0D) for byte in head):
+        return "text"
+    return "unknown"
+
+
+def payload_hex_prefix(payload: bytes, limit: int = HEX_PREVIEW_BYTES) -> str:
+    """The first ``limit`` bytes as spaced hex. Empty payload renders as ``-``."""
+    return payload[:limit].hex(" ") or "-"
+
+
+def payload_ascii_preview(payload: bytes, limit: int = ASCII_PREVIEW_CHARS) -> str:
+    """A bounded, control-free rendering of the leading bytes.
+
+    Every byte outside printable ASCII becomes ``.`` — including newline and
+    tab, so the result can never break a log line or smuggle a terminal escape
+    — and at most ``limit`` characters are produced whatever arrives.
+    """
+    return "".join(chr(byte) if 0x20 <= byte < 0x7F else "." for byte in payload[:limit])
+
+
+def redact_source_url(url: str) -> str:
+    """The asset url as it may be logged: no credentials, no query, no fragment.
+
+    An asset url can be presigned (see ``images/conditional.py``), so its query
+    string IS a credential. The path is kept because it is what identifies the
+    asset to a human reading the log; everything that could carry a secret is
+    replaced by a marker that still says one was there.
+    """
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # pragma: no cover - urlsplit is extremely permissive
+        return "<unparseable-url>"
+    if not parts.scheme and not parts.netloc:
+        # A ServiceTitan storage path like `Images/Pricebook/x.jpg`. No
+        # credential can hide in one — `is_storage_path` forbids `?` and `@`.
+        return url.split("?", 1)[0]
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    userinfo = "<redacted>@" if parts.username or parts.password else ""
+    rendered = f"{parts.scheme}://{userinfo}{host}{parts.path}"
+    if parts.query:
+        rendered += "?<redacted>"
+    return rendered
+
+
+def describe_rejected_payload(payload: bytes) -> str:
+    """``shape=… bytes=… hex=… ascii=…`` for one payload the sniff refused."""
+    return (
+        f"shape={payload_shape(payload)} bytes={len(payload)} "
+        f"hex={payload_hex_prefix(payload)} "
+        f"ascii={payload_ascii_preview(payload)!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# HOW BIG IS THIS PICTURE, AND IS IT A PICTURE OF ANYTHING?
+#
+# `MIN_PLAUSIBLE_IMAGE_BYTES` is a FIXED byte floor, and a fixed byte floor
+# cannot answer either question. Measured on 2026-09-16 against ServiceTitan's
+# web-app image proxy:
+#
+#     GET .../Image/<path>                                  -> 404, 272 bytes
+#     GET .../Image/<path>?size=1200&default=Default%2F1.png -> 200, image/webp,
+#                                                               2798 bytes
+#
+# The 2,798-byte answer is a COMPLETELY BLANK WHITE 1200x1200 image. It clears
+# the 1 KiB floor with room to spare, and the placeholder's size scales with the
+# `size=` parameter, so no constant can be both above every placeholder and
+# below every photograph. (We call the AUTHENTICATED endpoint, not that proxy —
+# see the module docstring in `images/upload.py` — so it is not known that this
+# exact body ever reaches us. What IS known is that the floor could not stop it.)
+#
+# The signal that does scale is DENSITY: compressed bytes per pixel. A blank
+# 1200x1200 WebP is 0.0019 bytes/pixel; a photograph, however aggressively
+# compressed, is one to two orders of magnitude denser. Density needs the
+# DIMENSIONS, and the dimensions are in the file header — no decoding, no
+# dependency, no allocation beyond the first few dozen bytes.
+#
+# Everything below is INFORMATION ONLY, deliberately. It changes nothing about
+# what is accepted: the byte sniff is unchanged and the floor is unchanged. The
+# reason is order of operations — nobody has yet measured a single real
+# pricebook asset from this tenant, so there is no evidence from which to set a
+# rejection threshold, and a rule guessed today could silently drop real images.
+# What these functions do is produce that evidence, on the next run, per upload.
+# ---------------------------------------------------------------------------
+
+# Below this many compressed bytes per pixel, a payload is almost certainly a
+# flat fill rather than a photograph. Reported, never enforced.
+#
+# 0.01 sits ~5x above the measured blank (0.0019) and ~5x below the least dense
+# real JPEG one would expect (~0.05 at low quality). It is a WIDE gap on purpose
+# because it decides a log line, not an upload: being wrong here costs a
+# misleading count, and being wrong in a rejection rule would cost a contractor
+# their catalogue.
+BLANK_DENSITY_BYTES_PER_PIXEL = 0.01
+
+
+def image_dimensions(payload: bytes) -> tuple[int, int] | None:
+    """``(width, height)`` read from the file HEADER, or None.
+
+    Header parsing only — no decode, no image library, no pixel ever touched.
+    Covers exactly the three formats ``sniff_content_type`` accepts, because
+    anything else is refused before it gets here. Returns None whenever it is
+    not certain, which is the harmless direction: an unknown size means no
+    density is reported, never a wrong one.
+    """
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        # IHDR is mandatory and first: 8 signature + 4 length + 4 type, then
+        # two big-endian uint32s.
+        if len(payload) < 24 or payload[12:16] != b"IHDR":
+            return None
+        return (
+            int.from_bytes(payload[16:20], "big"),
+            int.from_bytes(payload[20:24], "big"),
+        )
+    if payload.startswith(b"\xff\xd8\xff"):
+        return _jpeg_dimensions(payload)
+    if len(payload) >= 12 and payload.startswith(b"RIFF") and payload[8:12] == b"WEBP":
+        return _webp_dimensions(payload)
+    return None
+
+
+def _jpeg_dimensions(payload: bytes) -> tuple[int, int] | None:
+    """Walk JPEG segment headers to the first SOF marker.
+
+    Bounded by the payload itself and by a hard segment count: a malformed or
+    hostile file must cost a few dozen iterations, never a scan of 8 MiB.
+    """
+    index = 2
+    for _ in range(64):
+        if index + 9 > len(payload) or payload[index] != 0xFF:
+            return None
+        marker = payload[index + 1]
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            index += 2
+            continue
+        length = int.from_bytes(payload[index + 2 : index + 4], "big")
+        if length < 2:
+            return None
+        # SOF0..SOF15, excluding the four that are not frame headers.
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            height = int.from_bytes(payload[index + 5 : index + 7], "big")
+            width = int.from_bytes(payload[index + 7 : index + 9], "big")
+            return (width, height)
+        index += 2 + length
+    return None
+
+
+def _webp_dimensions(payload: bytes) -> tuple[int, int] | None:
+    """VP8, VP8L and VP8X, the three WebP chunk layouts."""
+    if len(payload) < 30:
+        return None
+    chunk = payload[12:16]
+    if chunk == b"VP8X":
+        # 24-bit little-endian, stored as (value - 1).
+        width = int.from_bytes(payload[24:27], "little") + 1
+        height = int.from_bytes(payload[27:30], "little") + 1
+        return (width, height)
+    if chunk == b"VP8L":
+        bits = int.from_bytes(payload[21:25], "little")
+        return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+    if chunk == b"VP8 ":
+        if payload[23:26] != b"\x9d\x01\x2a":
+            return None
+        return (
+            int.from_bytes(payload[26:28], "little") & 0x3FFF,
+            int.from_bytes(payload[28:30], "little") & 0x3FFF,
+        )
+    return None
+
+
+def describe_image_size(payload: bytes) -> str:
+    """``bytes=2798 (2.7K) 1200x1200 density=0.0019/px SUSPECTED-BLANK``.
+
+    One string carrying every fact needed to answer "is ServiceTitan serving us
+    photographs, thumbnails, or blanks", for a log line. ``SUSPECTED-BLANK`` is
+    a WARNING WORD, not a decision: the payload is uploaded either way.
+    """
+    size = len(payload)
+    dimensions = image_dimensions(payload)
+    if dimensions is None or dimensions[0] <= 0 or dimensions[1] <= 0:
+        return f"bytes={size} dimensions=unknown density=unknown"
+    width, height = dimensions
+    density = size / (width * height)
+    verdict = " SUSPECTED-BLANK" if density < BLANK_DENSITY_BYTES_PER_PIXEL else ""
+    return f"bytes={size} {width}x{height} density={density:.4f}/px{verdict}"
+
+
+def looks_blank(payload: bytes) -> bool:
+    """True when this payload's byte DENSITY says it is a flat fill.
+
+    Reported by the image pass under its own counter and never acted on — see
+    the note above this section on why a rejection rule is not being guessed
+    before a single real asset has been measured. Unknown dimensions answer
+    False: no evidence is not evidence.
+    """
+    dimensions = image_dimensions(payload)
+    if dimensions is None or dimensions[0] <= 0 or dimensions[1] <= 0:
+        return False
+    width, height = dimensions
+    return len(payload) / (width * height) < BLANK_DENSITY_BYTES_PER_PIXEL

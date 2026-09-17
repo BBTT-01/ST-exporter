@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any, Callable, TypeVar
 
 from st_cli.client import ServiceTitanClient
@@ -50,6 +51,7 @@ from st_exporter.feeds.pricebook import (
 )
 from st_exporter.feeds.raw_cache import RawCache
 from st_exporter.feeds.reference import fetch_business_units, fetch_job_types, fetch_technicians
+from st_exporter.feeds.sales import fetch_estimates
 from st_exporter.financial import (
     CONTRACT_VERSION as FINANCIAL_CONTRACT_VERSION,
 )
@@ -67,7 +69,11 @@ from st_exporter.format import (
 )
 from st_exporter.images.client import TrueQuoteImageClient
 from st_exporter.images.ledger import ImageLedger
-from st_exporter.images.upload import ImageUploadSummary, upload_pricebook_images
+from st_exporter.images.upload import (
+    NO_ASSET_CAP,
+    ImageUploadSummary,
+    upload_pricebook_images,
+)
 from st_exporter.logging_setup import announce_to_actions, configure_logging, logger
 from st_exporter.meta import (
     CursorBundle,
@@ -77,7 +83,9 @@ from st_exporter.meta import (
     parse_meta_grid,
 )
 from st_exporter.pricebook import CONTRACT_VERSION, build_category_grid, build_item_grid
-from st_exporter.scopes import ScopeLedger
+from st_exporter.sales import CONTRACT_VERSION as SALES_CONTRACT_VERSION
+from st_exporter.sales import build_estimate_grid
+from st_exporter.scopes import ScopeLedger, is_permission_denied
 from st_exporter.sheets import SheetsClient, SheetsPort, get_gspread_client
 from st_exporter.window import DEFAULT_WINDOW_DAYS, FINANCIAL_WINDOW_DAYS, in_window
 from st_exporter.writeback import JobsWriteBack
@@ -98,9 +106,25 @@ _RAW_CUSTOMER_CONTACTS = "_raw_customer_contacts"
 # product's secrets in some other workflow job can no longer cause a second
 # drain of the same queue. See EXPORT_FEEDS / OUTBOX_FEED below and cli.py.
 OUTBOX_FEED = "outbox"
+# `images` is not an export feed either, and for the same structural reason: it
+# writes no export tab and no `_meta` row. It POSTs pricebook image BYTES to
+# TrueQuote and records what it sent in `_image_ledger`, a tab on the PRIVATE
+# raw-cache Sheet that nothing else reads or writes.
+#
+# It used to be a flag on the pricebook feed (`--upload-images`), sharing that
+# feed's invocation, its ten-minute job and its concurrency lock. On a tenant
+# with ~7,191 assets the download pass could not finish inside the job, so the
+# runner SIGKILLed it — run 35130164187 on `BBTT-01/tr-doorservpro`, killed at
+# 10m35s with 0 images uploaded — and a killed process flushes no ledger, so
+# every run restarted the catalogue from the top. It could never converge, and
+# while it failed it took the hourly pricebook export down with it.
+#
+# Splitting it out gives it its own timeout, its own cadence and its own lock.
+# See `run_images` for where an independent pass gets its image references.
+IMAGES_FEED = "images"
 EXPORT_FEEDS = frozenset({"jobs", "technicians", "pricebook", "financial"})
-_VALID_FEEDS = EXPORT_FEEDS | {OUTBOX_FEED}
-_FEED_LIST = "jobs, technicians, pricebook, financial, outbox"
+_VALID_FEEDS = EXPORT_FEEDS | {OUTBOX_FEED, IMAGES_FEED}
+_FEED_LIST = "jobs, technicians, pricebook, financial, images, outbox"
 # Neither `pricebook` nor `financial` is a default. `pricebook` is a catalogue on a
 # much slower cadence than jobs (~5 min) and technicians (~30 min), and re-listing
 # it on every jobs run would be pure waste. `financial` is a six-hourly feed —
@@ -115,18 +139,27 @@ PRICEBOOK_TABS: dict[str, str] = {f"pricebook.{resource}": resource for resource
 PRICEBOOK_CATEGORIES_TAB = "pricebook.categories"
 PRICEBOOK_FEED_NAMES: tuple[str, ...] = tuple(PRICEBOOK_TABS) + (PRICEBOOK_CATEGORIES_TAB,)
 
-# The four tabs the single `financial` feed writes. The names are Profit Wizard's,
-# not this exporter's — its reader (`lib/hosted/tabs.ts`) addresses these exact
+# The tabs the single `financial` feed writes. The names are Profit Wizard's, not
+# this exporter's — its reader (`lib/hosted/tabs.ts`) addresses these exact
 # strings, so they are part of the contract, dots and camelCase included.
 FINANCIAL_INVOICES_TAB = "accounting.invoices"
 FINANCIAL_TIMESHEETS_TAB = "payroll.timesheets"
 FINANCIAL_BUSINESS_UNITS_TAB = "settings.businessUnits"
 FINANCIAL_JOB_COSTS_TAB = "reporting.jobCosts"
+#: `sales.estimates` for Profit Wizard hosted parity (sold estimates / quotes).
+#: Wired into the `financial` feed's run cadence deliberately — same six-hourly
+#: window as `reporting.jobCosts` — even though it carries its OWN contract
+#: version (`sales.v1`, see `contracts.SALES`): a wholly new tab is a new
+#: version regardless of which feed's schedule refreshes it, and estimates are
+#: exactly the "grows without bound, six-hourly is plenty" shape the rest of
+#: this feed already exists for.
+FINANCIAL_ESTIMATES_TAB = "sales.estimates"
 FINANCIAL_FEED_NAMES: tuple[str, ...] = (
     FINANCIAL_INVOICES_TAB,
     FINANCIAL_TIMESHEETS_TAB,
     FINANCIAL_BUSINESS_UNITS_TAB,
     FINANCIAL_JOB_COSTS_TAB,
+    FINANCIAL_ESTIMATES_TAB,
 )
 
 # Every export tab this exporter can write — the unit a ServiceTitan permission is
@@ -174,7 +207,7 @@ class ExportSummary:
     images: ImageUploadSummary | None = None
     # Row count per successfully-written `financial` tab, or None when the feed
     # wasn't selected. A tab that FAILED is absent from this dict and present in
-    # `financial_failures` — the two together always name all four tabs, so
+    # `financial_failures` — the two together always name every tab, so
     # "wrote 0 rows" can never be confused with "didn't manage to write".
     financial_row_counts: dict[str, int] | None = None
     # Tab name -> why it was skipped, for the financial tabs that failed. Its
@@ -234,11 +267,12 @@ def run_export(
     (`pricebook.services`/`equipment`/`materials`/`categories`), each with its own
     `_meta` row — see ``pricebook.py`` for the frozen column contract.
 
-    ``financial`` is likewise one selectable feed writing four tabs
+    ``financial`` is likewise one selectable feed writing several tabs
     (`accounting.invoices`, `payroll.timesheets`, `settings.businessUnits`,
-    `reporting.jobCosts`) for Profit Wizard — see ``financial.py``. Its four tabs
-    are independent: one failing leaves the other three written and keeps the
-    failed tab's previous contents and `_meta` row.
+    `reporting.jobCosts`, `sales.estimates`) for Profit Wizard — see
+    ``financial.py``/``sales.py``. Its tabs are independent: one failing leaves
+    the others written and keeps the failed tab's previous contents and
+    `_meta` row.
 
     ``client``/``export_store``/``raw_cache_store`` can be injected (used by tests
     with fixtures and an in-memory Sheets double); left as ``None`` in production,
@@ -259,16 +293,164 @@ def run_export(
             feeds=feeds,
             window_days=exporter_settings.window_days,
             financial_window_days=exporter_settings.financial_window_days,
+            job_cost_report_id=exporter_settings.job_cost_report_id,
             financial_max_jobs=exporter_settings.financial_max_jobs,
             contacts_route=exporter_settings.contacts_route,
             contacts_max_customers=exporter_settings.contacts_max_customers,
             pricebook_category_ids=exporter_settings.pricebook_category_ids,
             image_client=image_client,
+            # `run_export` no longer runs an image pass in production — the
+            # `images` feed does (`run_images`), and `cli.py` builds an image
+            # client only for that feed. The budget is still computed and passed
+            # so the in-process lane stays bounded for any caller that injects an
+            # image client here directly, which the tests do.
+            image_deadline=monotonic() + exporter_settings.image_budget_seconds,
+            image_max_assets=exporter_settings.image_max_assets,
+            image_concurrency=exporter_settings.image_concurrency,
+            image_requests_per_second=exporter_settings.image_requests_per_second,
             dry_run=dry_run,
         )
     finally:
         if owns_client:
             active_client.close()
+
+
+def run_images(
+    st_settings: Settings,
+    exporter_settings: ExporterSettings,
+    *,
+    image_client: TrueQuoteImageClient,
+    client: ServiceTitanClient | None = None,
+    raw_cache_store: SheetsPort | None = None,
+    deadline: float | None = None,
+    max_assets: int | None = None,
+) -> ImageUploadSummary:
+    """Run the `images` feed: upload pricebook image bytes, and nothing else.
+
+    WHERE AN INDEPENDENT PASS GETS ITS IMAGE REFERENCES
+    ===================================================
+
+    It re-lists the pricebook from ServiceTitan, with the same
+    ``fetch_pricebook_items`` the `pricebook` feed uses and the same
+    ``pricebook_category_ids``. Two alternatives were considered and rejected:
+
+    **Reading the exported `pricebook.*` tabs back off the Sheet is not
+    possible** — not "expensive", not "coupled", impossible against the frozen
+    `pricebook.v1` contract. The tabs carry one image column, ``image_refs``,
+    and ``pricebook.asset_identifier`` fills it with the asset's ``id`` when
+    ServiceTitan supplies one and only otherwise with its ``url``. The url is
+    what gets downloaded, and for every asset that has an id the url is simply
+    not in the Sheet. ``select_uploadable_asset`` also needs ``fileName``,
+    ``alias``, ``type`` and ``isDefault``, and needs the whole candidate list to
+    pick the same primary image TrueQuote's own ``selectDefaultPricebookImage``
+    would. None of that is exported. Reading the Sheet back would have meant
+    widening a frozen consumer-facing contract to carry upload plumbing, and
+    then coupling the image pass to whether the pricebook feed had run recently.
+
+    **Persisting the item records in the raw cache** would work — that is what
+    ``feeds/raw_cache.py`` does for the five change feeds — but it makes the
+    hourly pricebook feed write several megabytes of JSON it has no other use
+    for, and reintroduces exactly the freshness coupling the split exists to
+    remove: the image pass would then be as stale as the last pricebook run.
+
+    **So it re-fetches, and the duplicated work is a rounding error.** The
+    listing is three paginated calls at 200 records a page — about 36 requests
+    for a 7,191-item catalogue — against a pass whose real cost is up to 7,191
+    HTTPS downloads of up to 8 MiB each. It is the same fetch that makes the
+    pricebook feed itself viable hourly. In exchange the feed is self-contained:
+    it does not care whether the pricebook tab has ever been written or how
+    stale it is, because it never reads it.
+
+    WHAT IT WRITES
+    ==============
+
+    ``_image_ledger``, on the PRIVATE raw-cache Sheet, and nothing else. No
+    export tab, no `_meta` row, no read-modify-write of any grid another feed
+    touches — which is what lets the caller give this job its own concurrency
+    lock instead of queueing it behind the export feeds. Never add a `_meta`
+    write here without moving the job back onto the shared lock.
+    """
+    configure_logging()
+
+    if deadline is None:
+        deadline = monotonic() + exporter_settings.image_budget_seconds
+    if max_assets is None:
+        max_assets = exporter_settings.image_max_assets
+
+    owns_client = client is None
+    active_client = client or ServiceTitanClient(st_settings)
+    try:
+        active_raw_cache_store = raw_cache_store or SheetsClient.open(
+            get_gspread_client(exporter_settings.service_account_json),
+            exporter_settings.raw_cache_sheet_id,
+        )
+        records, catalogue_complete = _fetch_image_catalogue(
+            active_client, category_ids=exporter_settings.pricebook_category_ids
+        )
+        summary = _upload_pricebook_images(
+            active_client,
+            active_raw_cache_store,
+            records,
+            image_client=image_client,
+            image_deadline=deadline,
+            image_max_assets=max_assets,
+            image_concurrency=exporter_settings.image_concurrency,
+            image_requests_per_second=exporter_settings.image_requests_per_second,
+            run_at=datetime.now(timezone.utc).isoformat(),
+            dry_run=False,
+            catalogue_complete=catalogue_complete,
+        )
+        # `_upload_pricebook_images` answers None only for "no client / dry run",
+        # neither of which can be true here.
+        assert summary is not None
+        return summary
+    finally:
+        if owns_client:
+            active_client.close()
+
+
+def _fetch_image_catalogue(
+    client: ServiceTitanClient,
+    *,
+    category_ids: tuple[str, ...] = (),
+) -> tuple[list[dict[str, Any]], bool]:
+    """Every pricebook item that could carry an image, and whether that is ALL of them.
+
+    One resource refused or failing must not cost the others: a TrueQuote-only
+    tenant has `Pricebook -> Services`, `-> Equipment` and `-> Categories` ticked
+    and NOT `-> Materials`, so a 403 on materials is the ORDINARY state of the
+    tenants this feed exists for, and treating it as a failure would skip the
+    images they are paying for. Same rule as the pricebook feed's `_TabGuard`.
+
+    The boolean is the prune veto, and it is the whole reason this returns a pair.
+    A resource that did not answer means its items never reached the list, so its
+    ledger entries would look "not seen" — and "not looked at" must never be read
+    as "gone". Anything short of a clean full listing sets it False.
+    """
+    records: list[dict[str, Any]] = []
+    complete = True
+    for resource in ITEM_RESOURCES:
+        try:
+            records.extend(fetch_pricebook_items(client, resource, category_ids=category_ids))
+        except STCLIError as exc:
+            complete = False
+            if is_permission_denied(exc):
+                # Quiet, like a never-granted tab: no annotation, no failure.
+                logger.info(
+                    "images: ServiceTitan answered 403 for pricebook.%s, so this tenant's "
+                    "app was not granted it. Its images are skipped and the other "
+                    "resources still run.",
+                    resource,
+                )
+            else:
+                logger.warning(
+                    "images: pricebook.%s could not be listed (%s). Its images are skipped "
+                    "this run and retried by the next one; the ledger is NOT pruned, so "
+                    "nothing already delivered is forgotten.",
+                    resource,
+                    exc,
+                )
+    return records, complete
 
 
 def _resolve_stores(
@@ -301,11 +483,18 @@ def _run(
     feeds: frozenset[str] = DEFAULT_FEEDS,
     window_days: int = DEFAULT_WINDOW_DAYS,
     financial_window_days: int = FINANCIAL_WINDOW_DAYS,
+    job_cost_report_id: str = "",
     financial_max_jobs: int = DEFAULT_MAX_TIMESHEET_JOBS,
     contacts_route: str = ROUTE_PER_CUSTOMER,
     contacts_max_customers: int = DEFAULT_MAX_CONTACT_CUSTOMERS,
     pricebook_category_ids: tuple[str, ...] = (),
     image_client: TrueQuoteImageClient | None = None,
+    # None = no budget. Only a caller that knows nothing will kill the process
+    # may leave it unset; `run_export` always sets one.
+    image_deadline: float | None = None,
+    image_max_assets: int = NO_ASSET_CAP,
+    image_concurrency: int | None = None,
+    image_requests_per_second: float | None = None,
     dry_run: bool,
 ) -> ExportSummary:
     now = datetime.now(timezone.utc)
@@ -457,6 +646,7 @@ def _run(
             today=today,
             window_days=financial_window_days,
             max_jobs=financial_max_jobs,
+            job_cost_report_id=job_cost_report_id,
             scopes=scopes,
             dry_run=dry_run,
         )
@@ -505,6 +695,10 @@ def _run(
             raw_cache_store,
             pricebook_item_records,
             image_client=image_client,
+            image_deadline=image_deadline,
+            image_max_assets=image_max_assets,
+            image_concurrency=image_concurrency,
+            image_requests_per_second=image_requests_per_second,
             run_at=run_at,
             dry_run=dry_run,
             # An item tab that did not produce a grid — failed, or refused with a
@@ -936,9 +1130,15 @@ def _run_technicians_feed(
     Returns the number of rows WRITTEN, derived from the grid rather than from the
     fetched records — ``build_technician_grid`` dedupes, so counting the records
     would report rows the tab does not contain (the same rule ``_TabGuard`` keeps).
+
+    ``business_units`` is the same optional, degrading reference lookup the
+    `jobs` feed already uses for its own ``business_unit`` column — a 403 here
+    costs two blank columns (``business_unit_name`` and, transitively, nothing
+    else), never the whole tab. See ``_optional_reference``.
     """
     technicians = fetch_technicians(client)
-    technicians_grid = build_technician_grid(technicians)
+    business_units = _optional_reference("business units", lambda: fetch_business_units(client))
+    technicians_grid = build_technician_grid(technicians, business_units)
     # The header row is not data — a tab with only a header is zero rows.
     row_count = max(len(technicians_grid) - 1, 0)
     check_blank_columns("technicians", technicians_grid)
@@ -1011,7 +1211,7 @@ class _TabGuard:
         self.row_counts: dict[str, int] = {}
         self.failures: dict[str, str] = {}
 
-    def attempt(self, tab_name: str, build: Any) -> Any:
+    def attempt(self, tab_name: str, build: Any, *, contract_version: str | None = None) -> Any:
         """Build one tab's grid behind the guard. Returns whatever ``build`` did.
 
         Every tab is attempted, always. A sibling's 403 never short-circuits this
@@ -1019,6 +1219,12 @@ class _TabGuard:
         says nothing at all about `pricebook.categories`, and skipping the rest of
         the feed to save four requests is what cost a TrueQuote-only tenant the
         categories tab it had paid for.
+
+        ``contract_version`` overrides the guard's own version for this ONE tab —
+        `sales.estimates` runs on the `financial` feed's cadence but is a wholly
+        new tab with its own version (`sales.v1`), never `financial.v1`. Every
+        other caller leaves it unset and gets the guard's shared version, as
+        before.
         """
         try:
             grid, carried = build()
@@ -1052,7 +1258,7 @@ class _TabGuard:
                 last_cursor="",
                 row_count=self.row_counts[tab_name],
                 exporter_version=EXPORTER_VERSION,
-                contract_version=self._contract_version,
+                contract_version=contract_version or self._contract_version,
             )
         )
         return carried
@@ -1151,12 +1357,13 @@ def _run_financial_feed(
     today: Any,
     window_days: int,
     max_jobs: int,
+    job_cost_report_id: str = "",
     scopes: ScopeLedger | None = None,
     dry_run: bool,
 ) -> tuple[dict[str, int], dict[str, str]]:
-    """Write the four `financial` tabs; append one MetaRow per tab that succeeded.
+    """Write the `financial` feed's tabs; append one MetaRow per tab that succeeded.
 
-    **The four tabs are independent, and that is the point.** ``reporting.jobCosts``
+    **The tabs are independent, and that is the point.** ``reporting.jobCosts``
     depends on a report that may be absent, ambiguous or throttled, and
     ``payroll.timesheets`` costs one request per completed job — either can fail on
     a tenant where invoices and business units are perfectly readable. So each tab
@@ -1208,9 +1415,26 @@ def _run_financial_feed(
     guard.attempt(
         FINANCIAL_JOB_COSTS_TAB,
         lambda: (
-            build_job_cost_grid(fetch_job_costs(client, today=today, window_days=window_days)),
+            build_job_cost_grid(
+                fetch_job_costs(
+                    client,
+                    today=today,
+                    window_days=window_days,
+                    report_id=job_cost_report_id,
+                )
+            ),
             None,
         ),
+    )
+    guard.attempt(
+        FINANCIAL_ESTIMATES_TAB,
+        lambda: (
+            build_estimate_grid(fetch_estimates(client, today=today, window_days=window_days)),
+            None,
+        ),
+        # A wholly new tab, not an appended column — its own version. See
+        # `contracts.SALES` and `_TabGuard.attempt`'s docstring.
+        contract_version=SALES_CONTRACT_VERSION,
     )
 
     logger.info(
@@ -1231,6 +1455,10 @@ def _upload_pricebook_images(
     item_records: list[dict[str, Any]],
     *,
     image_client: TrueQuoteImageClient | None,
+    image_deadline: float | None,
+    image_max_assets: int = NO_ASSET_CAP,
+    image_concurrency: int | None = None,
+    image_requests_per_second: float | None = None,
     run_at: str,
     dry_run: bool,
     catalogue_complete: bool = True,
@@ -1252,6 +1480,24 @@ def _upload_pricebook_images(
     ``ImageLedger.keep``'s precondition is that the caller saw the WHOLE
     catalogue, and a failed `pricebook.equipment` means every equipment image
     key is simply absent from ``seen_keys`` rather than gone.
+
+    ``image_deadline`` bounds the pass so it ends with a FLUSHED ledger rather
+    than a SIGKILL. A pass that runs out of budget is ``stopped``, which already
+    vetoes the prune for exactly the right reason: it did not see the catalogue.
+
+    ``image_max_assets`` is the second, independent bound — how many DOWNLOADS
+    this run may make (``EXPORTER_IMAGE_MAX_ASSETS``, 0 = no cap). It sets its
+    own ``stopped`` reason, so the run's output says which dial to turn, and it
+    vetoes the prune for the same reason the deadline does.
+
+    ``image_concurrency`` and ``image_requests_per_second`` are the two dials
+    that decide how long a first sync takes: how many assets are in flight, and
+    the ceiling the pass holds itself to against each service. Both default to
+    the exporter's own conservative numbers when the caller names none.
+
+    The LEDGER FLUSH is not a parameter here on purpose. The pass flushes on its
+    own timer (``LEDGER_FLUSH_SECONDS``) so a killed process loses at most that
+    much, and the ``finally`` below is the backstop, not the only write.
     """
     if image_client is None or dry_run:
         return None
@@ -1259,7 +1505,17 @@ def _upload_pricebook_images(
     ledger = ImageLedger(raw_cache_store)
     summary = ImageUploadSummary()
     try:
-        summary = upload_pricebook_images(client, image_client, ledger, item_records, now=run_at)
+        summary = upload_pricebook_images(
+            client,
+            image_client,
+            ledger,
+            item_records,
+            now=run_at,
+            deadline=image_deadline,
+            max_assets=image_max_assets,
+            concurrency=image_concurrency,
+            requests_per_second=image_requests_per_second,
+        )
         # Only prune on a pass that actually saw the whole catalogue — a run
         # stopped by a 403, a rate limit or a failed download has "not looked
         # at" assets that must not be mistaken for "gone" and re-uploaded next

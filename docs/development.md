@@ -12,7 +12,7 @@ uv run python -m pytest -x                               # stop on first failure
 # Lint + format
 uv run ruff check src/ tests/
 uv run ruff format src/ tests/
-uv run mypy src/                                         # see note below
+uv run mypy src/
 
 # Export Store contract fixtures (contracts/fixtures/)
 uv run python scripts/gen_contract_fixtures.py --check    # CI: is the suite stale?

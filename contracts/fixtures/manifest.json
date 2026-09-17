@@ -24,26 +24,26 @@
       }
     },
     "pricebook": {
-      "contract_version": "pricebook.v1",
+      "contract_version": "pricebook.v2",
       "tabs": {
         "pricebook.services": {
-          "path": "pricebook.v1/pricebook.services.json",
-          "sha256": "ffb73be1678c16cb60e81c673e7260c3774f6d7a0aafc48e1b46823a16414a55",
+          "path": "pricebook.v2/pricebook.services.json",
+          "sha256": "b037b3522c5f46dd95d69bb842454de70fdc2b853b35f1716f2e941dfdd70e34",
           "row_count": 3
         },
         "pricebook.equipment": {
-          "path": "pricebook.v1/pricebook.equipment.json",
-          "sha256": "1704cbc33abce7b8d3a4581a828e5d9acb6a93d1aec727251bffe515e41f20a0",
+          "path": "pricebook.v2/pricebook.equipment.json",
+          "sha256": "b1f5140d037e2ba7f0523e2c46a50cde0a03e0d5899e5eb8dc89eb29fc0faae5",
           "row_count": 1
         },
         "pricebook.materials": {
-          "path": "pricebook.v1/pricebook.materials.json",
-          "sha256": "83bb2618d9348b3265f7af8a40753104d9c91f0dacbfa857cb10c0ba7f6c5b65",
-          "row_count": 1
+          "path": "pricebook.v2/pricebook.materials.json",
+          "sha256": "0e3f76ae290aeef4dbac106c58fc5864aae9a63f79d5cf2413e9fcb2b1b09d29",
+          "row_count": 2
         },
         "pricebook.categories": {
-          "path": "pricebook.v1/pricebook.categories.json",
-          "sha256": "a0e9d2d529ed8d3334adba6bbd279386135e7ebea0ec20d65b8bef77e7d1e047",
+          "path": "pricebook.v2/pricebook.categories.json",
+          "sha256": "40c33f6596e885e8fa6ad1090eeaaf59d694f6ab16e02cfcaade5df3de611c9b",
           "row_count": 2
         }
       }
@@ -70,6 +70,16 @@
           "path": "financial.v1/reporting.jobCosts.json",
           "sha256": "9375121d643085b79d6073cafca61a6ada7745e755c0ae2cf391c136ef3e11cd",
           "row_count": 2
+        }
+      }
+    },
+    "sales": {
+      "contract_version": "sales.v1",
+      "tabs": {
+        "sales.estimates": {
+          "path": "sales.v1/sales.estimates.json",
+          "sha256": "50b1dee4ebefdfd226673477e1b4f7077b7c760686f00ac06dab6d9228d17dad",
+          "row_count": 3
         }
       }
     }

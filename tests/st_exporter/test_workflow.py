@@ -54,25 +54,32 @@ def test_every_lane_secret_is_optional(workflow_text: str) -> None:
             assert "required: false" in secrets_block[index : index + 200], stripped
 
 
-def test_the_feeds_validator_accepts_the_outbox_feed(workflow_text: str) -> None:
-    """The workflow validates `feeds` before `st-export` does. If it rejected
-    `outbox`, the one job allowed to drain would fail before Python ran."""
-    assert "jobs|technicians|pricebook|financial|outbox)" in workflow_text
+def test_the_feeds_validator_accepts_every_feed_the_exporter_does(workflow_text: str) -> None:
+    """The workflow validates `feeds` before `st-export` does. If it rejected a
+    feed, the job asking for it would fail before Python ran — that is how the
+    one job allowed to drain, or the one allowed to upload images, stops."""
+    assert "jobs|technicians|pricebook|financial|images|outbox)" in workflow_text
 
 
-def test_the_drain_and_the_export_feeds_take_different_locks(workflow_text: str) -> None:
-    """Two locks, split by what a run WRITES.
+def test_the_meta_free_feeds_take_their_own_locks(workflow_text: str) -> None:
+    """Three locks, split by what a run WRITES.
 
     A drain-only run never reads or writes `_meta` (`cli.py` does not call
     `run_export` at all for it), so it is safe beside an export — and it has to
-    be, or the 5-minute drain queues behind the hourly pricebook run. Anything
-    else falls back to the shared export lock, which is the safe side.
+    be, or the 5-minute drain queues behind the hourly pricebook run. An
+    images-only run passes the same test for the same reason: `run_images` never
+    opens the Export Store, and the only tab it rewrites is `_image_ledger` on
+    the private raw-cache Sheet. Anything else falls back to the shared export
+    lock, which is the safe side.
     """
     assert (
         "group: st-export-${{ github.repository }}-"
-        "${{ inputs.feeds == 'outbox' && 'outbox' || 'export' }}" in workflow_text
+        "${{ (inputs.feeds == 'outbox' && 'outbox') || "
+        "(inputs.feeds == 'images' && 'images') || 'export' }}" in workflow_text
     )
     # Never cancel a run mid-drain: that is the crash the ledger recovers from.
+    # Same for an image pass: a cancelled one loses the ledger it was about to
+    # flush, which is the whole failure this split exists to end.
     assert "cancel-in-progress: false" in workflow_text
 
 
@@ -127,6 +134,10 @@ FEED_VARIABLES = ("JOBS_FEED", "TECHNICIANS_FEED", "PRICEBOOK_FEED", "FINANCIAL_
 
 FEED_JOBS = ("jobs-feed", "technicians-feed", "pricebook-feed", "financial-feed")
 DRAIN_JOB = "outbox-drain"
+# Not in FEED_JOBS: like the drain, it writes no tab and no `_meta` row. It is
+# the job that POSTs pricebook image BYTES to TrueQuote, and it is the only job
+# in the file that may hold TRUEQUOTE_IMAGE_TOKEN.
+IMAGES_JOB = "images-feed"
 
 
 @pytest.fixture(scope="module")
@@ -230,13 +241,22 @@ def test_no_job_condition_reads_any_repository_variable(caller: dict[Any, Any]) 
 
 
 def test_pricebook_category_ids_survives_because_it_is_not_a_gate(caller: dict[Any, Any]) -> None:
-    """The one surviving `vars` reference. It narrows WHAT the pricebook feed
-    exports; it never decides WHETHER the feed runs, so it lives in `with:` and
-    a blank value exports the whole catalogue."""
+    """The one surviving `vars` NAME. It narrows WHAT the pricebook feed exports
+    and which items the image pass uploads for; it never decides WHETHER either
+    runs, so it lives in `with:` and a blank value means the whole catalogue.
+
+    Two references now, one per job, and they must agree: an image pass scoped
+    to different categories than the tab it illustrates would upload pictures
+    for items the Sheet does not carry.
+    """
     text = CALLER.read_text()
-    assert text.count("vars.") == 1, "the only repository variable left is PRICEBOOK_CATEGORY_IDS"
-    assert "pricebook_category_ids: ${{ vars.PRICEBOOK_CATEGORY_IDS }}" in text
-    assert "PRICEBOOK_CATEGORY_IDS" not in caller["jobs"]["pricebook-feed"]["if"]
+    assert text.count("vars.") == 2, "the only repository variable left is PRICEBOOK_CATEGORY_IDS"
+    assert text.count("pricebook_category_ids: ${{ vars.PRICEBOOK_CATEGORY_IDS }}") == 2
+    for name in ("pricebook-feed", IMAGES_JOB):
+        assert "PRICEBOOK_CATEGORY_IDS" not in caller["jobs"][name]["if"]
+        assert caller["jobs"][name]["with"]["pricebook_category_ids"] == (
+            "${{ vars.PRICEBOOK_CATEGORY_IDS }}"
+        )
 
 
 def test_the_drain_runs_exactly_once_per_cycle(caller: dict[Any, Any]) -> None:
@@ -272,7 +292,7 @@ def test_no_feed_job_is_given_a_product_machine_token(caller: dict[Any, Any]) ->
     `image_upload`-scoped TRUEQUOTE_IMAGE_TOKEN. That pair uploads image bytes
     and cannot form a drain lane.
     """
-    for name in FEED_JOBS:
+    for name in (*FEED_JOBS, IMAGES_JOB):
         held = set(caller["jobs"][name].get("secrets", {}))
         assert not {secret for secret in held if secret.endswith("_MACHINE_TOKEN")}, name
 
@@ -322,39 +342,31 @@ def test_the_caller_pins_the_tag_this_repo_publishes(caller: dict[Any, Any]) -> 
     """The five `uses:` lines agreeing with each other is not enough.
 
     They agreed perfectly at `exporter-v0.3.0` — a tag that does not exist. Tags
-    stop at 0.2.8 and `EXPORTER_TAG`/`pyproject.toml` say 0.2.9, so a contractor
-    copying the file whose own header calls it "the SOURCE OF TRUTH" got a
-    workflow GitHub cannot resolve: every feed and the drain stop, with the only
-    symptom being runs that do not happen.
+    stopped at 0.2.8 while `pyproject.toml` said 0.2.9, so a contractor copying
+    the file whose own header calls it "the SOURCE OF TRUTH" got a workflow
+    GitHub cannot resolve: every feed and the drain stop, with the only symptom
+    being runs that do not happen.
 
-    So the caller is checked against the ONE literal in `export.yml`, which is
-    what `scripts/release.sh` moves and what the runtime guard verifies against
-    the installed package.
+    THE SOURCE OF TRUTH IS `pyproject.toml`, and it is now the only one. This
+    used to check the caller against `EXPORTER_TAG` in `export.yml` as well, and
+    that literal is gone — a version string under `.github/workflows/` makes the
+    release unpushable, because GITHUB_TOKEN may not push a commit that touches
+    a workflow file. `export.yml` resolves its own commit at run time instead,
+    so `pyproject.toml`'s version and the caller's five pins are the whole set.
     """
-    published = re.search(r"^ +EXPORTER_TAG: (exporter-v\S+)$", WORKFLOW.read_text(), re.M)
-    assert published, "export.yml no longer declares a single EXPORTER_TAG literal"
-    expected = published.group(1)
+    pyproject = (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text()
+    version = re.search(r'^version = "(.+)"$', pyproject, re.M)
+    assert version, "pyproject.toml no longer declares a version"
+    expected = f"exporter-v{version.group(1)}"
     pinned = {job["uses"].split("@", 1)[1] for job in caller["jobs"].values()}
     assert pinned == {expected}, (
         f"CALLER PINS A DIFFERENT TAG — docs/examples/connector-export.yml uses "
         f"{sorted(pinned)} but this repository publishes {expected} "
-        f"(.github/workflows/export.yml, EXPORTER_TAG).\n"
+        f"(pyproject.toml, version).\n"
         f"A contractor copies that file verbatim. A tag that does not exist is not a "
         f"warning: GitHub cannot resolve the workflow, so every feed and the drain "
         f"simply stop running.\n"
-        f"Bump all three literals together with: ./scripts/release.sh <X.Y.Z>"
-    )
-
-
-def test_the_pinned_tag_is_the_version_in_pyproject(caller: dict[Any, Any]) -> None:
-    """...and the tag names the version this source tree actually is."""
-    pyproject = (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text()
-    version = re.search(r'^version = "(.+)"$', pyproject, re.M)
-    assert version
-    tag = {job["uses"].split("@", 1)[1] for job in caller["jobs"].values()}.pop()
-    assert tag == f"exporter-v{version.group(1)}", (
-        f"{tag} does not name pyproject.toml's version {version.group(1)}. "
-        f"Use ./scripts/release.sh <X.Y.Z>, which moves all three together."
+        f"Bump both literals together with: ./scripts/release.sh <X.Y.Z>"
     )
 
 
@@ -367,7 +379,7 @@ def test_release_sh_rewrites_the_caller_too() -> None:
         "scripts/release.sh does not touch the caller workflow, so a release leaves it "
         "pinned to the previous tag and nothing bumps it."
     )
-    assert "exactly two" not in release
+    assert "exactly three" not in release
 
 
 def test_the_caller_header_table_states_the_cadence_each_job_actually_runs_on(
@@ -378,19 +390,21 @@ def test_the_caller_header_table_states_the_cadence_each_job_actually_runs_on(
     six-hourly. A wrong table is how a contractor concludes a feed is broken."""
     header = CALLER.read_text().split("jobs:", 1)[0]
     stated = dict(re.findall(r"^#   ([a-z-]+-(?:feed|drain)) +(\S+(?: \S+)?) ", header, re.M))
-    assert set(stated) == set(FEED_JOBS) | {DRAIN_JOB}, stated
+    assert set(stated) == set(FEED_JOBS) | {DRAIN_JOB, IMAGES_JOB}, stated
     expected_minutes = {
         "jobs-feed": "*/5",
         "technicians-feed": "*/30",
         "pricebook-feed": "hourly",
         "financial-feed": "*/6 hours",
+        IMAGES_JOB: "*/2 hours",
         DRAIN_JOB: "*/5",
     }
     assert stated == expected_minutes, (
         f"THE HEADER TABLE IS STALE — it says {stated}, the crons say {expected_minutes}."
     )
-    # And the claim about `financial-feed` is grounded in the cron, not in this table.
+    # And the claims are grounded in the crons, not in this table.
     assert _evaluate(caller["jobs"]["financial-feed"]["if"], schedule="37 */6 * * *")
+    assert _evaluate(caller["jobs"][IMAGES_JOB]["if"], schedule="22 */2 * * *")
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +457,43 @@ def test_ci_cannot_interfere_with_the_customer_export_workflow(ci: dict[Any, Any
     assert not any("export.yml" in entry for entry in used), used
 
 
+def test_the_dependency_cache_is_keyed_on_a_file_that_is_actually_there(
+    workflow_text: str,
+) -> None:
+    """`cache: pip` FAILS the job when `cache-dependency-path` matches nothing.
+
+    That is a caching optimisation taking down an export the contractor's
+    scheduled run depends on, for no benefit, and it would do it on every
+    connector at once. The path is therefore pinned to a file this repo really
+    ships — and the checkout that puts it on disk runs before setup-python, so
+    the hash is of the exporter's own `pyproject.toml` and not of whatever the
+    CALLER repo happens to have at that path.
+    """
+    steps = list(yaml.safe_load(workflow_text)["jobs"]["export"]["steps"])
+    setup = [step for step in steps if "setup-python" in str(step.get("uses", ""))]
+    assert len(setup) == 1, setup
+    with_ = dict(setup[0]["with"])
+    assert with_.get("cache") == "pip", with_
+
+    dependency_path = str(with_["cache-dependency-path"])
+    assert (WORKFLOW.parents[2] / dependency_path).is_file(), dependency_path
+
+    names = [str(step.get("uses", "")) or str(step.get("name", "")) for step in steps]
+    assert names.index("actions/checkout@v4") < names.index(str(setup[0]["uses"])), names
+
+
+def test_the_install_still_installs_this_repo_not_a_cached_environment(
+    workflow_text: str,
+) -> None:
+    """The cache holds pip's downloads, not the environment. If that ever became
+    a cached virtualenv, a job could run code from a previous release while
+    reporting the version it checked out — the v0.2.1 failure mode with a new
+    cause."""
+    steps = list(yaml.safe_load(workflow_text)["jobs"]["export"]["steps"])
+    install = [step for step in steps if step.get("name") == "Install"]
+    assert [str(step["run"]).strip() for step in install] == ["pip install -e ."]
+
+
 def test_the_export_workflow_is_still_reusable_only(workflow_text: str) -> None:
     """The other direction of the same separation: adding CI must not have given
     `export.yml` a trigger of its own, which would run it here against no secrets."""
@@ -453,7 +504,7 @@ def test_the_export_workflow_is_still_reusable_only(workflow_text: str) -> None:
 # ---------------------------------------------------------------------------
 # RELEASE — `.github/workflows/release.yml`.
 #
-# The release dance (bump three literals -> commit -> merge -> tag the MERGED
+# The release dance (bump two literals -> commit -> merge -> tag the MERGED
 # commit) has been got wrong four times: v0.2.1 tagged code the bump had not
 # reached, v0.2.7 failed twice, the caller file shipped pinned to a v0.3.0 that
 # never existed, and v0.2.9 went stale two merges later. The workflow performs
@@ -567,10 +618,274 @@ def test_the_release_token_starts_empty_and_only_the_pushing_job_can_write(
 ) -> None:
     """Minimum that can push a commit and a tag, and nothing else — no issues, no
     packages, no deployments, no Actions API. The job that parses commit messages
-    and computes a version stays read-only."""
+    and computes a version stays read-only.
+
+    There is no second scope to add, and there is no longer anything to add it
+    for. The bump used to rewrite `EXPORTER_TAG:` in
+    `.github/workflows/export.yml`, and GITHUB_TOKEN is refused any ref update
+    touching `.github/workflows/**` — runs 35024004355 and 35025492123 died on
+    exactly that — but the permission that would allow it is not one this key
+    can grant. The literal was deleted instead. See
+    `test_no_workflows_scope_is_invented_to_fix_the_push` and
+    `test_no_version_literal_ever_returns_to_a_workflow_file`.
+    """
     assert release["permissions"] == {}, "the workflow-level token must start empty"
     assert release["jobs"]["decide"]["permissions"] == {"contents": "read"}
     assert release["jobs"]["release"]["permissions"] == {"contents": "write"}
+
+
+# The complete set of scopes the Actions `permissions:` key accepts. `workflows`
+# is deliberately absent: it does not exist for GITHUB_TOKEN, which is the whole
+# reason the release bump must not touch a workflow file in the first place.
+GITHUB_TOKEN_SCOPES = frozenset(
+    {
+        "actions",
+        "artifact-metadata",
+        "attestations",
+        "checks",
+        "code-quality",
+        "contents",
+        "deployments",
+        "discussions",
+        "id-token",
+        "issues",
+        "models",
+        "packages",
+        "pages",
+        "pull-requests",
+        "repository-projects",
+        "security-events",
+        "statuses",
+        "vulnerability-alerts",
+    }
+)
+
+
+@pytest.mark.parametrize("path", [WORKFLOW, CI, RELEASE, DRIFT])
+def test_no_workflows_scope_is_invented_to_fix_the_push(path: Path) -> None:
+    """THE FIX THAT LOOKS OBVIOUS AND DOES NOT EXIST.
+
+    When release run 35024004355 was rejected with "refusing to allow a GitHub
+    App to create or update workflow ... without `workflows` permission", the
+    reading that costs a day is that the `release` job is missing
+    `permissions: workflows: write`. It is not a permission the Actions
+    `permissions:` key has. Writing one there is silently meaningless — the
+    push is refused exactly as before — and `actionlint` rejects the file.
+
+    Every scope named in every workflow in this repository must be a real one,
+    so the next person to reach for it fails here in a second instead of in a
+    release run twenty minutes long.
+    """
+    parsed: Any = yaml.safe_load(path.read_text())
+    doc = dict(parsed)
+    blocks = [doc.get("permissions")] + [
+        job.get("permissions") for job in doc.get("jobs", {}).values()
+    ]
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue  # `permissions: read-all` / absent / `{}`
+        unknown = set(block) - GITHUB_TOKEN_SCOPES
+        assert not unknown, (
+            f"{path.name} asks GITHUB_TOKEN for {sorted(unknown)}, which is not a scope the "
+            "`permissions:` key grants. If this is `workflows`, it cannot be granted at all, "
+            "and the answer is not a stored credential either — keep version literals out of "
+            "workflow files (see release.yml's header)."
+        )
+
+
+def test_the_release_refuses_early_when_it_cannot_publish_what_it_would_build(
+    release: dict[Any, Any],
+) -> None:
+    """Run 35024004355 ran every refusal, bumped, installed, ran 1200 tests,
+    committed and tagged — and only then found out its token could not push a
+    workflow file. Nothing landed (the push is atomic), but nothing could ever
+    have landed either, and none of that work was needed to know it.
+
+    The question is asked before the first write, by reading `export.yml`
+    rather than by hardcoding the answer. It passes trivially today — the file
+    carries no `EXPORTER_TAG:` line at all — which is exactly the retirement the
+    step was written to reach. It is kept as the regression detector: if a
+    version literal ever creeps back into a workflow file, this refuses here
+    rather than at the final push.
+    """
+    steps = _release_steps(release)
+    names = [step.get("name", "") for step in steps]
+    guard = "Refuse if this push needs a credential GITHUB_TOKEN cannot have"
+    assert guard in names, "the release can once again spend a tag on a push it cannot make"
+    step = steps[names.index(guard)]
+    # Before the bump, which is the first thing that writes.
+    assert names.index(guard) < names.index("Bump both version literals (scripts/release.sh)")
+    # ...and therefore before the commit and the tag, which is the point.
+    assert names.index(guard) < names.index("Commit the bump") < names.index("Tag that commit")
+    # It reads the live file rather than asserting a remembered answer.
+    assert ".github/workflows/export.yml" in step["run"]
+    assert 'if [ "$current" = "$TAG" ]' in step["run"]
+    # ...and it passes, rather than refuses, when there is no literal to move.
+    assert 'if [ -z "$current" ]' in step["run"], (
+        "with EXPORTER_TAG gone this step reads an empty string and would refuse every "
+        "release — the retirement it documents has to actually be implemented"
+    )
+    # There is no escape hatch. This step once stood down when a
+    # RELEASE_PUSH_TOKEN secret was set; a literal back in a workflow file must
+    # now fail the run outright, not be waved through by a stored credential.
+    assert "env" not in step, step.get("env")
+    assert "secrets." not in step["run"]
+    assert "exit 1" in step["run"], "the creep-back detector no longer refuses anything"
+    # A rehearsal pushes nothing, so it needs no credential and must still run.
+    assert step["if"] == "${{ !inputs.dry_run }}"
+
+
+def test_no_credential_that_could_rewrite_a_workflow_file_returns(
+    release: dict[Any, Any],
+) -> None:
+    """THE SEAM EXISTED, AND REMOVING IT IS THE ASSERTION.
+
+    This file briefly carried a `RELEASE_PUSH_TOKEN` seam — the checkout fell
+    back to it when set, and the refusal step above stood down when it was. It
+    was never populated, and it became unnecessary the moment the `EXPORTER_TAG`
+    literal left `export.yml`: the release commit touches no workflow file, so
+    GITHUB_TOKEN can push it.
+
+    It was removed rather than left unset because anything that could go in that
+    slot can rewrite the reusable workflow every contractor runs UNATTENDED
+    against their own live ServiceTitan tenant. An empty slot labelled for a
+    privileged token is an invitation to reopen that path the next time a push
+    is refused; the right answer then is to delete the literal again.
+
+    So: the release workflow names NO secret at all. That is the blanket claim
+    it started with, recoverable now that the seam is gone, and a stronger
+    statement than any allow-list of "safe" secret names.
+    """
+    checkout = next(
+        step
+        for step in _release_steps(release)
+        if str(step.get("uses", "")).startswith("actions/checkout")
+    )
+    # Plain GITHUB_TOKEN, spelled out because loop guard (3) depends on it: a
+    # push made with anything else DOES start workflow runs.
+    assert checkout["with"]["token"] == "${{ github.token }}"
+    assert checkout["with"]["persist-credentials"] is True
+    text = RELEASE.read_text()
+    assert "secrets." not in text, (
+        "release.yml references a repository secret again. A credential this workflow can "
+        "reach is a credential that can be given permission to rewrite .github/workflows/"
+        "export.yml — the exporter every contractor runs against their own live tenant. The "
+        "RELEASE_PUSH_TOKEN seam was deliberately deleted; do not reopen it."
+    )
+    # The decision is documented where it is made, with the run that forced it.
+    assert "35024004355" in text, "the run that forced this is not named anywhere"
+    assert "job.workflow_sha" in text, "the condition for removing the credential is not recorded"
+    # The seam's removal is recorded rather than erased, and so are the narrower
+    # options that were considered and rejected, cheapest-surface first.
+    assert "RELEASE_PUSH_TOKEN" in text, "the seam was deleted silently, with no record of why"
+    for option in ("create-github-app-token", "deploy key", "fine-grained PAT"):
+        assert option in text, f"{option!r} is no longer recorded as a rejected alternative"
+
+
+def test_the_bump_can_touch_no_workflow_file_at_all(
+    release: dict[Any, Any],
+) -> None:
+    """`.github/workflows/export.yml` is DELIBERATELY ABSENT from the allow-list.
+
+    A release commit that touches any file under `.github/workflows/` cannot be
+    pushed by GITHUB_TOKEN — that is what killed runs 35024004355 and
+    35025492123 — so the bump is allowed to move exactly two files, neither of
+    them a workflow. If a version literal ever creeps back into `export.yml` and
+    `release.sh` starts rewriting it, this step fails before the commit instead
+    of at the push.
+
+    Not to be confused with the READ list in the `decide` job, which still names
+    `export.yml` so that a change to the reusable workflow triggers a release.
+    """
+    steps = _release_steps(release)
+    names = [step.get("name", "") for step in steps]
+    guard = next(
+        step for step in steps if step.get("name") == "Assert both literals moved and agree"
+    )
+    run = guard["run"]
+    assert "unexpected" in run and "release.sh touched files it should not have" in run
+    allowed = re.findall(r"-e '\^(\S+)\$'", run)
+    assert allowed == [
+        r"pyproject\.toml",
+        r"docs/examples/connector-export\.yml",
+    ], allowed
+    # And it gates the commit, which gates the tag, which gates the push.
+    assert names.index("Assert both literals moved and agree") < names.index("Commit the bump")
+    committed = next(step for step in steps if step.get("name") == "Commit the bump")["run"]
+    add_line = next(line for line in committed.splitlines() if line.strip().startswith("git add"))
+    assert add_line.strip() == "git add pyproject.toml docs/examples/connector-export.yml"
+    assert ".github/workflows/" not in add_line
+
+
+def test_the_workflow_resolves_its_own_source_and_refuses_before_it_fetches() -> None:
+    """THE GUARD IS THE WHOLE SAFETY STORY, AND IT MUST COME FIRST.
+
+    `export.yml` checks itself out with `job.workflow_sha` /
+    `job.workflow_repository` — the `job` context, which GitHub documents for a
+    reusable workflow checking out its own source. Nothing in `github.*` can
+    stand in for it: all of `github.*` describes the CALLER by design, which is
+    how the 2026-09-08 attempt checked out this repo's `main` and ran the wrong
+    exporter against a live tenant.
+
+    An empty `ref:` does not error — `actions/checkout` silently fetches the
+    default branch and runs the wrong exporter successfully, which is how v0.2.1
+    shipped. So the resolution is asserted non-empty and asserted to name this
+    repository BEFORE the checkout, and this test pins that order.
+    """
+    export: Any = yaml.safe_load(WORKFLOW.read_text())
+    steps = export["jobs"]["export"]["steps"]
+    names = [str(s.get("name", "")) for s in steps]
+    guard_i = names.index("Self-discovery resolved")
+    checkout_i = next(
+        i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("actions/checkout")
+    )
+    assert guard_i < checkout_i, (
+        "the self-discovery guard runs after the checkout — by then the wrong exporter "
+        "has already been fetched, and an empty ref does not fail"
+    )
+    guard = steps[guard_i]
+    assert guard["env"]["JOB_WORKFLOW_SHA"] == "${{ job.workflow_sha }}"
+    assert guard["env"]["JOB_WORKFLOW_REPOSITORY"] == "${{ job.workflow_repository }}"
+    assert guard["env"]["JOB_WORKFLOW_REF"] == "${{ job.workflow_ref }}"
+    # It HARD-FAILS. A warning here would let the wrong exporter run.
+    assert "::error" in guard["run"] and "exit 1" in guard["run"]
+    assert '-z "$JOB_WORKFLOW_SHA"' in guard["run"]
+    assert '-z "$JOB_WORKFLOW_REPOSITORY"' in guard["run"]
+    assert "BBTT-01/ST-exporter" in guard["run"]
+    # And the checkout depends on exactly what was just proved.
+    checkout = steps[checkout_i]["with"]
+    assert checkout["repository"] == "${{ job.workflow_repository }}"
+    assert checkout["ref"] == "${{ job.workflow_sha }}"
+
+
+def test_no_version_literal_ever_returns_to_a_workflow_file() -> None:
+    """THE TEST THAT STOPS THE LITERAL CREEPING BACK.
+
+    `export.yml` carried an `EXPORTER_TAG:` literal that `scripts/release.sh`
+    rewrote on every bump. That made every release commit touch
+    `.github/workflows/**`, and GITHUB_TOKEN — a GitHub App installation token —
+    may not push such a commit. Release runs 35024004355 and 35025492123 each
+    built the bump, ran the suite, committed and tagged, and were rejected at
+    the final push; `0.2.11` was unreleasable until the literal was deleted.
+
+    There is no `permissions:` scope that fixes it and no stored credential
+    worth having, since anything able to rewrite this file can rewrite the
+    exporter every contractor runs against their own live tenant. So the literal
+    must not come back, and the thing that replaced it must stay.
+    """
+    text = WORKFLOW.read_text()
+    assert not re.search(r"^ +EXPORTER_TAG:", text, re.M), (
+        "a version literal is back in .github/workflows/export.yml. The release bump "
+        "would then rewrite a workflow file, and GITHUB_TOKEN cannot push a commit that "
+        "does — runs 35024004355 and 35025492123 both died on exactly that, after a full "
+        "green suite. Keep the version in pyproject.toml; export.yml resolves its own "
+        "commit via job.workflow_sha."
+    )
+    assert "job.workflow_sha" in text, (
+        "export.yml no longer resolves its own commit — without job.workflow_sha the "
+        "checkout has nothing to pin to, and an empty ref silently takes the default "
+        "branch (how v0.2.1 shipped the wrong exporter to a live tenant)"
+    )
 
 
 def test_the_release_workflow_cannot_touch_a_tenant(release: dict[Any, Any]) -> None:
@@ -579,7 +894,17 @@ def test_the_release_workflow_cannot_touch_a_tenant(release: dict[Any, Any]) -> 
     assert "workflow_call" not in _triggers(release)
     assert "pull_request" not in _triggers(release), "a fork's PR must not reach a write token"
     text = RELEASE.read_text()
-    assert "secrets." not in text, "the release workflow is handed no tenant credentials"
+    # It reads NO secret at all. The `RELEASE_PUSH_TOKEN` seam briefly made this
+    # weaker — it had to be spelled out as an allow-list of one — and deleting
+    # the seam restored the blanket claim, which is the one worth holding: a
+    # release workflow that can reach no secret cannot leak a tenant's.
+    referenced = set(re.findall(r"secrets\.([A-Z_][A-Z0-9_]*)", text))
+    assert referenced == set(), referenced
+    tenant_secrets = set(yaml.safe_load(WORKFLOW.read_text())[True]["workflow_call"]["secrets"])
+    assert not (referenced & tenant_secrets), (
+        "the release workflow names a secret export.yml hands to a live tenant"
+    )
+    assert "GOOGLE" not in text and "ST_CLIENT" not in text and "MACHINE_TOKEN" not in text
     steps = [step.get("run", "") for job in release["jobs"].values() for step in job["steps"]]
     assert not any(re.search(r"\bst-export\b", run) for run in steps)
     assert "st-export-${{ github.repository }}" not in text, (
@@ -602,7 +927,7 @@ def test_the_release_workflow_calls_the_script_rather_than_reimplementing_it(
     release: dict[Any, Any],
 ) -> None:
     """One definition of "bump the version". `scripts/release.sh` stays usable by
-    hand, and the sed logic that knows where the three literals live is not copied
+    hand, and the sed logic that knows where the two literals live is not copied
     into YAML, where it would drift from the script."""
     steps = [step.get("run", "") for step in _release_steps(release)]
     assert any("./scripts/release.sh" in run for run in steps), steps
@@ -626,7 +951,7 @@ def test_the_release_refuses_the_ways_this_has_gone_wrong(release: dict[Any, Any
     ):
         assert fragment in names, f"{fragment!r} is gone from the release workflow"
     # And every one of them runs before the first thing that writes.
-    bumped = names.index("Bump all three version literals (scripts/release.sh)")
+    bumped = names.index("Bump both version literals (scripts/release.sh)")
     assert names.index("Refuse to overwrite an existing tag") < bumped
 
 
@@ -648,23 +973,28 @@ def test_the_release_is_tested_before_it_is_tagged(release: dict[Any, Any]) -> N
 def test_the_tag_is_verified_against_its_own_commit_before_anything_is_pushed(
     release: dict[Any, Any],
 ) -> None:
-    """THE ORDERING CONSTRAINT.
+    """THE TAGGED COMMIT MUST AGREE WITH ITSELF.
 
-    The tag must point at a commit whose `EXPORTER_TAG` already names that tag,
-    because `export.yml`'s runtime guard fails a contractor's run when they
-    disagree. The proof step reads the literals back out of the TAGGED TREE
-    (`git show $TAG:...`), not out of the working tree, and it runs before the
-    push.
+    `pyproject.toml` and the example caller are read back out of the TAGGED TREE
+    (`git show $TAG:...`), not out of the working tree, before the push.
+
+    `export.yml` is no longer one of the things compared — it carries no version
+    literal — but it is still read here, for the opposite reason: to prove the
+    literal did NOT come back. `EXPORTER_TAG` appearing in the tagged workflow
+    file is what made runs 35024004355 and 35025492123 unpushable.
     """
     steps = _release_steps(release)
     names = [step.get("name", "") for step in steps]
-    proof = names.index("Prove the tag names a commit that already names the tag")
+    proof = names.index("Prove the tagged commit agrees with itself")
     pushed = next(i for i, step in enumerate(steps) if "git push" in step.get("run", ""))
     assert proof < pushed
     run = steps[proof]["run"]
-    assert 'git show "$TAG:.github/workflows/export.yml"' in run
     assert 'git show "$TAG:docs/examples/connector-export.yml"' in run
     assert 'git show "$TAG:pyproject.toml"' in run
+    # Present as the ABSENCE guard, not as a cross-check.
+    assert "EXPORTER_TAG" in run, (
+        "nothing stops a version literal returning to export.yml in the tagged tree"
+    )
 
 
 def test_the_tag_is_cut_from_the_commit_by_sha_not_by_head(release: dict[Any, Any]) -> None:
@@ -696,3 +1026,133 @@ def test_the_drift_warning_never_fails_a_build() -> None:
     assert step["continue-on-error"] is True
     assert step["run"].rstrip().endswith("exit 0")
     assert "::warning" in step["run"] and "::error" not in step["run"]
+
+
+# ---------------------------------------------------------------------------
+# The `images` feed — its own job, its own lock, its own timeout, and the only
+# job in the file holding TRUEQUOTE_IMAGE_TOKEN.
+#
+# It used to be a flag on `pricebook-feed`. Run 35130164187 on
+# `BBTT-01/tr-doorservpro` was SIGKILLed at 10m35s having uploaded 0 of ~7,191
+# images, and took the hourly pricebook export down with it every hour. Each
+# assertion below is one of the three things that had to be true for that to
+# stop happening.
+# ---------------------------------------------------------------------------
+
+
+def test_the_image_pass_is_a_job_of_its_own(caller: dict[Any, Any]) -> None:
+    """`feeds: "images"` exactly, and it runs on its own schedule.
+
+    Anything else in its `feeds:` puts it back on the shared export lock (see
+    the reusable workflow's concurrency group) and makes it write `_meta`.
+    """
+    assert caller["jobs"][IMAGES_JOB]["with"]["feeds"] == "images"
+    assert IMAGES_JOB in _jobs_ever_run(caller)
+
+
+def test_no_other_job_asks_for_the_images_feed(caller: dict[Any, Any]) -> None:
+    """Two image passes would re-tread the same catalogue against one ledger and
+    halve the forward progress each run makes."""
+    uploading = [name for name, job in caller["jobs"].items() if "images" in job["with"]["feeds"]]
+    assert uploading == [IMAGES_JOB]
+
+
+def test_only_the_images_job_is_given_the_image_token(caller: dict[Any, Any]) -> None:
+    """The token moved off `pricebook-feed`, and it must not come back.
+
+    A copy left there is not merely redundant: it is what used to make the
+    pricebook feed download thousands of images inside its own ten-minute job,
+    which is the failure this split exists to end.
+    """
+    holding = [
+        name
+        for name, job in caller["jobs"].items()
+        if "TRUEQUOTE_IMAGE_TOKEN" in (job.get("secrets") or {})
+    ]
+    assert holding == [IMAGES_JOB]
+
+
+def test_the_images_job_raises_its_own_timeout_and_nothing_else_does(
+    caller: dict[Any, Any],
+) -> None:
+    """One job passes `job_timeout_minutes`, and it is this one.
+
+    Every other job leaves it unset and therefore keeps the reusable workflow's
+    default of 10 — which is the whole point of giving the input a default
+    rather than making every caller state a number.
+    """
+    passing = {
+        name: job["with"]["job_timeout_minutes"]
+        for name, job in caller["jobs"].items()
+        if "job_timeout_minutes" in (job.get("with") or {})
+    }
+    assert set(passing) == {IMAGES_JOB}
+    assert passing[IMAGES_JOB] > 10
+
+
+def test_the_reusable_workflow_defaults_the_timeout_to_ten(workflow_text: str) -> None:
+    """The default is what keeps every EXISTING caller and every other feed on
+    exactly the behaviour they had before this input existed."""
+    inputs: Any = yaml.safe_load(workflow_text)
+    declared = inputs.get("on", inputs.get(True))["workflow_call"]["inputs"]
+    assert declared["job_timeout_minutes"]["default"] == 10
+    assert "timeout-minutes: ${{ inputs.job_timeout_minutes }}" in workflow_text
+
+
+def test_the_exporter_is_told_the_runner_deadline(workflow_text: str) -> None:
+    """Forwarding it is not optional and its absence is SILENT.
+
+    Without `EXPORTER_JOB_TIMEOUT_MINUTES` the exporter assumes the default ten
+    minutes, so a job given thirty would be killed by the runner at thirty
+    having stopped uploading at eight — or, worse, a job given ten would be
+    killed at ten with an unflushed ledger, which is the original bug exactly.
+    """
+    assert "EXPORTER_JOB_TIMEOUT_MINUTES: ${{ inputs.job_timeout_minutes }}" in workflow_text
+
+
+def test_the_per_run_image_asset_cap_defaults_to_unlimited(workflow_text: str) -> None:
+    """0 = no cap, and that is the default on purpose.
+
+    A number here would silently truncate a large catalogue for ever on every
+    caller that never chose one, and a tenant permanently missing its last N
+    images looks exactly like a clean run.
+    """
+    inputs: Any = yaml.safe_load(workflow_text)
+    declared = inputs.get("on", inputs.get(True))["workflow_call"]["inputs"]
+    assert declared["image_max_assets"]["default"] == 0
+
+
+def test_the_exporter_is_told_the_asset_cap(workflow_text: str) -> None:
+    """Forwarding it is not optional and its absence is SILENT: the input would
+    accept a number and the run would ignore it."""
+    assert "EXPORTER_IMAGE_MAX_ASSETS: ${{ inputs.image_max_assets }}" in workflow_text
+
+
+def test_the_image_concurrency_dial_exists_and_defaults_to_eight(workflow_text: str) -> None:
+    """The number that turns a ~20-hour first sync into a ~2.5-hour one.
+
+    Eight rather than one because the image pass is almost entirely network
+    wait, and eight rather than thirty-two because a payload can be 8 MiB and
+    the bound on memory is the worker count.
+    """
+    inputs: Any = yaml.safe_load(workflow_text)
+    declared = inputs.get("on", inputs.get(True))["workflow_call"]["inputs"]
+    assert declared["image_concurrency"]["default"] == 8
+
+
+def test_the_exporter_is_told_the_image_concurrency(workflow_text: str) -> None:
+    """Forwarding it is not optional and its absence is SILENT: the input would
+    accept a number and every run would quietly stay on the default."""
+    assert "EXPORTER_IMAGE_CONCURRENCY: ${{ inputs.image_concurrency }}" in workflow_text
+
+
+def test_the_rate_ceiling_is_declared_and_forwarded(workflow_text: str) -> None:
+    """A concurrency dial with no governor behind it is how a pass discovers
+    somebody's rate limit by collecting 429s."""
+    inputs: Any = yaml.safe_load(workflow_text)
+    declared = inputs.get("on", inputs.get(True))["workflow_call"]["inputs"]
+    assert declared["image_requests_per_second"]["default"] == 6
+    assert (
+        "EXPORTER_IMAGE_REQUESTS_PER_SECOND: ${{ inputs.image_requests_per_second }}"
+        in workflow_text
+    )

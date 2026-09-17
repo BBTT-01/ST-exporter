@@ -66,15 +66,27 @@ def announce_to_actions(title: str, message: str, *, level: str = "warning") -> 
         logger.debug("could not emit a GitHub Actions annotation", exc_info=True)
 
 
+def _make_visible(target: logging.Logger) -> None:
+    target.setLevel(logging.INFO)
+    if not target.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        target.addHandler(handler)
+    # This logger's own messages shouldn't also go through root's handlers (if the
+    # hosting environment ever adds any) and print twice.
+    target.propagate = False
+
+
 def configure_logging() -> None:
     for name in _QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
 
-    logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        logger.addHandler(handler)
-    # This logger's own messages shouldn't also go through root's handlers (if the
-    # hosting environment ever adds any) and print twice.
-    logger.propagate = False
+    _make_visible(logger)
+    # `st_cli` is a separate package with a separate logger, and (1)'s rationale
+    # does not cover it: it is OUR code, not a transport library, and it says
+    # only what it chose to say. It gets the same treatment because the one thing
+    # it narrates — "I am parked on a 429 for the next fifty seconds" — is
+    # otherwise an exporter run printing nothing for minutes at a time, which
+    # reads as a hang. Silence during a throttle is what run 35159471697 on
+    # `BBTT-01/tr-doorservpro` looked like: seven minutes, not one line.
+    _make_visible(logging.getLogger("st_cli"))

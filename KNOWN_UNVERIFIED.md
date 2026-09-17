@@ -15,8 +15,15 @@ Paul's ServiceTitan environment (or any real tenant) is available, before trusti
 
 Assumed `invoicedOnOrAfter` on `accounting/v2/.../invoices` (Profit Wizard uses
 this exact spelling, so it is well-evidenced) and `completedOnOrAfter` on
-`jpm/v2/.../jobs` (inferred — Profit Wizard filters its own local `completed_date`
-column rather than ServiceTitan's parameter, so nothing confirms the API spelling).
+`jpm/v2/.../jobs`.
+
+**`completedOnOrAfter` is now CONFIRMED** (2026-09-16): the published
+`tenant-jpm-v2` OpenAPI description of `GET /tenant/{tenant}/jobs` carries both
+`completedOnOrAfter` and `completedBefore` — *"Return jobs that are completed
+after a certain date/time (in UTC)"*. The spelling the feed sends is the right
+one; the tripwire below stays as a standing check. `invoicedOnOrAfter` remains
+inferred.
+
 A wrong parameter name is the dangerous kind of wrong here: ServiceTitan ignores
 unknown query parameters rather than rejecting them, so the feed would quietly
 export the **entire** invoice or job history instead of the window. Check the
@@ -28,9 +35,163 @@ predates the window start (`warn_if_older_than_window`). It **only logs** — it
 deliberately does not filter the rows out locally, because doing so would hide
 the one symptom that proves the parameter name is wrong.
 
-`sort: "-completedOn"` on the job list is likewise inferred; if it is rejected or
-ignored, the `max_jobs` cap would truncate to an arbitrary set of jobs rather than
-the most recently completed ones.
+`sort: "-completedOn"` on the job list was inferred and was **WRONG** — RESOLVED
+2026-09-16. Run `35034278334` on `tr-pioneer-overhead-door` answered:
+
+```
+HTTP 400 {"errors":{"sort":["The value '-completedOn' is not valid for Sort."]}}
+```
+
+which cost the whole `payroll.timesheets` tab (the job list drives the per-job
+timesheet calls). The endpoint's own description names the closed list —
+*"Available fields are: Id, ModifiedOn, CreatedOn, Priority."* — so completion
+date is not sortable at all. The feed now sends `sort: "-Id"` (`JOB_SORT`), the
+stable proxy for "newest first"; the `max_jobs` cap therefore keeps the newest
+jobs in the window rather than the oldest.
+
+## Jobs feed: WHERE the export change-feed puts a job's completion instant
+
+`src/st_exporter/denormalize.py`, `_COMPLETED_ON_KEYS`
+
+The `jobs` tab's `completed_on` column (appended in 0.2.20) reads `completedOn`,
+falling back to `completedOnUtc`.
+
+**What is evidenced.** `completedOn` is the documented spelling on the JPM job
+object, and it is not a bare guess. Three independent lines of evidence:
+
+1. **Profit Wizard's own Direct path reads it in production, for these two
+   contractors.** `profitwizard/lib/crm/servicetitan.ts:852`:
+
+       completed_date: job.completedOn ? new Date(job.completedOn) : undefined,
+
+   That is the same precedent that resolved the customer-contacts entry below —
+   a live, shipped reader against the same tenants is the strongest evidence
+   available short of a recorded response. It is also what fills
+   `completed_date` on the direct baseline this exporter is being compared
+   against, so matching it is what makes the two comparable at all.
+2. The sibling query parameter `completedOnOrAfter` on
+   `GET /jpm/v2/tenant/{tenant}/jobs` is CONFIRMED against the published
+   `tenant-jpm-v2` OpenAPI description (see the first entry on this page) — a
+   parameter that by construction filters on a field of that name.
+3. `financial.warn_if_older_than_window` already reads `completedOn` off live
+   job records from that same endpoint.
+
+**What is NOT verified.** That the **export change-feed** —
+`/jpm/v2/tenant/{tenant}/export/jobs`, which is what actually fills `_raw_jobs`
+and therefore this tab — spells it identically to the LIST endpoint. All three
+evidence lines above are about the LIST/detail endpoint; the two are different
+endpoints with separately-generated response models, and no live response from
+the export feed has been inspected for this field. The alternate
+spelling is carried for the same reason `job_number` still reads `number`
+underneath `jobNumber`; both names mean the same fact, so accepting both cannot
+pick up a different one.
+
+**How the first live run answers it, without anyone remembering to look.**
+`completed_on` is deliberately NOT in `blank_columns.ALL_BLANK_OK`, so if neither
+spelling matches, the next `jobs` run (every 5 minutes) emits
+
+    BLANK COLUMN: jobs.completed_on is empty on all N rows
+
+as a WARNING, a GitHub `::warning` annotation and a step-summary line. Check the
+first run after this ships. The measured baseline to check it against: on
+`tr-doorservpro`, 864 jobs have `jobStatus` = completed, so a correct reading is
+several hundred non-empty cells, not zero.
+
+One false-positive shape is worth knowing about: a tenant with genuinely no
+completed jobs inside the window would also trip that warning. It is left
+checked rather than exempted anyway — an exemption would silence the exact signal
+this entry exists to produce, and "no completed jobs at all in 90 days" is itself
+worth a look.
+
+## Jobs feed: WHERE a job's billed revenue lives
+
+`src/st_exporter/denormalize.py`, `_TOTAL_REVENUE_KEYS`
+
+The `jobs` tab's `total_revenue` column reads `total`, falling back to
+`invoiceTotal`.
+
+**Why these two and in this order.** It is the DIRECT path's own expression.
+Profit Wizard fills `jobs.total_revenue` from
+`(job.total || job.invoiceTotal) ?? undefined`
+(`profitwizard/lib/crm/servicetitan.ts:856`), and that is the ONLY code path in
+Profit Wizard that writes the column. Reading the same two fields in the same
+order is what makes hosted numbers comparable to the direct baseline: the QA
+sweep that found this gap is a direct-vs-hosted comparison, so a different source
+would produce a different figure for the same job and break the comparison even
+when it was arguably a better number.
+
+**What is inferred.** That these fields exist on the JPM job record at all. The
+inference is not weak — the direct baseline carries revenue on 446 jobs and line
+856 is the only thing that could have put it there, so at least one of the two is
+real and populated on ~446 of that tenant's jobs. But Profit Wizard's `STJob`
+interface is a statement of belief about the API, not proof, and it has been
+wrong before in exactly this way: the comment above `jobTypeId` in that same file
+records that its `type`/`jobType` fields are "near-always undefined in practice",
+which silently sent all 2894/2896 production job rows down a `custom` fallback.
+And as with `completed_on`, the EXPORT change-feed has not been inspected for
+either field.
+
+**There is a second, larger source already in the export if this one is empty.**
+`accounting.invoices` carries `ItemTotal` per invoice LINE — 2817 rows live on
+`tr-doorservpro` — which is billed revenue at a finer grain and covers more jobs
+than 446. It is not used here because summing it would produce numbers that
+disagree with the direct baseline, and because Profit Wizard already parses
+`ItemTotal` into `itemTotal` and then discards it: `aggregateInvoiceLines`
+(`lib/hosted/sync.ts:173`) uses it only to detect negative price-modifier lines
+for `discount_total`, accumulates only `itemTotalCost` into material/equipment,
+and returns `{material, equipment, discount}` with no revenue field at all. So
+the hosted path never writes `total_revenue` from any source. **That is a Profit
+Wizard-side gap and it is not fixed by this column** — it is simply a different,
+already-available route to the same fact, worth taking if `total`/`invoiceTotal`
+turn out to be absent.
+
+**How the first live run answers it.** `total_revenue` is deliberately NOT in
+`blank_columns.ALL_BLANK_OK`, so if neither field exists the next `jobs` run
+emits `BLANK COLUMN: jobs.total_revenue is empty on all N rows` as a WARNING and
+an Actions annotation. The baseline to check against: the direct pull has revenue
+on 446 of ~999 jobs, so a correct reading is a few hundred populated cells, not
+zero — and notably not all of them either.
+
+## ~~Jobs feed: does a `0` in `job.total` mean $0, or "not recorded"?~~ — MEASURED
+
+`src/st_exporter/denormalize.py`, `_TOTAL_REVENUE_KEYS`, `_money_or_absent`
+
+**"Not recorded", and the first cut of `total_revenue` got this wrong and
+shipped.** It read a resolved `0` as a real zero, on this contract's "blank is
+not zero" rule, and called the divergence from Profit Wizard's `||` deliberate.
+
+Measured on `tr-doorservpro` across 1256 rows of the live jobs tab:
+
+| | share |
+|---|---|
+| rows with a BLANK `total_revenue` | **0** |
+| distinct jobs reading exactly `0` | 45% |
+| **COMPLETED** jobs reading `$0` | **41%** |
+
+Non-zero values ranged `70.00`–`30,302.10`, so the field spelling is right and
+the column is genuinely populated. But ServiceTitan never sends null here — it
+sends `0` for "no revenue recorded" — so reading `0` literally labelled four
+completed jobs in ten as free work.
+
+Profit Wizard's `(job.total || job.invoiceTotal) ?? undefined` makes the opposite
+choice, and `||` rather than `??` is the whole point: a `0` falls through, and
+the field is omitted when nothing is left. That is why the direct baseline
+carries revenue on 446 of ~999 jobs as NULL rather than as zeros, and why the two
+paths disagreed on roughly 400 jobs with hosted holding the harmful answer.
+
+The asymmetry settles it: a blank makes Profit Wizard REFUSE to compute a margin,
+a `0` makes it compute one against zero revenue — **-100%** — and
+`blank_columns` cannot catch that, because it only fires on a column empty on
+EVERY row. An all-zero column passes straight through the tripwire.
+
+Accepted cost: a genuine zero-dollar job is now indistinguishable from one with
+nothing recorded. This field cannot tell them apart anyway, the direct path
+already makes that trade, and "I cannot tell you" beats "they worked for free".
+
+**Still open:** whether `reporting.jobCosts.TotalRevenue` is the better source.
+That tab only started working today (run 35159471697, 1563 rows) and its
+`TotalRevenue` is already in the frozen `JOB_COST_COLUMNS`, but nobody has
+measured how well it is populated. Do that before adopting it.
 
 ## Financial feed: how ServiceTitan marks a report as custom
 
@@ -51,6 +212,61 @@ and the first page of its data (`reporting.require_columns`); a mismatch raises
 columns. That check does not depend on any unverified spelling, and it is what
 turns "wrong report, blank money, reported as success" into a loud refusal.
 Confirm on a tenant that has custom reports.
+
+The refusal now carries its own evidence, so one live run is enough to tell a
+missing report from a false positive in these guesses: a name-matching report
+skipped as custom is quoted by category id, report id, name **and the marker it
+was judged on** (`isCustom=true`, `reportType='Custom'`, ...), and the message
+says outright that the spellings are unconfirmed. The asymmetry above only holds
+if the loud half is actionable, and "the only reports with that name are custom"
+was not — it points the contractor at a report they can already see.
+`reporting.custom_marker` is that rule; `_looks_custom` is now a thin wrapper on
+it, so selection is unchanged.
+
+## ~~Financial feed: why `reporting.jobCosts` is absent on tr-doorservpro~~ — DIAGNOSED
+
+`src/st_exporter/feeds/reporting.py`; `src/st_exporter/config.py`,
+`job_cost_report_id`
+
+**Answered 2026-09-16 by run 35155266960, and it was none of the things it was
+assumed to be.** The chain, in the order each was eliminated:
+
+1. *Reporting permission* — fine. Never the problem. Enumeration reads 12
+   categories and 265 reports.
+2. *Report name* — was wrong, fixed in 0.2.14: this tenant carries "Job Costing
+   Summary Report", not "Job Costing Summary". Confirmed working.
+3. *`require_columns` refusing a mismatched report* — the assumed cause, and it
+   has never run. Resolution fails before it.
+4. **The actual cause: the tenant has TWO distinct reports with that exact
+   name** — ids `21131704` and `21639096`, both in category `operations`,
+   neither carrying any custom marker — and `find_builtin_report` refuses to
+   choose between them.
+
+The refusal is correct and stays. What is new is that there are now two ways
+past it that are not guesses, and a third that is and remains rejected:
+
+- **Elimination by declared columns** (`capable_of`). A candidate that does not
+  declare `JOB_COST_COLUMNS` could not produce the tab at all — `require_columns`
+  would refuse it moments later — so dropping it removes a non-viable candidate
+  rather than preferring one viable one. If exactly one survives it is selected.
+  **This does not resolve two copies of the same report**, which both declare the
+  same columns; that case still refuses, by design.
+- **An explicit pin** (`EXPORTER_JOB_COST_REPORT_ID`). A human's recorded
+  decision. Honoured whatever the report is named and whether or not it looks
+  custom, but it does NOT skip `require_columns`, so a mistyped or stale id fails
+  loudly instead of writing an empty tab. An id the tenant does not have is its
+  own refusal and never falls back to the name — falling back could re-select the
+  very report the pin was added to avoid.
+- **Rejected: any tie-break heuristic.** Lower id, higher id, best column score.
+  Each always returns a winner, and a wrong winner is a contractor's own report
+  silently supplying their cost numbers. This is the same reasoning the module
+  docstring uses to reject Profit Wizard's column-scoring fallback.
+
+**Still unknown, and needs a human:** which of `21131704` / `21639096` is the
+genuine built-in. Nobody has looked in the tenant's ServiceTitan UI. If both
+declare the frozen column set — likely, if one is a copy of the other — the
+exporter will keep refusing until somebody either deletes/renames the duplicate
+there or sets the pin here.
 
 ## Financial feed: the Reporting permission's portal name
 
@@ -255,6 +471,62 @@ The contract describes `modified_on` only as "for drift debugging" without
 specifying which entity's timestamp it should reflect. This mapping is a
 reasonable guess, not a confirmed requirement.
 
+## Profit Wizard hosted-parity columns (jobs, technicians, sales.estimates)
+
+`src/st_exporter/denormalize.py`, `src/st_exporter/format.py`, `src/st_exporter/sales.py`,
+`src/st_exporter/feeds/sales.py`
+
+Six columns appended to `jobs`, seven appended to `technicians`, and a new
+`sales.estimates` tab — all read straight from `export-columns-spec.md`, built for
+Profit Wizard's hosted (Export Store) path to reach parity with its existing
+Direct ServiceTitan path. Each field's confidence is different:
+
+- **`jobs.recall_for_id`, `jobs.warranty_id`** — well evidenced, not guessed:
+  Profit Wizard's own Direct path already reads `job.recallForId` / `job.warrantyId` off this exact JPM job
+  object in production (`profitwizard/lib/crm/servicetitan.ts`), which is the
+  strongest evidence short of a recorded response. What is NOT confirmed is that
+  the **export change-feed** (`jpm/v2/.../export/jobs`, which is what actually
+  fills `_raw_jobs`) spells these identically to the object the Direct path's list
+  call returns — the same open question `completed_on`'s sibling PRs on this repo
+  already flag.
+- **`jobs.no_charge`, `jobs.total`, `jobs.business_unit_id`, `jobs.sold_by_id`** —
+  read from the spec's literal field names (`noCharge`, `total`, `businessUnitId`,
+  `soldById`) with no fallback spelling, because the spec gives exactly one name
+  for each and a widened guess without a second candidate is just a guess dressed
+  up. `jobs.total` is deliberately narrower than the `total_revenue` column
+  that precedes it: that column widens to `job.invoiceTotal` as a fallback, this
+  one does not — the spec asks for `job.total` verbatim, nothing else.
+- **`technicians.phone`, `technicians.business_unit_id`, `technicians.role_ids`,
+  `technicians.home_address`, `technicians.home_latitude`,
+  `technicians.home_longitude`** — genuinely unverified. `phone` widens
+  `phoneNumber`/`phone`, matching `settings.businessUnits.Phone`'s existing
+  widen. `businessUnitId` is a single guess (ServiceTitan's technician list
+  sometimes nests `businessUnit: {name}` instead — see
+  `docs/integrations/servicetitan-api.md` in the Profit Wizard repo — so a flat
+  `businessUnitId` may not exist on every tenant's response; if it doesn't, the
+  column is blank, not wrong). `roleIds` is assumed to be a bare array of ids.
+  The technician's home address object's own key is unknown — `homeAddress` is
+  tried first, `home` second, and either shape's `latitude`/`longitude` read the
+  same way `denormalize._coordinate` reads a job location's. If the blank-column
+  detector fires on any of these six on a real tenant, that is the answer.
+- **`sales.estimates` — every column beyond `EstimateId`.** There was no real
+  ServiceTitan tenant to record an Estimates API response from, so every field
+  name in `src/st_exporter/sales.py` is inferred from the shape ServiceTitan uses
+  for the SAME fact elsewhere in this exporter (an item's `sku` object mirrors an
+  invoice line's; `qty` mirrors the Estimates API's documented request body) with
+  a flatter fallback tried second. The date-filter parameter on the fetch side
+  (`feeds/sales.py`, `ESTIMATE_DATE_PARAM = "modifiedOnOrAfter"`) is likewise a
+  guess, guarded by the same `warn_if_older_than_window` tripwire the invoices
+  and job-completion filters already use. **Check this whole tab first** once a
+  real tenant with estimates is available — a wrong guess here costs blank
+  `Item*` columns and/or an unbounded window, not wrong money (every money/hours
+  cell still goes through `_money`, blank when null). Two shapes are read
+  deliberately wider than the first draft: `soldBy` is accepted as a bare
+  employee id as well as `{id}` (the bare id is what this repo's own
+  `estimates-sell` examples send), and `Total` falls back to `subtotal + tax`
+  when the response has no `total` — the Estimates response is believed to
+  carry those two separately and no total of its own.
+
 ## ~~CRM Outbox response envelope~~ — RESOLVED 2026-09-14
 
 `src/st_exporter/outbox/client.py`, `TradeRatedOutboxClient.claim`
@@ -433,19 +705,17 @@ Unverified, and worth knowing before trusting the quiet half:
 
 `src/st_exporter/feeds/pricebook.py`, `src/st_exporter/pricebook.py`
 
-Three guesses, none confirmable without a tenant:
-
-- **`active=Any`.** Assumed the pricebook list endpoints take the same
-  `active` parameter as the settings endpoints, so withdrawn items export as
-  `active=false` instead of vanishing. If the real parameter differs, the tabs
-  silently become active-only — which consumers cannot distinguish from a
-  contractor deleting items, and they are forbidden from deleting rows.
-- **`assets[].id`.** Taken from TrueQuote's own client type, where it is
-  `string | null`. `image_refs` falls back to `assets[].url` when the id is
-  absent, and that url is either an HTTPS URL or an authenticated storage path
-  (`Images/Pricebook/<uuid>.jpg`). Whether ServiceTitan supplies stable asset ids
-  at all on these payloads is unconfirmed; if it never does, `image_refs` is
-  entirely url/path-shaped, which the contract still permits ("identifiers").
+- **`active=Any` — CONFIRMED 2026-09-16** against `tenant-pricebook-v2`'s
+  OpenAPI: `active` on `/services`, `/materials` and `/equipment` is
+  `ActiveRequestArg` with values `[True, Any, False]`, defaulting to active-only.
+  The spelling was right and withdrawn items do export as `active=false`.
+- **`assets[].id` — RESOLVED 2026-09-16, and the guess was WRONG:**
+  `Pricebook.V2.SkuAssetResponse` has no `id` at all. Its fields are `alias`,
+  `fileName`, `isDefault`, `type` and `url`. So `image_refs` is **always**
+  url/path-shaped in production (the contract permits that — "identifiers"), the
+  `assets[].id` branch in `asset_identifier` only ever fires on fixtures, and the
+  asset dedupe is effectively a dedupe by url. Left in place: it costs one `or`
+  and it is the right identity if ServiceTitan ever adds ids.
 - **`name` is never blank.** The contract guarantees it; ServiceTitan could
   return both `displayName` and `name` as null. The builder falls back to `code`
   and then the item id rather than emit a blank cell. Whether that fallback ever
@@ -453,7 +723,58 @@ Three guesses, none confirmable without a tenant:
 
 Also unverified: that the four tabs' row counts are small enough that a full
 replace every run stays well inside a Sheets write. A very large catalogue has
-never been measured.
+never been measured — and `pricebook.v2` widened the item tabs from 12 columns to
+42, so the arithmetic moved. Google Sheets caps a spreadsheet at 10,000,000 cells
+across all tabs; the pilot tenant's 35,138 items now come to ~1.48M (was ~0.42M),
+around 15% of the cap, with room for roughly 238,000 item rows before the
+pricebook tabs alone reach it. Still comfortable, no longer irrelevant. What has
+never been tested is a single `values.update` write of that size, or the write
+time for a six-figure catalogue.
+
+## Pricebook full payload — spellings verified against the spec, not a tenant
+
+`src/st_exporter/pricebook.py`
+
+Every column `pricebook.v2` added is named after a field in the published Pricebook
+v2 OpenAPI document — `Pricebook.V2.{Service,Equipment,Material,Category}Response`
+and the nested `SkuWarrantyResponse` / `SkuVendorResponse` — rather than guessed or
+copied from a consumer's client type. `cost` and `hours` are the two that matter
+most:
+
+- `Pricebook.V2.MaterialResponse` and `Pricebook.V2.EquipmentResponse` both
+  declare `cost` (decimal, "The cost paid to acquire the material") and `hours`
+  (decimal, "The number of hours associated with the installing the …").
+- `Pricebook.V2.ServiceResponse` declares `hours` ("Hours needed to complete this
+  service") and **no cost field of any spelling**. So `pricebook.services.cost` is
+  blank on every row of every tenant by construction, and `blank_columns` exempts
+  it by name with that reason.
+
+What is still unverified is the same thing as everywhere else on this page: that a
+live tenant's payload matches its own document. The tripwire is in place either
+way — `cost` is NOT exempted on `pricebook.equipment` or `pricebook.materials`, so
+a wrong spelling there fires the whole-column-blank warning above 25 rows, and
+`hours` is exempted on no tab at all.
+
+The wider column set makes that detector work harder, and the exemption list is
+where it can be blunted. Two kinds of entry now sit in
+`blank_columns.ALL_BLANK_OK` for the item tabs and they are NOT the same strength
+of claim:
+
+- **structurally absent** — the resource's schema has no such field, so the column
+  is blank on every row of every tenant forever (`cost` on services, `is_labor` on
+  equipment). Certain, from the spec.
+- **optional upstream** — the field exists and is commonly unset catalogue-wide
+  (`cross_sale_group`, `external_id`, `account`). A guess about contractor
+  behaviour, and the weaker one: if a spelling in that group is wrong, the
+  exemption is what hides it. Every money and hours column is deliberately left
+  OUT of both groups on every tab that has the field.
+
+Deliberately NOT copied from Profit Wizard's direct integration: its
+`item.price || item.memberPrice || item.addOnPrice` price fallback. Those are three
+different prices in the API (list, member, add-on), not three spellings of one, and
+a `||` chain fires on a real `0` — it would turn a genuinely free item into its
+member price. The exporter exports `price` and leaves the reconciliation to the
+consumer, which is the same reason `cost` and `hours` are blank-when-null here.
 
 ## Pricebook image upload — what could not be confirmed without a live TrueQuote
 
@@ -563,6 +884,45 @@ several spellings for each field (`item_id`/`itemId`/`id`, `payload`/`body`/`dat
 and so on) rather than assuming one, in the same widen-don't-narrow posture their
 result endpoint takes. Confirm the real names on the first live claim.
 
+## `categories` has two shapes — RESOLVED 2026-09-16, it was a real bug
+
+`src/st_exporter/feeds/pricebook.py`, `src/st_exporter/pricebook.py`
+
+Run `35134016237` on `BBTT-01/tr-doorservpro` (exporter 0.2.11) exported 61
+pricebook categories and then reported `category_ids` AND `category_names` blank
+on all 10041 `pricebook.equipment` rows and all 4990 `pricebook.materials` rows,
+while `pricebook.services` populated both.
+
+`tenant-pricebook-v2`'s OpenAPI says why: `Pricebook.V2.ServiceResponse.categories`
+is an array of `Pricebook.V2.SkuCategoryResponse` objects (`id`, `name`, `active`),
+but `Pricebook.V2.EquipmentResponse.categories` and
+`Pricebook.V2.MaterialResponse.categories` are arrays of **bare `int64` ids**. The
+reader accepted only the object form, so two thirds of the catalogue lost its
+category linkage entirely. Fixed by normalising both shapes in the fetch layer and
+resolving the names from the categories endpoint (one extra request, and only when
+nameless ids actually arrived).
+
+Still unverified: `categoryIds` is documented as taking a comma-separated list
+(`"example": "123,456"`), which contradicts the one-id-per-request quirk TrueQuote
+learned the hard way. The serial-request behaviour is deliberately kept — a
+live-tenant lesson outranks an example string — but it is worth re-measuring on a
+real tenant, because batching would cut the filtered fetch's request count.
+
+## `settings.businessUnits.Code` has no field behind it — CONFIRMED ABSENT 2026-09-16
+
+`src/st_exporter/financial.py`, `src/st_exporter/blank_columns.py`
+
+Run `35132986620` (same tenant) reported `Code` blank on all 189 business units.
+It is not a tenant that left it empty: `TenantSettings.V2.BusinessUnitResponse` in
+`tenant-settings-v2`'s OpenAPI has no `code` property, and neither does its export
+twin. The only code-ish fields are `accountCode`/`conceptCode` (the TENANT's
+franchise account and concept — identical on every unit, so not a substitute) and
+`certifiedSentriconSpecialistCode`. Profit Wizard's reader reads only
+`BusinessUnitId`, `Name`, `Address` and `Active`, so nothing downstream is waiting
+on it. Exempted in `ALL_BLANK_OK` with that reason; **the column should be dropped
+at the next `financial.v2` bump**, which is a contract change and is not being made
+here.
+
 ## The general tripwire: whole-column-blank detection
 
 `src/st_exporter/blank_columns.py`
@@ -604,3 +964,172 @@ the anchor, whose whole purpose is to be the one check the branch cannot subvert
 
 There is no in-repo tripwire for this, deliberately: any test that tried to assert
 it would itself be running inside the run that was skipped.
+
+## Images feed: does `modifiedOn` move when an item's IMAGE is replaced?
+
+`src/st_exporter/images/upload.py`, `_is_still_fresh` / `REVERIFY_AFTER_DAYS`
+
+The image pass skips the DOWNLOAD of any asset whose item has a `modifiedOn` no
+later than the moment the ledger last confirmed that asset's bytes. This is the
+only pre-download check available — the idempotency key hashes the payload, so
+`ledger.has(key)` cannot be asked until the bytes are already in hand, which is
+what used to make a ~7,191-asset tenant re-download the whole catalogue on every
+run just to rediscover it had already sent it (run 35130164187).
+
+What is assumed: ServiceTitan bumps a pricebook item's `modifiedOn` when one of
+its `assets` changes, and not only when a scalar field like `price` does. That
+is the behaviour the `pricebook.*` tabs' own full-replace-every-run design makes
+moot, so nothing in this repo has ever had to depend on it before.
+
+If the assumption is wrong, the failure is a DELAY, not a wrong picture, and it
+is bounded on purpose: `REVERIFY_AFTER_DAYS` (7) re-verifies every asset at
+least that often whatever the timestamps say, so a swapped image reaches
+TrueQuote within a week at worst. Check on a real tenant by replacing one item's
+image and watching whether the next `images-feed` run re-uploads it or reports
+it in `images_revalidated`. If it does not, lower `REVERIFY_AFTER_DAYS`; do not
+remove the check, or the pass stops converging.
+
+**This entry is NOT resolved by conditional requests** (below), and the two are
+easy to conflate. A conditional fetch only happens once the `modifiedOn`
+shortcut has already declined to skip the asset — so if `modifiedOn` never moves
+when an image is replaced, the thing that still catches it is the weekly
+re-verification, not the `ETag`. What conditional requests changed is what that
+weekly re-verification COSTS, not whether it happens.
+
+## Images feed: does ServiceTitan (or its CDN) honour conditional requests?
+
+`src/st_exporter/images/conditional.py`, `src/st_exporter/images/upload.py`
+(`_fetch`), `src/st_exporter/images/ledger.py` (`etag` / `last_modified`)
+
+The weekly re-verification above used to be a full re-download of every asset.
+It now sends `If-None-Match` / `If-Modified-Since` built from whatever the
+server returned last time, and treats a **304** as a verification that moved no
+bytes. **Nobody has measured whether that works against a real tenant.** Three
+separate things are unknown, and they can have different answers on the
+authenticated `pricebook/v2/tenant/{id}/images` endpoint and on the public CDN
+urls ServiceTitan hands out:
+
+1. Do responses carry an `ETag` or a `Last-Modified` at all?
+2. If we quote one back, does anything answer 304, or is the header ignored?
+3. Are the asset urls **signed** (`?X-Amz-Signature=…`, `?sig=…`)? A signed url
+   defeats the mechanism twice over: the validator belongs to a url we will
+   never request again, and for an asset with no ServiceTitan `id` the ledger's
+   own `asset_ref` is built from the url, so the previous run's entry is not
+   even found. This one cannot be worked around from this side.
+
+**The code does not depend on any of the three answers.** No stored validator
+means a plain GET and a full download — exactly the behaviour that existed
+before — and an ignored validator means a 200, also exactly that behaviour. The
+feature can only make the pass cheaper, never wrong.
+
+**How to read the answer off one live run.** Every `images` run logs
+
+```
+image conditional requests: fetches=… conditional_sent=… not_modified=…
+conditional_missed=… validators_present=… validators_absent=… weak_etags=…
+signed_urls=… unstable_refs=… -- <one English sentence>
+```
+
+and the run's own summary line carries `images_not_modified=`,
+`images_conditional_sent=`, `images_no_validator=` and `images_signed_urls=`.
+
+**What a good result looks like**, on the second run after this ships (the first
+run only STORES validators; it cannot yet test them):
+
+- `validators_absent=0` — every response offers something to quote back;
+- `conditional_sent` ≈ the number of assets due for re-verification, and
+  `not_modified` equal or close to it, so the verdict reads
+  `conditional requests WORK: N/N (100%)`;
+- `signed_urls=0`, and `unstable_refs=0` above all.
+
+**What each bad result means.**
+
+- `validators_absent` high, `conditional_sent=0` → the server offers nothing;
+  conditional requests are inert on this tenant and the weekly sweep still costs
+  a full re-download. Nothing here is broken; the ticket simply did not buy
+  anything, and the next lever is a longer interval or an asset-level `modifiedOn`
+  if ServiceTitan ever exposes one.
+- `conditional_sent` high, `not_modified=0` → the headers are being ignored (or
+  the urls rotate). Check `signed_urls` before concluding anything.
+- `unstable_refs > 0` → those assets can never be deduplicated at all, by any
+  mechanism in this repo, because their ledger identity changes every listing.
+  That is a much bigger finding than this ticket and should be raised on its own.
+
+---
+
+## Nobody has ever measured a real pricebook image
+
+**Status: unverified, and now instrumented.**
+
+`MIN_PLAUSIBLE_IMAGE_BYTES = 1024` is justified in `images/assets.py` with "the
+smallest real pricebook assets seen are 2-4 KiB". That figure is an
+**assumption**: it was written alongside the constant in commit `2298a15`, and
+no asset from any live tenant has ever been sized. The only payload anyone has
+measured is a 246-byte placeholder. Run 35145303072 uploaded five real images
+and logged not one byte count.
+
+If 2-4 KiB is accurate, ServiceTitan is serving THUMBNAILS and this whole lane
+is shipping unusable pictures into contractors' catalogues.
+
+**How it gets settled.** `ImageUploadSummary` now carries every uploaded
+payload's size, and the run reports
+`images_bytes[min=… median=… max=… total=…]`. A capped run additionally names
+each upload with its item id, its byte size and its decoded dimensions. One
+uncapped run, or one run with `image_max_assets: 20`, answers it:
+
+- median in the low single-digit KB → thumbnails, and the product question is
+  whether ServiceTitan can be asked for a larger rendition at all;
+- median in the hundreds of KB → photographs, and the floor's justification was
+  merely unsourced rather than wrong.
+
+## The blank-placeholder defence does not hold, and cannot be fixed with a constant
+
+**Status: MEASURED as insufficient. Not fixed. Reported per run.**
+
+Measured by hand on 2026-09-16 against ServiceTitan's **web-app image proxy**:
+
+```
+GET .../Image/Images%2FService%2F<guid>.png                          -> 404, 272 bytes
+GET .../Image/Images%2FService%2F<guid>.png?size=1200
+        &default=Default%2F1.png                                     -> 200, image/webp, 2798 bytes
+```
+
+The 2,798-byte body is a **completely blank white 1200x1200 image**. It clears
+the 1 KiB floor with room to spare, and the placeholder's size scales with the
+`size=` parameter — so no fixed byte threshold can be both above every
+placeholder and below every photograph. The floor cannot do the job it was
+written for.
+
+**The signal that does scale is DENSITY**, compressed bytes per pixel.
+`assets.image_dimensions` reads width and height from the file header
+(PNG/JPEG/WebP; no decode, no image-processing dependency, no pixel touched) and
+`assets.looks_blank` compares byte count against pixel count. The measured blank
+is 0.0019 bytes/pixel; a photograph, however aggressively compressed, is one to
+two orders of magnitude denser.
+
+**It is reported, not enforced**, and deliberately so. Setting a rejection
+threshold requires knowing what a real asset's density looks like on this
+tenant, which is the unverified item above; a rule guessed today could silently
+drop real images, which is strictly worse than uploading a blank. The pass
+counts `images_suspected_blank=N` and uploads them anyway. A run reporting
+`images_suspected_blank=16000` is the finding, and the rule can then be written
+from evidence. (The sha256 of every payload rejected by the existing floor is
+still logged, so the hash-blocklist route remains open if density ever proves
+too blunt for a specific tenant.)
+
+**SCOPE — read before acting on this.** The exporter calls the **authenticated**
+`pricebook/v2/tenant/{id}/images?path=…` endpoint, never that web-app proxy, and
+it sends neither `size=` nor `default=` (`is_storage_path` forbids a `?` in the
+ref ServiceTitan hands us, so we could not add one by accident). `default=` is
+what turns a missing asset into a 200 OK placeholder instead of an honest 404,
+and we never send it. Run 35145303072 reported `placeholders=0 unsupported=0`
+on five real uploads, which is consistent with the authenticated endpoint
+behaving honestly.
+
+**What is NOT known** is what the authenticated endpoint returns for an asset
+the caller may not see, or one that no longer exists. Reading the code, a 4xx
+would surface as `NotFoundError`/`APIError` and be counted as
+`download_failed` — but that is an inference from `st_cli/client.py`, not an
+observation. **What would settle it:** one run against a tenant with a known-bad
+asset path, or simply an uncapped sweep whose `images_download_failed`,
+`images_placeholders` and `images_suspected_blank` counts are read together.

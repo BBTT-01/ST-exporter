@@ -68,6 +68,92 @@ _REMOVED_ASSIGNMENT_STATUSES = {"unassigned", "removed", "cancelled", "canceled"
 # nothing else in this pipeline ever removes a record once seen.
 _EXCLUDED_JOB_STATUSES = {"canceled", "cancelled"}
 
+#: Where a JPM job record carries its completion instant, in priority order.
+#:
+#: ``completedOn`` is the documented spelling and is the one expected to match.
+#: It is well-evidenced rather than guessed. Profit Wizard's own Direct path
+#: reads exactly this field in production for these two contractors —
+#: ``profitwizard/lib/crm/servicetitan.ts:852``,
+#: ``completed_date: job.completedOn ? ... : undefined`` — which is both the
+#: strongest evidence short of a recorded response and the thing that fills
+#: `completed_date` on the direct baseline this tab is compared against. The
+#: same precedent (a live shipped reader on the same tenants) is what resolved
+#: the customer-contacts question. Beyond that, the sibling query parameter
+#: ``completedOnOrAfter`` on ``GET /jpm/v2/tenant/{tenant}/jobs`` is CONFIRMED
+#: against the published ``tenant-jpm-v2`` OpenAPI description (see
+#: ``feeds/financial.JOB_COMPLETED_PARAM`` and ``KNOWN_UNVERIFIED.md``), a
+#: parameter that filters on a field of that name, and
+#: ``financial.warn_if_older_than_window`` already reads ``completedOn`` off
+#: live job records from that same endpoint.
+#:
+#: What is NOT confirmed is that the **export** change-feed
+#: (``/jpm/v2/tenant/{tenant}/export/jobs``, which is what actually fills
+#: ``_raw_jobs`` and therefore this tab) spells it identically to the list
+#: endpoint. The alternate is carried for the same reason ``job_number`` now
+#: reads ``jobNumber`` before ``number``: a single guessed key is exactly how
+#: that column stayed blank on all 2431 rows of a live Sheet for the life of the
+#: feature. Both names mean the same fact, so trying both cannot pick up a
+#: DIFFERENT one — the failure mode that makes widening dangerous elsewhere.
+#:
+#: If neither matches, the tenant's next run says so by itself: ``completed_on``
+#: is not in ``blank_columns.ALL_BLANK_OK``, so a whole-column blank raises the
+#: BLANK COLUMN warning and an Actions annotation rather than passing silently.
+_COMPLETED_ON_KEYS: tuple[str, ...] = ("completedOn", "completedOnUtc")
+
+#: Where a JPM job record carries what the customer was billed, in priority order.
+#:
+#: **This is the DIRECT path's own source, deliberately.** Profit Wizard fills
+#: `jobs.total_revenue` from exactly this expression in production —
+#: ``profitwizard/lib/crm/servicetitan.ts:856``,
+#: ``total_revenue: (job.total || job.invoiceTotal) ?? undefined`` — and that is
+#: the only code path in Profit Wizard that writes the column at all. Reading the
+#: same two fields in the same order is what makes the hosted numbers COMPARABLE
+#: to the direct baseline rather than merely plausible: a different source would
+#: produce a different figure for the same job, and the QA sweep that found this
+#: gap is a direct-vs-hosted comparison.
+#:
+#: That the fields exist is inferred, but not weakly: the direct baseline carries
+#: revenue on 446 jobs, and line 856 is the only thing that could have put it
+#: there, so at least one of the two is real and populated on ~446 of that
+#: tenant's jobs.
+#:
+#: **A resolved ``0`` means ABSENT here, not a zero-dollar job**, and that is the
+#: one place this column departs from how every other money cell in the export is
+#: read. It is worth the paragraph, because the first cut of this column got it
+#: the other way round and shipped.
+#:
+#: The reasoning then was that ``0`` is a real fact and the contract says blank is
+#: not zero, so ``_first_present`` (which treats ``0`` as a value) was used and
+#: Profit Wizard's ``||`` was called a difference made on purpose. The live tenant
+#: says that was wrong. Measured across 1256 rows of `tr-doorservpro`'s jobs tab:
+#: **no row was blank**, 45% of distinct jobs read exactly ``0``, and 41% of
+#: COMPLETED jobs reported ``$0``. ServiceTitan does not send null here — it sends
+#: ``0`` for "no revenue recorded" — so reading ``0`` as a real zero labels four
+#: jobs in ten as free work.
+#:
+#: PW's choice of ``||`` over ``??`` is the same judgement, made earlier: it lets
+#: a ``0`` fall through and omits the field entirely when nothing is left, which
+#: is why the direct baseline carries revenue on 446 of ~999 jobs as NULL rather
+#: than as zeros. Matching it restores parity between the two paths on ~400 jobs.
+#:
+#: The asymmetry is what settles it. A blank makes Profit Wizard REFUSE to compute
+#: a margin; a ``0`` makes it compute one against zero revenue, i.e. **-100%**.
+#: One is a gap, the other is a confident wrong number on a customer's screen, and
+#: the blank-column tripwire cannot catch it — it only fires on a column that is
+#: empty on every row, and an all-zero column sails straight past.
+#:
+#: The cost is real and accepted: a genuine zero-dollar job (a warranty callback,
+#: a goodwill visit) is now indistinguishable from one with nothing recorded. This
+#: field cannot tell them apart in the first place, the direct path already makes
+#: that trade, and "I cannot tell you" beats "they worked for free".
+#:
+#: If neither field exists on the export change-feed's job record, the next run
+#: says so: ``total_revenue`` is not in ``blank_columns.ALL_BLANK_OK``, so a
+#: whole-column blank is reported loudly. See ``KNOWN_UNVERIFIED.md`` — there is
+#: a second, larger source (invoice line ``ItemTotal``) already in the export if
+#: this one turns out to be empty.
+_TOTAL_REVENUE_KEYS: tuple[str, ...] = ("total", "invoiceTotal")
+
 
 def _first_present(*sources: dict[str, Any] | None, keys: tuple[str, ...]) -> Any:
     """Return the first non-``None`` value for any of ``keys`` across ``sources``,
@@ -186,6 +272,33 @@ def _typed_contact(customer: dict[str, Any], contact_types: tuple[str, ...]) -> 
     if not contact_types:
         return None
     return select_contact_value(customer.get("contacts") or [], contact_types)
+
+
+def _money_or_absent(source: dict[str, Any], *, keys: tuple[str, ...]) -> Any:
+    """First value for ``keys`` that is neither missing nor zero, else ``None``.
+
+    ``_first_present`` with one change: a numeric ``0`` does not stop the search
+    and does not become the answer. See :data:`_TOTAL_REVENUE_KEYS` for why this
+    field, alone among the money cells here, reads ``0`` as "not recorded".
+
+    Deliberately narrow. It is NOT a general money reader and must not become
+    one: a ``0`` cost and a ``0`` price elsewhere in this export are real facts,
+    and the contract's "blank is not zero" rule holds everywhere it is not
+    overridden with evidence like the paragraph above.
+
+    A non-numeric value (a string, say) is returned as-is rather than judged —
+    parsing is the consumer's job and refusing to guess is this module's habit.
+    """
+    for key in keys:
+        value = source.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and value == 0:
+            continue
+        return value
+    return None
 
 
 def _coordinate(location: dict[str, Any] | None) -> tuple[Any, Any]:
@@ -381,6 +494,55 @@ def build_job_rows(
                     "summary": job.get("summary"),
                     "business_unit": _business_unit_name(job, business_units),
                     "modified_on": appointment.get("modifiedOn") or job.get("modifiedOn"),
+                    # The JOB's own completion instant, never derived from the
+                    # appointment. Profit Wizard's `jobs.completed_date` was null
+                    # on all 864 completed jobs of the live tenant because this
+                    # tab carried no completion timestamp at all, so every
+                    # jobs-backed analytic that filters on it read the tenant as
+                    # having done no work: the technicians roster showed named
+                    # techs a 0% close rate and $0, and the Safety System
+                    # reported "no completed jobs in the last 90 days".
+                    #
+                    # Deliberately NOT synthesised from `appointment_end`. A
+                    # consumer can already do that fallback itself and several
+                    # do; what none of them can do is tell a real completion
+                    # apart from a guess. An appointment that ended is not a job
+                    # that completed — a technician can finish a visit on a job
+                    # that stays open for parts, a second visit or an approval,
+                    # and the last appointment on a cancelled job ends too.
+                    # Writing a guess into this column would make the guess
+                    # indistinguishable from the fact for every consumer,
+                    # permanently.
+                    #
+                    # Blank for a job ServiceTitan has not completed, which is
+                    # correct and is what "blank is not zero" means here.
+                    "completed_on": _first_present(job, keys=_COMPLETED_ON_KEYS),
+                    # What the customer was billed. Without it every margin and
+                    # profitability surface in Profit Wizard is empty: it
+                    # correctly refuses to compute a margin from half an input
+                    # rather than show a wrong one, so the product is hollow
+                    # rather than wrong. Blank means "no revenue recorded", and
+                    # blank is not zero — a zero-dollar job is its own fact.
+                    "total_revenue": _money_or_absent(job, keys=_TOTAL_REVENUE_KEYS),
+                    # APPENDED columns for Profit Wizard hosted parity (see
+                    # `format.JOB_COLUMNS`). Read straight off the JOB record, never
+                    # derived or defaulted: a job ServiceTitan has not completed, has
+                    # no recall, carries no warranty, or was never marked no-charge
+                    # must stay BLANK, not "0"/"false" — collapsing "unknown" into a
+                    # falsy value is exactly the mistake `docs/export-contract.md`
+                    # calls out for money and booleans alike. `recall_for_id`
+                    # and `warranty_id` are already read by Profit
+                    # Wizard's own Direct path off these exact field names
+                    # (`lib/crm/servicetitan.ts`), which is the strongest evidence
+                    # short of a recorded response; `no_charge`/`total`/
+                    # `business_unit_id`/`sold_by_id` are the same shape of read,
+                    # unverified against a live tenant (see KNOWN_UNVERIFIED.md).
+                    "recall_for_id": job.get("recallForId"),
+                    "warranty_id": job.get("warrantyId"),
+                    "no_charge": job.get("noCharge"),
+                    "total": job.get("total"),
+                    "business_unit_id": job.get("businessUnitId"),
+                    "sold_by_id": job.get("soldById"),
                     # Not a contract column; used by run.py to sort deterministically
                     # without re-deriving ints from formatted text.
                     "_sort_key": _sort_key(job.get("id"), appointment_id),

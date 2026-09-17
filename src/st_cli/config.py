@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -50,7 +51,7 @@ class Settings(BaseSettings):
 
 def load_settings(env_file: Path | None = None) -> Settings:
     """Load settings, optionally from a specific .env file."""
-    kwargs: dict = {}
+    kwargs: dict[str, Any] = {}
     if env_file is not None:
         kwargs["_env_file"] = str(env_file)
-    return Settings(**kwargs)  # type: ignore[arg-type]
+    return Settings(**kwargs)

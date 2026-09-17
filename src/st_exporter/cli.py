@@ -10,12 +10,21 @@ from st_cli.config import Settings, load_settings
 from st_cli.exceptions import STCLIError
 from st_exporter.config import ExporterSettings
 from st_exporter.images.client import TrueQuoteImageClient
+from st_exporter.images.upload import ImageUploadSummary
 from st_exporter.logging_setup import announce_to_actions, logger
 from st_exporter.outbox.drain import LaneOutcome, drain_lanes
 from st_exporter.outbox.lanes import build_lanes, close_lanes
 from st_exporter.outbox.ledger import OutboxLedger
 from st_exporter.outbox.settings import load_all_lane_credentials
-from st_exporter.run import EXPORT_FEEDS, OUTBOX_FEED, ExportSummary, parse_feeds, run_export
+from st_exporter.run import (
+    EXPORT_FEEDS,
+    IMAGES_FEED,
+    OUTBOX_FEED,
+    ExportSummary,
+    parse_feeds,
+    run_export,
+    run_images,
+)
 from st_exporter.sheets import SheetsClient, get_gspread_client
 from st_exporter.traderated_settings import TradeRatedSettings
 
@@ -26,11 +35,13 @@ def run_once(
         "--feeds",
         help=(
             "Comma-separated feeds to run this call: jobs, technicians, pricebook, "
-            "financial, outbox. `pricebook` writes the four pricebook.* tabs and "
+            "financial, images, outbox. `pricebook` writes the four pricebook.* tabs and "
             "`financial` the four Profit Wizard tabs (accounting.invoices, "
             "payroll.timesheets, settings.businessUnits, reporting.jobCosts); neither "
-            "is on by default. `outbox` writes no tab at all — it drains the outbox "
-            "queue of every product whose secrets are set, and it must appear in "
+            "is on by default. `images` writes no tab either — it re-lists the pricebook "
+            "and POSTs item image BYTES to TrueQuote, bounded by the job timeout and "
+            "resumed by the next run. `outbox` writes no tab at all — it drains the "
+            "outbox queue of every product whose secrets are set, and it must appear in "
             "EXACTLY ONE workflow job."
         ),
     ),
@@ -41,10 +52,12 @@ def run_once(
         True,
         "--upload-images/--no-upload-images",
         help=(
-            "With `--feeds pricebook`, also POST the pricebook image bytes to TrueQuote. "
-            "Needs TRUEQUOTE_IMAGE_TOKEN + TRUEQUOTE_OUTBOX_URL (the TRADERATED_* "
-            "spellings are still accepted); silently skipped "
-            "without them. Identifiers still go in the Sheet either way."
+            "With `--feeds images`, POST the pricebook image bytes to TrueQuote. Needs "
+            "TRUEQUOTE_IMAGE_TOKEN + TRUEQUOTE_OUTBOX_URL (the TRADERATED_* spellings "
+            "are still accepted); silently skipped without them. Identifiers still go "
+            "in the Sheet via the `pricebook` feed either way. NOTE: this used to apply "
+            "to `--feeds pricebook`; it now applies to `--feeds images`, which is a feed "
+            "and a workflow job of its own."
         ),
     ),
 ) -> None:
@@ -56,21 +69,29 @@ def run_once(
     parsed_feeds = parse_feeds(feeds)
     export_feeds = parsed_feeds & EXPORT_FEEDS
     drain_requested = OUTBOX_FEED in parsed_feeds
+    images_requested = IMAGES_FEED in parsed_feeds
 
     summary: ExportSummary | None = None
     if export_feeds:
-        image_client = _image_client(traderated_settings, export_feeds, upload_images, dry_run)
-        try:
-            summary = run_export(
-                st_settings,
-                exporter_settings,
-                feeds=export_feeds,
-                dry_run=dry_run,
-                image_client=image_client,
-            )
-        finally:
-            if image_client is not None:
-                image_client.close()
+        summary = run_export(
+            st_settings,
+            exporter_settings,
+            feeds=export_feeds,
+            dry_run=dry_run,
+        )
+
+    # AFTER any export half, and outside it. The image pass writes no export tab
+    # and no `_meta` row — see `run_images` — so nothing it does can land between
+    # a written tab and the `_meta` row describing it, whatever it is asked to do
+    # alongside. In the caller workflow it is a job of its own and this is the
+    # only half that runs.
+    image_summary: ImageUploadSummary | None = None
+    if images_requested:
+        image_summary = _run_image_feed(
+            st_settings, exporter_settings, traderated_settings, upload_images, dry_run
+        )
+    else:
+        _warn_if_images_unsent(traderated_settings)
 
     outcomes: list[LaneOutcome] = []
     if drain_requested and not dry_run:
@@ -97,7 +118,7 @@ def run_once(
     # has already been reported succeeded to its app.
     write_back_note = _write_back(summary, outcomes)
 
-    typer.echo(_summary_line(summary, outcomes) + write_back_note)
+    typer.echo(_summary_line(summary, outcomes, image_summary) + write_back_note)
 
     run_failed = False
 
@@ -325,6 +346,50 @@ def _announce_unwritable_ledger(outcomes: list[LaneOutcome]) -> None:
     )
 
 
+def _run_image_feed(
+    st_settings: Settings,
+    exporter_settings: ExporterSettings,
+    traderated_settings: TradeRatedSettings,
+    upload_images: bool,
+    dry_run: bool,
+) -> ImageUploadSummary | None:
+    """The `images` feed. None when this run has no business uploading bytes."""
+    image_client = _image_client(traderated_settings, upload_images, dry_run)
+    if image_client is None:
+        return None
+    try:
+        return run_images(st_settings, exporter_settings, image_client=image_client)
+    finally:
+        image_client.close()
+
+
+def _warn_if_images_unsent(traderated_settings: TradeRatedSettings) -> None:
+    """Say loudly when a run holds an image token but was not asked for `images`.
+
+    The same shape as ``_warn_if_undrained``, and for the same reason. The image
+    pass used to be a flag on the `pricebook` feed, so the caller workflow gave
+    `TRUEQUOTE_IMAGE_TOKEN` to `pricebook-feed`. A connector that repins to this
+    version without adding the `images-feed` job keeps handing that token to a
+    job that no longer uploads anything, and would simply stop delivering image
+    bytes — on GREEN runs, with nothing anywhere saying so. That is the exact
+    silent-stop shape the one-drain rule exists to prevent, arriving by a new
+    door.
+
+    Not an error and not a failure: image REFS still reach the Sheet from the
+    `pricebook` feed, so the tenant is degraded rather than broken, and the fix
+    is one job in a repository this one cannot edit.
+    """
+    if not traderated_settings.images_configured:
+        return
+    logger.warning(
+        "TRUEQUOTE_IMAGE_TOKEN is set on this run but `images` was not in its feeds, so "
+        "NO image bytes were uploaded. The image pass is its own feed and its own caller "
+        "job now (it used to be a flag on `pricebook`): add an `images-feed` job passing "
+        "`feeds: images`, and move the token to it. Image identifiers still reach the "
+        "Sheet meanwhile; only the bytes are skipped."
+    )
+
+
 def _warn_if_undrained() -> None:
     """Say loudly when a purchased product's queue was not drained by this call.
 
@@ -348,8 +413,12 @@ def _warn_if_undrained() -> None:
     )
 
 
-def _summary_line(summary: ExportSummary | None, outcomes: list[LaneOutcome]) -> str:
-    """The one line this run echoes. Drain-only runs have no export half."""
+def _summary_line(
+    summary: ExportSummary | None,
+    outcomes: list[LaneOutcome],
+    image_summary: ImageUploadSummary | None = None,
+) -> str:
+    """The one line this run echoes. Drain-only and images-only runs have no export half."""
     message = ""
     if summary is not None:
         message = (
@@ -405,20 +474,13 @@ def _summary_line(summary: ExportSummary | None, outcomes: list[LaneOutcome]) ->
             # digging for.
             message += " financial_failed=" + ",".join(sorted(summary.financial_failures))
         if summary.images is not None:
-            images = summary.images
-            message += (
-                f" images_uploaded={images.uploaded} images_already={images.already_uploaded} "
-                f"images_failed={images.download_failed + images.upload_rejected} "
-                f"images_permission_denied={str(images.permission_denied).lower()} "
-                # `stopped` is the one that changes what the counts MEAN: a pass
-                # that aborted has "not looked at" the rest of the catalogue, so
-                # images_uploaded=0 reads as "nothing to do" unless this says
-                # otherwise. Named in the run's output, not only in the log —
-                # the same rule as pricebook_failed / financial_failed above.
-                f"images_stopped={images.stopped or 'no'} "
-                f"images_too_large={images.too_large} "
-                f"images_unsupported={images.unsupported}"
-            )
+            message += _image_fields(summary.images)
+
+    if image_summary is not None:
+        # The `images` feed's own half. An images-only run has no ExportSummary
+        # at all, so without this its line would read "nothing to do" after a
+        # pass that moved thousands of images.
+        message += _image_fields(image_summary)
 
     for outcome in outcomes:
         # Prefixed per product, so a two-lane run reads as two sets of counters
@@ -448,6 +510,87 @@ def _summary_line(summary: ExportSummary | None, outcomes: list[LaneOutcome]) ->
     return message.strip() or "nothing to do"
 
 
+def _image_fields(images: ImageUploadSummary) -> str:
+    """The image pass's counters, for the run's one output line.
+
+    Shared by the `images` feed and by an in-process pass, so an operator reads
+    the same words either way.
+    """
+    return (
+        f" images_uploaded={images.uploaded} images_already={images.already_uploaded} "
+        f"images_failed={images.download_failed + images.upload_rejected} "
+        # Refusals TrueQuote made this run, and the ones it made on an EARLIER
+        # run that this run therefore did not re-send. The second is the number
+        # that says a refusal is being remembered rather than re-paid for on
+        # every pass; both sit beside `images_failed`, which folds the first in.
+        f"images_rejected={images.upload_rejected} "
+        f"images_rejected_remembered={images.rejected_remembered} "
+        f"images_permission_denied={str(images.permission_denied).lower()} "
+        # `stopped` and `pending` are the two that change what the counts MEAN: a
+        # pass that ran out of budget has "not looked at" the rest of the
+        # catalogue, so images_uploaded=0 reads as "nothing to do" unless these
+        # say otherwise — and `pending` is the number that falls run over run
+        # while a first sweep converges. Named in the run's output, not only in
+        # the log: the same rule as pricebook_failed / financial_failed above.
+        f"images_stopped={images.stopped or 'no'} "
+        f"images_pending={images.pending} "
+        f"images_revalidated={images.revalidated} "
+        # The conditional-request measurement, on the run's own output line
+        # rather than only in the log, because it is the whole point of the
+        # first few runs: `images_not_modified` is what the 304 path saved, and
+        # `images_no_validator` is how many responses offered nothing to quote
+        # back and therefore stay on the old full-re-download schedule. Nobody
+        # has confirmed ServiceTitan honours conditional requests; these two
+        # numbers are the confirmation. See `images/conditional.py`.
+        f"images_not_modified={images.not_modified} "
+        f"images_fetched={images.fetched} "
+        # The cap in force and whether it BIT, so one line answers "did it stop
+        # on the cap or on the clock" without cross-referencing the config.
+        f"images_max_assets={images.max_assets or 'none'} "
+        f"images_cap_hit={str(images.cap_hit).lower()} "
+        f"images_conditional_sent={images.conditional.conditional_sent} "
+        f"images_no_validator={images.conditional.validators_absent} "
+        f"images_signed_urls={images.conditional.signed_urls} "
+        f"images_too_large={images.too_large} "
+        f"images_unsupported={images.unsupported} "
+        # Byte-valid images too small to BE a picture — ServiceTitan's blank
+        # placeholder, served with 200 OK. Its own field, never folded into
+        # `images_unsupported`: a run that reports `images_placeholders=N` is
+        # NOT a clean run, and the fix (a permission) is nothing like the fix
+        # for an unsupported format.
+        f"images_placeholders={images.placeholders} "
+        # WHAT the unsupported payloads looked like. `html:5` and `gif:5` are
+        # the same `images_unsupported=5` and opposite diagnoses.
+        f"images_unsupported_shapes={images.unsupported_shapes_field} "
+        # HOW MUCH SHARING there is in this catalogue. Several items routinely
+        # point at one photograph, and the pass now downloads it once: run
+        # 35145303072 fetched one GUID five times before this existed. The ratio
+        # is measured over the whole listing, free, and is the number that says
+        # what a first sync will actually cost.
+        f"images_item_assets={images.item_assets} "
+        f"images_distinct={images.distinct_assets} "
+        f"images_dedupe={images.dedupe_ratio:.2f}x "
+        # WHAT SIZE the images we are actually uploading are. Nobody has ever
+        # confirmed that what ServiceTitan serves is a photograph rather than a
+        # thumbnail, and a median in the low single-digit KB is the answer
+        # "thumbnails". On the run's own output line because it is a question
+        # about the product, not about the exporter.
+        f"images_bytes[{images.bytes_field}] "
+        # Uploads whose byte density says "blank fill". Counted, never acted on:
+        # the 1 KiB floor demonstrably cannot catch a blank (a white 1200x1200
+        # WebP is 2,798 bytes) and no real asset has been measured, so this is
+        # the measurement that would let a rule be written from evidence.
+        f"images_suspected_blank={images.suspected_blank} "
+        # Non-zero means the pass was throttled and is being held back by its
+        # own governor or by a 429. Zero on a healthy run.
+        f"images_rate_limited={images.rate_limit_penalties} "
+        # How many times the ledger reached the Sheet mid-pass. On a multi-hour
+        # backfill this is the resumability guarantee, stated as a number: a
+        # killed process loses at most the work since the last one.
+        f"images_ledger_flushes={images.ledger_flushes}"
+    )
+
+
 def _tab_key(tab_name: str) -> str:
     """`accounting.invoices` -> `accounting_invoices`, for the flat summary line."""
     return tab_name.replace(".", "_")
@@ -455,7 +598,6 @@ def _tab_key(tab_name: str) -> str:
 
 def _image_client(
     traderated_settings: TradeRatedSettings,
-    feeds: frozenset[str],
     upload_images: bool,
     dry_run: bool,
 ) -> TrueQuoteImageClient | None:
@@ -465,8 +607,14 @@ def _image_client(
     state until TrueQuote issues one, so it is INFO and a skip, never an error.
     The token is the `image_upload`-scoped one — presenting the booking token
     here earns a 401 from TrueQuote, not a fallback.
+
+    It no longer takes `feeds`: the caller decides, and the only caller is the
+    `images` feed. That is the deliberate behaviour change in this split — a
+    connector that repins and keeps giving `TRUEQUOTE_IMAGE_TOKEN` to its
+    `pricebook-feed` job now uploads nothing there instead of being SIGKILLed
+    mid-download every hour, and `_warn_if_images_unsent` says so out loud.
     """
-    if not upload_images or dry_run or "pricebook" not in feeds:
+    if not upload_images or dry_run:
         return None
     if not traderated_settings.images_configured:
         logger.info("TRUEQUOTE_IMAGE_TOKEN/TRUEQUOTE_OUTBOX_URL not set; skipping image upload")

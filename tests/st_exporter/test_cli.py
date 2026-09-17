@@ -10,6 +10,7 @@ plain wrapper function).
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -53,7 +54,6 @@ class TestSuccessPath:
             "fake-exporter-settings",
             feeds=DEFAULT_FEEDS,
             dry_run=False,
-            image_client=None,
         )
 
     def test_dry_run_flag_is_passed_through(self, monkeypatch) -> None:
@@ -71,9 +71,7 @@ class TestSuccessPath:
             main()
 
         assert exc_info.value.code == 0
-        mock_run.assert_called_once_with(
-            "s", "e", feeds=DEFAULT_FEEDS, dry_run=True, image_client=None
-        )
+        mock_run.assert_called_once_with("s", "e", feeds=DEFAULT_FEEDS, dry_run=True)
 
     def test_pricebook_noop_flag_is_gone(self, monkeypatch, capsys) -> None:
         """`--pricebook` was a deliberate no-op; ticket 06 replaced it with a real
@@ -122,9 +120,7 @@ class TestSuccessPath:
         out = capsys.readouterr().out
         assert "pricebook_services=2" in out
         assert "pricebook_categories=4" in out
-        mock_run.assert_called_once_with(
-            "s", "e", feeds=frozenset({"pricebook"}), dry_run=False, image_client=None
-        )
+        mock_run.assert_called_once_with("s", "e", feeds=frozenset({"pricebook"}), dry_run=False)
 
     def test_a_failed_pricebook_tab_is_named_in_the_run_output(self, monkeypatch, capsys) -> None:
         # Not only in the log: a tab left at last run's contents is a fact the
@@ -163,9 +159,7 @@ class TestFeedsFlag:
             main()
 
         assert exc_info.value.code == 0
-        mock_run.assert_called_once_with(
-            "s", "e", feeds=frozenset({"jobs"}), dry_run=False, image_client=None
-        )
+        mock_run.assert_called_once_with("s", "e", feeds=frozenset({"jobs"}), dry_run=False)
 
     def test_invalid_feeds_value_prints_clean_error_and_exits_one(
         self, monkeypatch, capsys
@@ -736,3 +730,170 @@ class TestAFailedFeedRedsTheRun:
         assert code == 1
         out = capsys.readouterr().out
         assert "feed_failed=jobs" in out and "pricebook_failed" not in out
+
+
+class TestTheImagesFeedIsRoutedOnItsOwn:
+    """`images` is its own feed and its own workflow job.
+
+    It used to be `--upload-images` riding inside a `--feeds pricebook` run. On
+    a tenant with ~7,191 assets that run was SIGKILLed by the runner at 10m35s
+    with 0 images uploaded (run 35130164187 on `BBTT-01/tr-doorservpro`) and
+    took the hourly pricebook export down with it.
+    """
+
+    @staticmethod
+    @contextmanager
+    def _patches(images_configured: bool = True):
+        """The three settings loaders, as one context manager.
+
+        A tuple of patches cannot be star-unpacked into a `with`, and every test
+        below needs the same three.
+        """
+        with (
+            patch("st_exporter.cli.load_settings", return_value="s"),
+            patch("st_exporter.cli.ExporterSettings", return_value="e"),
+            patch(
+                "st_exporter.cli.TradeRatedSettings",
+                return_value=MagicMock(
+                    configured=False,
+                    images_configured=images_configured,
+                    image_upload_token="tqm_image",
+                    image_base_url="https://truequote.example.com/api/outbox",
+                ),
+            ),
+        ):
+            yield
+
+    def test_feeds_images_runs_the_image_pass_and_no_export(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "images"])
+        image_summary = ImageUploadSummary(uploaded=7, pending=12, stopped="budget")
+        with (
+            self._patches(),
+            patch("st_exporter.cli.run_export") as mock_export,
+            patch("st_exporter.cli.run_images", return_value=image_summary) as mock_images,
+            patch("st_exporter.cli.TrueQuoteImageClient") as mock_client,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 0
+        # No export half at all: it writes no tab and no `_meta` row, which is
+        # what earns its job a concurrency lock of its own.
+        mock_export.assert_not_called()
+        mock_images.assert_called_once()
+        assert mock_images.call_args.kwargs["image_client"] is mock_client.return_value
+        out = capsys.readouterr().out
+        assert "images_uploaded=7" in out
+        # `pending` and `stopped` are what tell an operator a sweep is
+        # converging rather than failing.
+        assert "images_pending=12" in out
+        assert "images_stopped=budget" in out
+        # A refusal TrueQuote made this run, and one it made on an earlier run
+        # that this run therefore did not re-send. Both on the output line: a
+        # `rejected=1` nobody can see is the defect this pair closes.
+        assert "images_rejected=0" in out
+        assert "images_rejected_remembered=0" in out
+
+    def test_feeds_pricebook_no_longer_uploads_any_bytes(self, monkeypatch) -> None:
+        """THE BEHAVIOUR CHANGE, stated.
+
+        A connector that repins and leaves TRUEQUOTE_IMAGE_TOKEN on its
+        `pricebook-feed` job uploads nothing from there. That is deliberate and
+        it is the SAFE direction: what that job used to do on a large catalogue
+        was get killed mid-download every hour, delivering nothing anyway and
+        failing the pricebook export as well. Identifiers still reach the Sheet.
+        """
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "pricebook"])
+        with (
+            self._patches(),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            patch("st_exporter.cli.run_images") as mock_images,
+            patch("st_exporter.cli.TrueQuoteImageClient") as mock_client,
+            pytest.raises(SystemExit),
+        ):
+            main()
+
+        mock_images.assert_not_called()
+        mock_client.assert_not_called()
+
+    def test_holding_the_token_without_the_feed_is_loud(self, monkeypatch, caplog) -> None:
+        """...and it must not be SILENT, or a connector that repins without
+        adding the job simply stops delivering images on green runs — the exact
+        silent-stop shape the one-drain rule exists to prevent."""
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "pricebook"])
+        with (
+            self._patches(),
+            patch("st_exporter.cli.run_export", return_value=_summary()),
+            caplog.at_level(logging.WARNING),
+            pytest.raises(SystemExit),
+        ):
+            main()
+
+        assert "images-feed" in caplog.text
+        assert "TRUEQUOTE_IMAGE_TOKEN" in caplog.text
+
+    def test_no_token_means_a_quiet_no_op(self, monkeypatch, caplog) -> None:
+        """A contractor who never bought TrueQuote must not read a warning every
+        run. A missing token is the EXPECTED state, not an error."""
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "images"])
+        with (
+            self._patches(images_configured=False),
+            patch("st_exporter.cli.run_images") as mock_images,
+            caplog.at_level(logging.WARNING),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 0
+        mock_images.assert_not_called()
+        assert "TRUEQUOTE_IMAGE_TOKEN" not in caplog.text
+
+    def test_no_upload_images_still_switches_it_off(self, monkeypatch) -> None:
+        """The flag was kept rather than removed, so a caller already passing
+        `--no-upload-images` keeps working. It just points at `images` now."""
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "images", "--no-upload-images"])
+        with (
+            self._patches(),
+            patch("st_exporter.cli.run_images") as mock_images,
+            pytest.raises(SystemExit),
+        ):
+            main()
+
+        mock_images.assert_not_called()
+
+    def test_a_dry_run_uploads_nothing(self, monkeypatch) -> None:
+        monkeypatch.setattr("sys.argv", [_ARGV0, "--feeds", "images", "--dry-run"])
+        with (
+            self._patches(),
+            patch("st_exporter.cli.run_images") as mock_images,
+            pytest.raises(SystemExit),
+        ):
+            main()
+
+        mock_images.assert_not_called()
+
+
+class TestTheCapOnTheRunsOwnOutputLine:
+    """A connector runs a bounded proving pass by passing `image_max_assets`.
+    The run's output has to say what the cap was and whether it bit, or the
+    operator cannot tell a cap stop from a clock stop."""
+
+    def _line(self, images: ImageUploadSummary) -> str:
+        from st_exporter.cli import _image_fields
+
+        return _image_fields(images)
+
+    def test_a_capped_run_names_the_cap_and_the_hit(self) -> None:
+        from st_exporter.images.upload import ASSET_CAP_REACHED
+
+        line = self._line(
+            ImageUploadSummary(uploaded=500, fetched=500, max_assets=500, stopped=ASSET_CAP_REACHED)
+        )
+        assert "images_max_assets=500" in line
+        assert "images_cap_hit=true" in line
+        assert f"images_stopped={ASSET_CAP_REACHED}" in line
+
+    def test_an_uncapped_run_says_none_not_zero(self) -> None:
+        line = self._line(ImageUploadSummary(uploaded=3))
+        assert "images_max_assets=none" in line
+        assert "images_cap_hit=false" in line

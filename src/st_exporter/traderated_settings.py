@@ -11,8 +11,10 @@ outbox drain entirely, with a log line, when ``configured`` is ``False``.
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from st_exporter.url_validation import validate_outbox_url
 
 
 class TradeRatedSettings(BaseSettings):
@@ -43,6 +45,22 @@ class TradeRatedSettings(BaseSettings):
     truequote_image_token: str | None = Field(
         default=None, repr=False, validation_alias="TRUEQUOTE_IMAGE_TOKEN"
     )
+
+    # Both URL fields are checked the moment they are loaded, before anything
+    # can build a client on them — the Machine Token is a bearer credential, and
+    # `image_base_url` below hands whichever of these is set straight to
+    # `TrueQuoteImageClient`. Empty/unset stays valid: that is an unbought
+    # product, not a misconfigured one. The error is not a ValueError, so
+    # pydantic re-raises it unwrapped and the operator gets one clean sentence.
+    @field_validator("outbox_base_url")
+    @classmethod
+    def _check_outbox_base_url(cls, value: str | None) -> str | None:
+        return validate_outbox_url(value, "TRADERATED_OUTBOX_BASE_URL")
+
+    @field_validator("truequote_outbox_url")
+    @classmethod
+    def _check_truequote_outbox_url(cls, value: str | None) -> str | None:
+        return validate_outbox_url(value, "TRUEQUOTE_OUTBOX_URL")
 
     @property
     def image_base_url(self) -> str | None:

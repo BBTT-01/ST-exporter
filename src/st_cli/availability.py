@@ -32,13 +32,13 @@ def _build_busy_summary(
     appointments: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Cross-reference shifts and appointments to build per-tech availability."""
-    appts_by_tech: dict[int, list[dict]] = defaultdict(list)
+    appts_by_tech: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for appt in appointments:
         tech_id = appt.get("technicianId")
         if tech_id:
             appts_by_tech[tech_id].append(appt)
 
-    shifts_by_tech: dict[int, list[dict]] = defaultdict(list)
+    shifts_by_tech: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for shift in shifts:
         tech_id = shift.get("technicianId")
         if tech_id:

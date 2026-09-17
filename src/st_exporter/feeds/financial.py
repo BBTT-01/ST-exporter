@@ -59,11 +59,33 @@ JOBS_RESOURCE = "jobs"
 #: date it completed — the business dates Profit Wizard reports on, not
 #: ``createdOn`` (a back-dated invoice entered today is revenue for its invoice
 #: date) and not ``modifiedOn`` (a note edited today does not move a job's cost
-#: into this month). Profit Wizard uses ``invoicedOnOrAfter`` and filters jobs on
-#: ``completed_date``; the exact spellings are unverified against a real tenant —
-#: see KNOWN_UNVERIFIED.md.
+#: into this month). Profit Wizard uses ``invoicedOnOrAfter``; ``completedOnOrAfter``
+#: is now CONFIRMED against the published ``tenant-jpm-v2`` OpenAPI description of
+#: ``GET /tenant/{tenant}/jobs`` ("Return jobs that are completed after a certain
+#: date/time (in UTC)"). ``invoicedOnOrAfter`` is still inferred from Profit
+#: Wizard's own call — see KNOWN_UNVERIFIED.md and ``warn_if_older_than_window``.
 INVOICE_DATE_PARAM = "invoicedOnOrAfter"
 JOB_COMPLETED_PARAM = "completedOnOrAfter"
+
+#: ``jpm/v2/.../jobs`` validates ``sort`` against a closed list and REJECTS
+#: anything else. This feed used to send ``-completedOn``, which is not on that
+#: list, and a live tenant answered::
+#:
+#:     HTTP 400 {"errors":{"sort":["The value '-completedOn' is not valid for Sort."]}}
+#:
+#: — costing the whole ``payroll.timesheets`` tab on every run, because the job
+#: list is what drives the per-job timesheet calls.
+#:
+#: The endpoint's own description names the only accepted fields: *"Available
+#: fields are: Id, ModifiedOn, CreatedOn, Priority."* Completion date is not
+#: sortable, so the cap can only approximate "most recently completed" — ``-Id``
+#: is the best available proxy and the safest one: job ids increase with
+#: creation, a job inside a 90-day completion window was created close to when it
+#: completed, and unlike ``-ModifiedOn`` the ordering is STABLE across pages (a
+#: job edited mid-pagination cannot shift into a page already read, which would
+#: duplicate or skip its timesheets). Sorting must stay ON: without it the API
+#: answers ascending by id, so the cap would keep the OLDEST jobs in the window.
+JOB_SORT = "-Id"
 
 _PAGE_SIZE = 200
 
@@ -140,14 +162,18 @@ def fetch_completed_job_ids(
     window_days: int = FINANCIAL_WINDOW_DAYS,
     max_jobs: int = DEFAULT_MAX_TIMESHEET_JOBS,
 ) -> list[str]:
-    """Ids of jobs completed inside the window, newest-completing first, capped.
+    """Ids of jobs completed inside the window, newest job first, capped.
 
     Only the ids are kept: this list exists purely to drive the per-job timesheet
     calls, and the `jobs` tab is a different feed with a different window.
+
+    Ordered by ``JOB_SORT`` (``-Id``) and not by completion date: ServiceTitan
+    does not offer ``completedOn`` as a sort field and rejects the request
+    outright if you ask for it — see ``JOB_SORT``.
     """
     params = {
         JOB_COMPLETED_PARAM: _iso(window_start(today, window_days=window_days)),
-        "sort": "-completedOn",
+        "sort": JOB_SORT,
     }
     job_ids: list[str] = []
     seen: list[dict[str, Any]] = []
@@ -162,9 +188,11 @@ def fetch_completed_job_ids(
         if len(job_ids) >= max_jobs:
             logger.warning(
                 "financial: stopped listing completed jobs at the %d-job cap; "
-                "payroll.timesheets covers the most recently completed jobs only. "
+                "payroll.timesheets covers the newest jobs in the window only "
+                "(ordered by %s — ServiceTitan cannot sort jobs by completion date). "
                 "Raise EXPORTER_FINANCIAL_MAX_JOBS if this tenant needs more.",
                 max_jobs,
+                JOB_SORT,
             )
             break
     warn_if_older_than_window(
@@ -254,6 +282,7 @@ def fetch_job_costs(
     *,
     today: date,
     window_days: int = FINANCIAL_WINDOW_DAYS,
+    report_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Run the built-in Job Costing Summary report over the financial window.
 
@@ -261,7 +290,15 @@ def fetch_job_costs(
     partial or best-guess result, and never a result whose columns are not the
     ones ``financial.JOB_COST_COLUMNS`` names. See ``feeds/reporting.py``.
     """
-    ref = reporting.find_job_costing_summary(client)
+    # `JOB_COST_COLUMNS` is handed to the lookup as well as checked below. It is
+    # used there only to ELIMINATE candidates when one name matches more than one
+    # report — a report that does not declare these columns could not produce
+    # this tab anyway — never to prefer one viable report over another. See
+    # `reporting.capable_of`. `report_id`, when set, is a human's recorded choice
+    # and skips name resolution entirely; it does NOT skip the checks below.
+    ref = reporting.find_job_costing_summary(
+        client, required_columns=JOB_COST_COLUMNS, pinned_report_id=report_id or None
+    )
     # Replaying the report's metadata GET before POSTing its data is not
     # redundant: ServiceTitan answers the POST with
     # `Invalid report parameter: [From]` if the report was never described in
@@ -309,8 +346,9 @@ def warn_if_older_than_window(
 ) -> None:
     """Log loudly when a record predates the window we asked ServiceTitan for.
 
-    A tripwire for the one thing the server will not tell us. ``INVOICE_DATE_PARAM``
-    and ``JOB_COMPLETED_PARAM`` are unverified spellings (see KNOWN_UNVERIFIED.md),
+    A tripwire for the one thing the server will not tell us. ``JOB_COMPLETED_PARAM``
+    is now confirmed against the published ``tenant-jpm-v2`` description, but
+    ``INVOICE_DATE_PARAM`` is still an inferred spelling (see KNOWN_UNVERIFIED.md),
     and ServiceTitan **ignores query parameters it does not recognise** rather
     than rejecting them — so a misspelling does not fail, it quietly returns the
     tenant's entire history and the feed exports all of it as if that were the

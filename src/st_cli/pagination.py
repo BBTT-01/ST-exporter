@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterator
+from typing import Any, Iterator, cast
 
 from st_cli.client import ServiceTitanClient
 
@@ -20,7 +20,7 @@ def fetch_page(
     p = dict(params or {})
     p["page"] = page
     p["pageSize"] = page_size
-    return client.get(module, resource, params=p)
+    return cast(dict[str, Any], client.get(module, resource, params=p))
 
 
 def fetch_all(
@@ -61,7 +61,7 @@ def fetch_export_page(
         p["from"] = continue_from
     if include_recent_changes:
         p["includeRecentChanges"] = True
-    return client.get(module, f"export/{feed}", params=p)
+    return cast(dict[str, Any], client.get(module, f"export/{feed}", params=p))
 
 
 def fetch_export_all(

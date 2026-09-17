@@ -4,6 +4,657 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · `mypy src/` passes, and CI now runs it
+
+### Fixed: 91 strict-mode findings, none of them a behaviour change
+
+`pyproject.toml` has said `strict = true` since the start and nothing ran mypy in
+CI, so the count only ever grew: 41 tools in `mcp_server.py` were "untyped"
+because the `_handle_errors` decorator they all wear had no annotations (it now
+carries a `ParamSpec`, so each tool keeps its exact signature for FastMCP's
+schema introspection); 24 functions promised `dict[str, Any]` while returning the
+client's `Any` (now an explicit `cast` at each call site — the client keeps
+returning `Any`, because it hands back whatever JSON ServiceTitan sent and
+`feeds/reporting.py` checks the shape); 21 bare `dict` annotations are now
+`dict[str, Any]`; two stale `# type: ignore`s are gone; three functions gained
+annotations. No runtime path changed. `mypy src/` is a CI step from here on.
+
+## [Unreleased] · Profit Wizard hosted parity: callback flags, sold estimates
+
+### Added: 6 columns on `jobs`, 7 on `technicians`, and a new `sales.estimates` tab
+
+Closes the remaining gap between Profit Wizard's hosted (Export Store) path and
+its Direct ServiceTitan path: callback/recall detection, warranty jobs, booked
+job totals, technician phone/business-unit/home-location, and sold estimates
+were readable Direct but absent from every Sheet.
+
+* **`jobs`** gains `recall_for_id`, `warranty_id`, `no_charge`, `total`,
+  `business_unit_id`, `sold_by_id` — appended after the already-appended
+  `completed_on`/`total_revenue`, so `jobs.v2`'s
+  column list, grain and row key are untouched and the fixture regenerates with
+  the existing rows byte-identical plus the new trailing cells.
+* **`technicians`** gains `phone`, `business_unit_id`, `business_unit_name`,
+  `role_ids`, `home_address`, `home_latitude`, `home_longitude` — same rule,
+  `technicians.v1` unchanged. `business_unit_name` resolves against the SAME
+  `settings/business-units` reference table `jobs.business_unit` already joins,
+  so a business unit's name can never disagree between the two tabs.
+* **New tab `sales.estimates`**, one row per estimate ITEM (an estimate with no
+  items still writes one row with the `Item*` columns blank), fetched from the
+  Sales & Estimates API's `estimates` list and windowed like the rest of the
+  `financial` feed. It runs on the `financial` feed's six-hourly cadence and
+  behaves exactly like `reporting.jobCosts` for permissions — absent, not empty,
+  for a tenant that lacks the Estimates permission — but ships under its OWN
+  contract version, `sales.v1`, because it is a wholly new tab rather than an
+  appended column: adding a tab to an already-published version is refused by
+  `scripts/gen_contract_fixtures.py`.
+* Several of the new fields are unverified against a real tenant — see
+  `KNOWN_UNVERIFIED.md`, "Profit Wizard hosted-parity columns".
+  `jobs.recall_for_id` / `warranty_id` are the well-evidenced exception: Profit
+  Wizard's own Direct path already reads these exact JPM job fields in
+  production.
+* `sales.estimates.SoldById` accepts ServiceTitan's bare-integer `soldBy` (the
+  shape this repo's own `estimates-sell` docs use), not only a nested `{id}`.
+  `Total` falls back to `subtotal + tax` when the response carries no `total`,
+  and only when both parts are present — blank otherwise, never `0`.
+* **No contract bump on `jobs` or `technicians`.** `sales.estimates` is a brand
+  new tab under a brand new version, `sales.v1`; nothing published under
+  `jobs.v2`, `technicians.v1`, `pricebook.v1` or `financial.v1` changed shape.
+
+## [Unreleased] · CI lints all of src/ and tests/, not half of it
+
+### Fixed: `src/st_cli/` and most of `tests/` were never linted
+
+`ci.yml`'s lint step named `src/st_exporter tests/st_exporter` only. Everything
+else — the whole of `src/st_cli/`, and every test outside `tests/st_exporter/` —
+was checked by nothing. Two E501s duly merged into the release line in `aa0bfb3`
+with no check going red, and a third plus an N802 had been sitting in
+`tests/test_engine.py` unnoticed.
+
+The exporter imports `st_cli` on every request it makes; there is no reading of
+"shared code" under which that half deserves less scrutiny. The step is now
+`ruff check src/ tests/` and `ruff format --check src/ tests/`, and the four
+existing violations are fixed in the same commit so the widened scope lands
+green.
+
+## [Unreleased] · A long throttle no longer looks like a hang
+
+### Added: the run log says when it is waiting, on which page, and for how long
+
+Honouring ServiceTitan's stated `Retry-After` is what made `reporting.jobCosts`
+reachable — and it made a successful run look broken. Run 35159471697 on
+`BBTT-01/tr-doorservpro` wrote `reporting.jobCosts=1563` and ran from **22:51:34
+to 22:58:44**: seven minutes during which the log emitted **nothing at all**. A
+throttle and a hung job are the same thing to whoever is watching the Actions log,
+and only one of them is worth cancelling.
+
+Three lines, no behaviour change:
+
+- **Each report page, before it is fetched** — report name, page number, rows
+  accumulated so far — and again after it lands with the rows that page added and
+  whether another page follows (which will be throttled by this one, since
+  reporting counts each page as another run of the report).
+- **Each rate-limit wait inside a report pull** — how long, which page, and how
+  much of the 420s `_MAX_RATE_LIMIT_SECONDS_PER_REPORT` budget is now spent. It is
+  emitted from the observer the pull already borrows from the client, so the chain
+  to a caller that holds a real shared governor (the image pass) is untouched.
+- **Each rate-limit sleep in `st_cli.client`**, which covers every feed rather
+  than just reporting. Only waits of 5s or more say anything: the blind 1s/2s/4s
+  curve is the ordinary noise of a busy endpoint and the image pass alone would
+  earn hundreds of those. The line names the ServiceTitan resource and never the
+  request's current url, which on an image fetch has been rebound to a presigned
+  blob address whose query string is a credential.
+
+`st_cli` had no logger before this. `configure_logging` now gives `st_cli` the
+same level and handler it gives `st_exporter`, so an exporter run shows these
+lines; a bare `st` CLI invocation configures no logging and is unchanged.
+
+### Changed: the reusable export workflow caches its dependency install
+
+`pip install -e .` costs ~15s of resolving and downloading on a cold runner, and
+`export.yml` is not run once — every connector repo calls it on a five-minute
+schedule, several jobs per cycle. `actions/setup-python` now caches pip's
+download directory, keyed on this repo's own `pyproject.toml` (the self-checkout
+puts it on disk before the cache step reads it, so it is the exporter's file and
+not the caller's).
+
+It caches downloads, not an environment: the install still runs and still
+resolves, so which code a job runs does not move, and a cold or corrupt cache
+costs the 15 seconds back rather than failing. `cache-dependency-path` is written
+out rather than defaulted because setup-python's default hashes
+`requirements.txt`, which this repo does not have, and a path that matches
+nothing FAILS the job — on every connector at once. A test pins that the path
+names a file this repo really ships.
+
+## [Unreleased] · The pricebook tabs carry the whole payload
+
+### Added: every scalar ServiceTitan returns on the pricebook item and category tabs
+
+`pricebook.v1` emitted twelve hand-picked columns. `cost` and `hours` were sitting
+in the same JSON response, unpicked, and Profit Wizard imported **35,138 items for
+the pilot tenant that it could not price a single one of**. The same shape had
+already cost three other round trips through an exporter change, a re-run and a
+redeploy.
+
+So the judgement about which fields matter moves to the consumer, where it is
+cheap to change. The three item tabs go from 12 columns to **42**; the category tab
+from 4 to **13**.
+
+`cost` and `hours` are the two that prompted this and the two to check first:
+
+| Column | Source | Present on |
+|---|---|---|
+| `cost` | `item.cost` | `equipment`, `materials` — **not `services`** |
+| `hours` | `item.hours` | all three |
+
+`Pricebook.V2.ServiceResponse` has no cost field of any spelling, so
+`pricebook.services.cost` is blank on every row of every tenant by construction.
+
+Also added to the item tabs: `member_price`, `add_on_price`, `add_on_member_price`,
+`taxable`, `is_labor`, `is_inventory`, `deduct_as_job_cost`, `pays_commission`,
+`commission_bonus`, `unit_of_measure`, `cross_sale_group`, `account`,
+`cost_of_sale_account`, `asset_account`, the three warranty pairs
+(`warranty_*`, `manufacturer_warranty_*`, `service_provider_warranty_*`),
+`primary_vendor_id` / `_name` / `_part` / `_cost`, `other_vendor_ids` /
+`other_vendor_names`, `source`, `external_id`. And to the category tab:
+`description`, `image`, `position`, `category_type`, `business_unit_ids`,
+`sku_image_refs`, `sku_video_refs`, `source`, `external_id`.
+
+Every name is taken from the published Pricebook v2 OpenAPI document, not guessed.
+Every value follows the tabs' existing cell rules: null or absent is a **blank
+cell**, a real `0` is `"0"`, booleans are lowercase, every cell is text.
+
+Flattening follows conventions these tabs already used — nested objects become
+prefixed per-scalar columns, lists of objects become index-aligned CSV pairs like
+`category_ids` / `category_names`, lists of scalars become one comma-separated cell
+like `image_refs`. No cell is ever a JSON blob; a test asserts it.
+
+**Deliberately not exported**, because a cell that cannot carry the fact honestly
+is worse than no column: `externalData` (an arbitrary key/value bag any other
+integration can write to — the one field here that could plausibly hold a token),
+`serviceMaterials` / `serviceEquipment` / `equipmentMaterials` / `recommendations` /
+`upgrades` (bills of materials and cross-sell links: `{skuId, quantity}` per entry,
+where a CSV of ids would look like a usable BOM with every quantity silently
+dropped — that needs its own tab at its own grain), and `subcategories` (a
+recursive tree `parent_id` already carries, one row at a time).
+
+**One column set across three tabs.** The item header is the UNION of the three
+resources' fields, so one parser still reads all three and a column a resource does
+not have is blank on every one of its rows. `blank_columns.ALL_BLANK_OK` now
+distinguishes *structurally absent* (certain, from the spec) from *optional
+upstream* (a guess about contractor behaviour); no money or hours column is
+exempted on any tab that has the field, so a wrong spelling still trips the
+whole-column-blank detector.
+
+**Size.** Google Sheets caps a spreadsheet at 10,000,000 cells across all tabs. At
+42 columns the pilot tenant's 35,138 items come to ~1.48M cells, up from ~0.42M —
+about 15% of the cap, with headroom for roughly 238,000 item rows before the
+pricebook tabs alone would reach it. Noted in `KNOWN_UNVERIFIED.md`; a six-figure
+catalogue is now worth measuring rather than assuming.
+
+### Changed: `pricebook.v1` → `pricebook.v2` (append-only, but a bump)
+
+Every original column keeps its name, its meaning and its position; the tabs, the
+grain and the row key are untouched. By the contract's own rules an appended column
+is additive and does not force a bump.
+
+It is a bump anyway, because a released fixture's bytes may never change and
+appending a column changes every row of every `pricebook.v1` fixture.
+`--republish pricebook.v1` is refused structurally the moment `columns` moves, and
+relaxing that refusal would open exactly the hole the published register closes.
+So `pricebook.v1` stays frozen on disk for consumers still pinned to it, and
+`pricebook.v2` gets its own fixture directory.
+
+**TrueQuote, TradeRated and Profit Wizard must each widen their supported
+`pricebook` range to include `pricebook.v2`.** Until they do, their contract check
+refuses the four tabs — loudly, which is the intended order of events, not a
+regression. A reader that keeps `pricebook.v1` in its range and looks columns up by
+name is otherwise unaffected: nothing it reads moved.
+## [Unreleased] · A `0` in `total_revenue` meant "free work", and it shipped
+
+### Fixed: a resolved `0` is now ABSENT, not a zero-dollar job
+
+`jobs.total_revenue` landed reading `job.total` / `job.invoiceTotal` through
+`_first_present`, which treats `0` as a value. The commit called the divergence
+from Profit Wizard's `||` deliberate, on this contract's "blank is not zero"
+rule. The live tenant disproved it. Measured across 1256 rows of
+`tr-doorservpro`'s jobs tab: **no row was blank**, 45% of distinct jobs read
+exactly `0`, and **41% of COMPLETED jobs reported `$0`**.
+
+ServiceTitan does not send null here — it sends `0` for "no revenue recorded" —
+so reading it literally labelled four completed jobs in ten as free work. Profit
+Wizard's `(job.total || job.invoiceTotal)` makes the opposite choice, and `||`
+rather than `??` is the point: a `0` falls through and the field is omitted when
+nothing remains, which is why the direct baseline carries NULLs where hosted was
+writing zeros. The two paths disagreed on ~400 jobs and hosted held the harmful
+answer.
+
+The asymmetry is what settles it. A blank makes Profit Wizard REFUSE to compute a
+margin; a `0` makes it compute one against zero revenue, i.e. **-100%** — a
+confident wrong number on a customer's screen rather than a gap. And
+`blank_columns` cannot catch it: it fires only on a column empty on EVERY row, so
+an all-zero column sails past the one tripwire built for this class of bug.
+
+`_money_or_absent` is deliberately narrow and must stay so. A `0` cost and a `0`
+price elsewhere in this export are real facts; "blank is not zero" still holds
+everywhere it has not been overridden with live evidence.
+
+Accepted cost, stated rather than hidden: a genuine zero-dollar job (a warranty
+callback, a goodwill visit) is now indistinguishable from one with nothing
+recorded. This field cannot tell them apart in the first place, the direct path
+already makes that trade, and "I cannot tell you" beats "they worked for free".
+
+## [Unreleased] · Wait as long as ServiceTitan asks
+
+### Fixed: a 429 that says "try again in 50 seconds" was retried after 7
+
+`reporting.jobCosts` could never have been written on a tenant whose Job Costing
+Summary report is long enough to paginate — not on a manual dispatch, not on the
+six-hourly schedule. Reporting allows roughly one run of the same report per
+minute per tenant, and **each PAGE counts as another run**, so page 2 is always
+throttled by page 1:
+
+> `HTTP 429 {"status":429,"title":"Rate limit is exceeded. Try again in 50
+> seconds."}` — page 2, 11 seconds into the report
+
+The client's 429 backoff is `1s + 2s + 4s`: **seven seconds of total patience**
+against a fifty-second ask. It failed identically on both runs of
+35157864073 / 35158215902 (`BBTT-01/tr-doorservpro`), and would have failed the
+same way for ever. The report was resolved correctly by then — the duplicate-name
+work picked report 21639096 — so this was the last thing standing between the
+tenant and a populated cost tab.
+
+The server states the wait; the client now believes it. `retry_after_seconds`
+reads the RFC 7231 `Retry-After` header (seconds **or** HTTP-date) and falls back
+to ServiceTitan's problem BODY, which is where this API actually puts the number
+and is why reading the header alone would have fixed nothing. With no stated wait
+the old exponential curve is unchanged, so no other endpoint's behaviour moves.
+
+Two ceilings, because "wait as long as you are told" is how a run gets SIGKILLed
+by the runner with nothing written:
+
+- `_MAX_RATE_LIMIT_WAIT` (90s) — the longest ONE request will park. A longer ask
+  is refused as a rate-limit failure rather than slept through.
+- `_MAX_RATE_LIMIT_SECONDS_PER_REPORT` (420s) — the total one report pull may
+  spend throttled, summed across its pages, measured through the governor hook
+  the client already calls. Past it the tab is skipped the way every other
+  reporting failure is skipped: loudly, per-tab, non-fatally, with the other
+  three financial tabs already written. The hook is borrowed and restored, so a
+  caller that holds a real shared governor (the image pass) keeps it.
+
+## [Unreleased] · The job-cost report refusal says which marker skipped a report
+
+### Changed: a name-matching report skipped as CUSTOM now names its evidence
+
+`reporting.jobCosts` is still absent on `tr-doorservpro`. The name half of that
+was diagnosed and fixed in 0.2.14 (the tenant carries "Job Costing Summary
+Report", not "Job Costing Summary") — but **no financial run has executed since**:
+the last one was 18:50 UTC at exporter 0.2.13 and the fix landed at 18:59 in
+0.2.14. The connector is pinned at `exporter-v0.2.19`, so the fix is deployed and
+untried. The census that diagnosed it listed that name **twice**, which under
+0.2.14+ resolves three ways: built-in + custom selects the built-in; two built-ins
+refuse as ambiguous; two customs take the custom path.
+
+Two of those three end in a refusal, and one was the least actionable message in
+the module: "the only report(s) named X are custom reports". The fields that
+judgement rests on (`isCustom`, `reportType`, ...) are guesses at a spelling never
+seen on a real tenant. The asymmetry that makes guessing safe — false positive
+costs a loud refusal, false negative costs silently wrong money — only holds while
+the loud half is actionable, and that message was not: it points the contractor at
+a report they can already see.
+
+The refusal now quotes each skipped report by category id, report id, name and
+**the marker it was judged on**, and says plainly that the spellings are
+unconfirmed, so a false positive reads as one rather than as a missing report.
+Selection is untouched: `custom_marker` is the same rule `_looks_custom` was, and
+`_looks_custom` is now a wrapper on it.
+
+## [Unreleased] · Billed revenue on the `jobs` tab
+
+### Added: `jobs.total_revenue`, appended (NOT a contract bump)
+
+`total_revenue` is 0 on all 1701 hosted jobs while the direct baseline carries it
+on 446, so every margin and profitability surface in Profit Wizard is empty. PW
+refuses to compute a margin from half an input rather than show a wrong one, so
+the product is hollow rather than wrong — but hollow is most of what a product
+called Profit Wizard is for.
+
+Read from the job's `total`, falling back to `invoiceTotal` — **the direct path's
+own expression**, `(job.total || job.invoiceTotal)`
+(`profitwizard/lib/crm/servicetitan.ts:856`), which is the only code in PW that
+writes the column. Using the same source in the same order is what makes hosted
+numbers comparable to the baseline the QA sweep measures against; a different
+source would produce a different figure for the same job.
+
+One deliberate difference: PW's `||` lets a genuine `0` total fall through to
+`invoiceTotal`. This treats `0` as a value, because a zero-dollar job is a real
+fact and this contract is explicit that blank is not zero.
+
+Appended last; the feed stays at `jobs.v2` for the same reason `completed_on` did.
+
+**A Profit Wizard-side gap found while sourcing this, which this column does not
+fix.** The hosted sync never writes `total_revenue` from any source.
+`aggregateInvoiceLines` (`lib/hosted/sync.ts:173`) already parses `ItemTotal`
+off the exported `accounting.invoices` tab — 2817 rows live — but uses it only to
+detect negative price-modifier lines for `discount_total`, accumulates only
+`itemTotalCost` into material/equipment, and returns no revenue field. So the
+premise that there is "no revenue feed anywhere in the export" was not right:
+billed revenue has been in the Sheet all along and is being discarded on read.
+`KNOWN_UNVERIFIED.md` records it as the fallback source if `total`/`invoiceTotal`
+turn out to be absent on the export change-feed.
+
+## [Unreleased] · Two reports, one name: the job-cost tab can be unblocked
+
+### Fixed: `reporting.jobCosts` on a tenant with duplicate report names
+
+Run 35155266960 on `BBTT-01/tr-doorservpro` finally answered why this tab has
+never been written, and it was none of the assumed causes. The Reporting
+permission is fine and always was. The report NAME was wrong and was fixed in
+0.2.14 — confirmed working today. The `require_columns` guard everyone assumed
+was firing **has never run**. The actual cause:
+
+> `2 distinct reports are named 'Job Costing Summary Report' (category
+> operations/report 21131704, category operations/report 21639096). Refusing to
+> choose between them.`
+
+Both are in `operations`, neither carries a custom marker, and the exporter
+refuses to guess. That refusal is correct and is unchanged. What is added is two
+ways past it that are not guesses:
+
+- **Elimination by declared columns.** When one name matches several reports,
+  any candidate that does not declare `JOB_COST_COLUMNS` is dropped — it could
+  not have produced the tab in any case, since `require_columns` would refuse it
+  moments later. If exactly one survives, it is selected. This is elimination,
+  not scoring: it removes non-viable candidates, it never prefers one viable
+  candidate over another, and **two copies of one report both survive and still
+  refuse**.
+- **`EXPORTER_JOB_COST_REPORT_ID`**, a new workflow input and env setting. A
+  human's recorded decision about which report carries the money. Honoured
+  whatever the report is called and whether or not it looks custom — the guard
+  exists to stop the CODE choosing, not to overrule the operator — but it does
+  not skip the column checks, so a mistyped or stale id fails loudly rather than
+  writing an empty tab. An id the tenant does not have is its own refusal and
+  never falls back to name resolution, which could re-select the very report the
+  pin was added to avoid.
+
+Explicitly **not** added: any tie-break heuristic. Preferring the lower id, the
+higher id, or the better column score always returns a winner, and a wrong winner
+means a contractor's own report silently supplying their cost numbers — the same
+reasoning that rejects Profit Wizard's column-scoring fallback.
+
+Unset, everything behaves exactly as before.
+
+**This does not by itself unblock `tr-doorservpro`.** If both of its reports
+declare the frozen column set — likely, if one is a copy — somebody still has to
+say which is genuine, either by deleting/renaming the duplicate in ServiceTitan
+or by setting the pin.
+
+
+## [Unreleased] · A real completion timestamp on the `jobs` tab
+
+### Added: `jobs.completed_on`, appended (NOT a contract bump)
+
+The `jobs` tab carried no completion timestamp at all, so Profit Wizard's
+`jobs.completed_date` was null on **all 864** jobs whose `jobStatus` is completed
+on the `tr-doorservpro` tenant. Everything that filters on that column therefore
+read a working contractor as having done nothing: the technicians roster showed
+named technicians a fabricated **0% close rate** and **$0** (close rate is
+completed/total, counted off `completed_date`), and the Safety System reported
+"no completed jobs in the last 90 days" while 864 sat inside the window.
+
+`completed_on` is read from the job's own `completedOn` (falling back to
+`completedOnUtc`). It is **not** synthesised from `appointment_end`: a consumer
+can already make that fallback itself, and once a guess is written into the
+column no consumer can tell it from a fact. An appointment that ended is not a
+job that completed. Blank keeps meaning "not completed".
+
+The column is **appended last and the `jobs` feed stays at `jobs.v2`** — additive
+per `docs/export-contract.md`, so no consumer has to widen anything or deploy in
+any particular order, and nothing goes dark in the meantime. Profit Wizard picks
+the column up whenever it is ready to read it.
+
+Whether `completedOn` is the right spelling on the EXPORT change-feed (as opposed
+to the list endpoint, where it is evidenced) is not yet confirmed against a live
+response — see `KNOWN_UNVERIFIED.md`. If it is wrong the next run says so by
+itself: `completed_on` is not exempted in `blank_columns`, so a whole-column
+blank raises a `BLANK COLUMN` warning and an Actions annotation.
+
+### Changed: the fixture generator now recognises an APPENDED column
+
+`docs/export-contract.md` has always said appending a column is additive and must
+not bump the contract version. `scripts/gen_contract_fixtures.py` did not agree:
+it refused every byte change to a released fixture alike, so the only route it
+offered was the bump the rule forbids — and that bump is not a harmless
+over-signal, because a consumer pinned to the old version must answer
+`unsupported_contract` and **stop parsing the tab entirely** until it widens and
+deploys. Appending `completed_on` was the first time the two rules met.
+
+A pure append is now accepted, and `contracts.appended_columns` /
+`contracts.additive_refusals` are the single definition of "pure" that both the
+generator and the test suite ask. The released fixture is **left exactly as
+published** — bytes, `published.json` sha and `manifest.json` row_count all
+unmoved — so `check_register_append_only.py` is untouched and a consumer pinned
+to that version keeps testing against the file it was released with. The
+generator prints an `APPENDED COLUMN(S)` notice and writes nothing.
+
+The acknowledged cost: an appended column has **no committed fixture** until the
+next version bump. Needing fixture coverage for a new column is now the stated
+reason to bump.
+
+Everything else is refused exactly as before, each pinned by a new test: a
+rename, a removal, a **re-order** (the check is positional, not set-based, so
+`(a, b, c) -> (b, a, c, d)` is not an append), a changed cell in a released
+column **including one riding along beside a legitimate append**, a changed row
+count, and — the hole found and closed while building this — an append judged
+against a released file whose sha no longer matches the register, which would
+otherwise have laundered a tampered register into "additive, nothing to see
+here". `--republish` now compares and writes at the released width for the same
+reason, so an append can neither break the typo-fix hatch nor ride in on one.
+
+## [Unreleased] · Conditional image fetches, and a per-run asset cap
+
+
+## [Unreleased] · A one-off image backfill that finishes
+
+### Fixed: the same picture was downloaded once per ITEM that used it
+
+`upload_pricebook_images` iterated per item-asset, and the download is keyed by
+URL. Run 35145303072 on `BBTT-01/tr-doorservpro` reported `fetched=5 uploaded=5`
+— and items 2141068, 2141069, 2141070, 2141071 and 2141078 all named ONE asset
+GUID. It fetched the same photograph five times.
+
+The two halves are keyed differently and are now treated so: each distinct
+`source_url` is fetched **once per run** and hashed once, and the bytes are
+fanned out to every item that references it. The upload stays per item, because
+TrueQuote's route takes one `external_item_id` per POST, hardcodes `is_primary`
+and has no batch endpoint.
+
+Ledger semantics are unchanged in shape. `asset_ref` is still
+`{external_item_id}:{identity}` and `idempotency_key` still hashes the item, the
+identity, the url and the payload — both per ITEM — so five items sharing one
+picture still hold five rows, five keys and five `seen_keys` entries. That is
+what keeps `ImageLedger.keep` honest: a member whose key never reached
+`seen_keys` because somebody else made its download would be pruned out and
+re-uploaded for ever.
+
+A shared image is fetched **conditionally only when every member agrees** on the
+stored validators. One member with none — because it has never been delivered —
+means an unconditional GET, since a 304 carries no bytes and would starve it.
+
+`fetched` now counts DOWNLOADS rather than item-assets, and so does
+`image_max_assets`. The cap bounds the expensive half: run 35145303072's cap of
+5 bought one picture; the same cap now buys five different ones.
+
+### Added: bounded concurrency, and a REAL rate limiter behind it
+
+The pass is ~100% network wait, so it now runs on a bounded pool
+(`EXPORTER_IMAGE_CONCURRENCY` / `image_concurrency`, default 8, max 32). A
+payload exists only inside a running task, so the worst-case resident set is
+`concurrency x 8 MiB`; the dispatcher is held behind a semaphore so submitted
+work cannot run away from completed work.
+
+**The deadline, the cap and the least-recently-verified order are still decided
+by one thread, in one loop, before a group is handed to a worker.** That is what
+makes a bounded run deterministic when downloads finish out of order: which
+assets it reaches is fixed by dispatch order, not by which response came back
+first. A dispatcher stop ("start nothing more") is deliberately distinct from a
+worker abort ("the receiver is refusing work") — a cap of 2 that paid for 2
+downloads delivers 2.
+
+There was no rate limiter in this codebase. What existed — and still exists,
+unchanged — is a per-request retry backoff in `st_cli/client.py`. That is not a
+governor: under concurrency N workers back off on their own clocks, wake
+together and hit the endpoint again as a wave. `images/pacing.py` adds a shared
+token bucket per service (`EXPORTER_IMAGE_REQUESTS_PER_SECOND`, default 6/s;
+TrueQuote's side clamped to their documented 5,000/10min = 8.33/s), and the
+reactive backoff now **cooperates** with it: a 429 anywhere penalises the shared
+limiter, so every worker is held back rather than only the one that earned it.
+`TokenManager` is now thread-safe, so eight workers meeting one expired token
+issue one refresh rather than eight.
+
+### Added: mid-pass ledger flushes, so a killed process resumes within a minute
+
+The ledger is a Google Sheet tab and `flush` rewrites the whole grid, so it can
+never be written per asset. It is now written on a timer (60s) from the
+dispatcher thread while it holds the pass's lock, so every flush is a consistent
+snapshot. A killed process loses at most a minute of delivered-upload knowledge
+— bytes re-sent, never correctness — instead of the entire run.
+
+### Added: progress, uploaded item ids, and the SIZE of what we upload
+
+A multi-hour run prints a progress line every 30s (processed / total / uploaded
+/ fetched / rate / ETA). A run with a cap set — a proving run, whose whole
+purpose is "go and look at these" — now names every SUCCESS with its item id and
+byte size, where it previously named only failures.
+
+The summary reports `bytes[min/median/max/total]` over everything uploaded, plus
+`item_assets`, `distinct_assets` and `dedupe=Nx`. Nobody has ever measured a
+real pricebook asset from a live tenant; `MIN_PLAUSIBLE_IMAGE_BYTES`'s "real
+assets run 2-4 KiB" is an assumption written alongside the floor, not a
+measurement. These numbers settle it on the next run.
+
+### Known, unfixed: the 1 KiB floor cannot catch a blank placeholder
+
+Measured 2026-09-16 against ServiceTitan's web-app image proxy: a missing asset
+requested with `?size=1200&default=Default%2F1.png` answers **200 image/webp,
+2,798 bytes**, and the bytes are a completely blank white 1200x1200 image. It
+clears the 1 KiB floor, and the placeholder's size scales with `size=`, so no
+fixed byte threshold can work.
+
+`assets.image_dimensions` now reads width and height from the file header
+(PNG/JPEG/WebP, no decode, no dependency) and the pass reports compressed BYTES
+PER PIXEL. The measured blank is 0.0019/px; a photograph is one to two orders of
+magnitude denser. Uploads below `BLANK_DENSITY_BYTES_PER_PIXEL` are counted as
+`images_suspected_blank` and **still uploaded**: no real asset has been measured,
+so there is no evidence from which to set a rejection threshold, and a rule
+guessed today could silently drop real images. The count is how that evidence
+gets collected. Note the scope: we call the AUTHENTICATED
+`pricebook/v2/tenant/{id}/images` endpoint and never that proxy, and we send no
+`default=`, so it is NOT known that this body ever reaches us.
+
+## [Previously unreleased] · Conditional image fetches, and a per-run asset cap
+
+### Changed: the weekly full re-download of every image is now a conditional request
+
+The image pass skips the download of any asset whose ITEM has a `modifiedOn` no
+later than the moment the ledger last confirmed it. That timestamp is a proxy:
+`modifiedOn` is on the item, not on the image, and **no live tenant has ever
+been used to confirm that replacing an image moves it** (`KNOWN_UNVERIFIED.md`).
+The insurance against that was `REVERIFY_AFTER_DAYS = 7` — a full re-download of
+every asset every week, for ever, ~7,191 of them on one tenant.
+
+The interval is unchanged; its **price** is not. A successful download now
+stores the server's `ETag` / `Last-Modified` in `_image_ledger`, and the weekly
+re-verification quotes them back as `If-None-Match` / `If-Modified-Since`. A
+**304** is a verification that moved no bytes and sent no upload.
+
+The decision order, cheapest first:
+
+1. `modifiedOn` unchanged since the last verification — skip, **no request**.
+2. Otherwise a conditional GET. **304** → verified, no bytes, no upload.
+   **200** → new bytes, exactly as before.
+
+**Nothing assumes ServiceTitan honours any of this.** A response with no
+validator to store means the next check is a plain GET and a full download —
+today's behaviour, unchanged — and a validator the server ignores comes back as
+a 200, also unchanged. What the pass insists on is MEASURING which is happening:
+`images_not_modified=`, `images_conditional_sent=`, `images_no_validator=` and
+`images_signed_urls=` on the run's summary line, plus one `image conditional
+requests: … -- <verdict>` log line per run that says in English whether 304s are
+being returned, whether any validator is offered at all, and whether the asset
+urls look signed (which would make the whole mechanism unusable and is not
+fixable from this side). Read that line after the first live run.
+
+`_image_ledger` gains two trailing columns, `etag` and `last_modified`. A
+pre-upgrade four-column ledger loads unchanged — rows are padded, not rejected,
+because discarding them would re-upload a whole catalogue on the upgrade run.
+
+### Added: `EXPORTER_IMAGE_MAX_ASSETS` — a per-run cap on assets fetched
+
+A second stopping condition beside the time budget, and a separate one: the
+deadline bounds the CLOCK, this bounds the WORK. **The default is 0, meaning no
+cap** — a number would silently truncate a large catalogue for ever on any
+caller that never chose one, and a tenant permanently missing its last N images
+looks exactly like a clean run. Exposed as the reusable workflow's
+`image_max_assets` input.
+
+Free `modifiedOn` skips do not count against it: the cap bounds fetches, so a
+converged catalogue still sweeps end to end. Hitting it is announced as
+`images_stopped=per-run asset cap reached`, deliberately distinguishable from
+`images_stopped=time budget for the image pass spent` — the two ask for
+different dials. Both flush the ledger, both veto the prune, and both compose
+with least-recently-verified-first ordering, so successive capped runs sweep
+disjoint slices and the union converges.
+
+## [Unreleased] · The image upload is its own feed and its own job
+
+### Fixed: the pricebook image pass could never finish, and failed the pricebook feed while it tried
+
+Run `35130164187` on `BBTT-01/tr-doorservpro`, 2026-09-16: the image pass was
+SIGKILLed at **10m35s** (`Terminate orphan process ... (st-export)`) with **0 of
+~7,191 images uploaded**. GitHub reports a timed-out job as "cancelled", which
+reads like a competing run; `concurrency.cancel-in-progress` is `false`, so it
+was the timeout. `.github/workflows/export.yml` hardcoded `timeout-minutes: 10`.
+
+**It could not converge on its own.** `_upload_one` checked `ledger.has(key)`
+only AFTER downloading the bytes, because `idempotency_key(asset, payload)`
+hashes the payload. So every re-run re-downloaded the whole catalogue to
+rediscover what it had already sent, was killed in the same place, and — because
+a killed process flushes no ledger — forgot even that. Meanwhile the pass lived
+inside the `pricebook` feed's invocation, so its death reddened the hourly
+pricebook export too.
+
+Four changes, and it needs all four:
+
+* **`images` is a feed of its own** (`--feeds images`, `run_images`), with its
+  own caller job, its own cadence and its own concurrency lock. It writes no
+  export tab and no `_meta` row — verified by test, because that is the reusable
+  workflow's stated condition for leaving the shared export lock.
+* **It re-lists the pricebook from ServiceTitan** rather than reading the
+  exported tabs back. Reading them back is not possible against the frozen
+  `pricebook.v1` contract: `image_refs` carries the asset's id when there is one
+  and only otherwise its url, and the url is what gets downloaded. The
+  duplicated listing is ~36 requests against a pass that may download thousands
+  of images.
+* **`job_timeout_minutes`** (default 10, so every existing caller and every
+  other feed is untouched) drives `timeout-minutes` and is handed to the
+  exporter as `EXPORTER_JOB_TIMEOUT_MINUTES`. The pass stops two minutes short
+  of it and flushes its ledger, instead of being killed with nothing written.
+* **The pass resumes.** It works least-recently-verified first, so each run
+  starts on the images the last one did not reach; and it skips the DOWNLOAD
+  entirely for an asset whose item ServiceTitan has not modified since the
+  ledger confirmed it, so a converged catalogue costs no bytes at all.
+
+`_image_ledger`'s fourth column is renamed `uploaded_at` -> `verified_at` in
+place: same position, same data, an existing ledger loads unchanged. The summary
+line gains `images_pending=` (the number that falls to 0 as a sweep converges)
+and `images_revalidated=`.
+
+**`--upload-images` is kept, not removed** — a caller passing
+`--no-upload-images` keeps working — but it now applies to `--feeds images`
+rather than `--feeds pricebook`. A connector that repins without adding the
+`images-feed` job uploads no bytes from its pricebook job and says so at
+WARNING; image identifiers still reach the Sheet either way.
+
 ## [Unreleased] · Customer phone and email were never exported
 
 ### Fixed: `customer_phone` / `customer_email` blank on every row ever exported

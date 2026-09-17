@@ -94,6 +94,7 @@ TAB_FIRST_CALL = {
     "payroll.timesheets": f"payroll/v2/tenant/{TENANT_ID}/jobs/7/timesheets",
     "settings.businessUnits": f"settings/v2/tenant/{TENANT_ID}/business-units",
     "reporting.jobCosts": f"reporting/v2/tenant/{TENANT_ID}/report-categories",
+    "sales.estimates": f"sales/v2/tenant/{TENANT_ID}/estimates",
 }
 
 #: Which feed has to be selected for a tab to be attempted at all.
@@ -624,6 +625,7 @@ class TestTheTwoTenantsThisBroke:
             "accounting.invoices",
             "payroll.timesheets",
             "settings.businessUnits",
+            "sales.estimates",
         }
         assert set(summary.scope_not_granted) == {"reporting.jobCosts"}
         assert not summary.scope_revoked and not summary.financial_failures

@@ -7,9 +7,9 @@ Run via:  st-mcp          (stdio transport, for Claude Code / Claude Desktop)
 from __future__ import annotations
 
 import functools
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, ParamSpec, TypeVar, cast
 
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
@@ -85,7 +85,7 @@ mcp = FastMCP(
 
 def _get_client(ctx: Context) -> ServiceTitanClient:
     """Retrieve the ServiceTitanClient from lifespan context."""
-    return ctx.lifespan_context["client"]
+    return cast(ServiceTitanClient, ctx.lifespan_context["client"])
 
 
 def _paginate(
@@ -129,11 +129,20 @@ def _paginate(
     }
 
 
-def _handle_errors(fn):
-    """Decorator that maps STCLIError subtypes to ToolError."""
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _handle_errors(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Decorator that maps STCLIError subtypes to ToolError.
+
+    Typed with a ParamSpec so the tool it wraps keeps its exact signature — FastMCP
+    introspects that signature for the tool's input schema, and mypy needs it to
+    see the tool as typed at all.
+    """
 
     @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
         try:
             return fn(*args, **kwargs)
         except NotFoundError as exc:
@@ -185,21 +194,23 @@ def st_crm_customers_list(
 @_handle_errors
 def st_crm_customers_get(ctx: Context, customer_id: int) -> dict[str, Any]:
     """Get a single customer by ID."""
-    return _get_client(ctx).get("crm", f"customers/{customer_id}")
+    return cast(dict[str, Any], _get_client(ctx).get("crm", f"customers/{customer_id}"))
 
 
 @mcp.tool(tags={"crm", "write"})
 @_handle_errors
 def st_crm_customers_create(ctx: Context, data: dict[str, Any]) -> dict[str, Any]:
     """Create a new customer. `data` must include at least {\"name\": \"...\"}."""
-    return _get_client(ctx).post("crm", "customers", json_body=data)
+    return cast(dict[str, Any], _get_client(ctx).post("crm", "customers", json_body=data))
 
 
 @mcp.tool(tags={"crm", "write"})
 @_handle_errors
 def st_crm_customers_update(ctx: Context, customer_id: int, data: dict[str, Any]) -> dict[str, Any]:
     """Update an existing customer. `data` contains fields to change."""
-    return _get_client(ctx).patch("crm", f"customers/{customer_id}", json_body=data)
+    return cast(
+        dict[str, Any], _get_client(ctx).patch("crm", f"customers/{customer_id}", json_body=data)
+    )
 
 
 @mcp.tool(tags={"crm", "read"})
@@ -218,7 +229,7 @@ def st_crm_locations_list(
 @_handle_errors
 def st_crm_locations_get(ctx: Context, location_id: int) -> dict[str, Any]:
     """Get a single location by ID."""
-    return _get_client(ctx).get("crm", f"locations/{location_id}")
+    return cast(dict[str, Any], _get_client(ctx).get("crm", f"locations/{location_id}"))
 
 
 @mcp.tool(tags={"crm", "read"})
@@ -237,21 +248,23 @@ def st_crm_bookings_list(
 @_handle_errors
 def st_crm_bookings_get(ctx: Context, booking_id: int) -> dict[str, Any]:
     """Get a single booking by ID."""
-    return _get_client(ctx).get("crm", f"bookings/{booking_id}")
+    return cast(dict[str, Any], _get_client(ctx).get("crm", f"bookings/{booking_id}"))
 
 
 @mcp.tool(tags={"crm", "write"})
 @_handle_errors
 def st_crm_bookings_create(ctx: Context, data: dict[str, Any]) -> dict[str, Any]:
     """Create a new booking."""
-    return _get_client(ctx).post("crm", "bookings", json_body=data)
+    return cast(dict[str, Any], _get_client(ctx).post("crm", "bookings", json_body=data))
 
 
 @mcp.tool(tags={"crm", "write"})
 @_handle_errors
 def st_crm_bookings_update(ctx: Context, booking_id: int, data: dict[str, Any]) -> dict[str, Any]:
     """Update an existing booking."""
-    return _get_client(ctx).patch("crm", f"bookings/{booking_id}", json_body=data)
+    return cast(
+        dict[str, Any], _get_client(ctx).patch("crm", f"bookings/{booking_id}", json_body=data)
+    )
 
 
 @mcp.tool(tags={"crm", "read"})
@@ -270,7 +283,7 @@ def st_crm_contacts_list(
 @_handle_errors
 def st_crm_contacts_get(ctx: Context, contact_id: int) -> dict[str, Any]:
     """Get a single contact by ID."""
-    return _get_client(ctx).get("crm", f"contacts/{contact_id}")
+    return cast(dict[str, Any], _get_client(ctx).get("crm", f"contacts/{contact_id}"))
 
 
 # ===========================================================================
@@ -292,8 +305,9 @@ def st_jpm_jobs_list(
     page_size: int = 50,
     max_results: int = _DEFAULT_MAX_RESULTS,
 ) -> dict[str, Any]:
-    """List jobs. Filter by status, customer_id, or date range. Optional `sort`,
-    e.g. `-completedOn` (newest first) or `+createdOn`."""
+    """List jobs. Filter by status, customer_id, or date range. Optional `sort` —
+    the endpoint accepts only Id, ModifiedOn, CreatedOn and Priority, so e.g.
+    `-Id` (newest first) or `+createdOn`; `-completedOn` is rejected with a 400."""
     params: dict[str, Any] = {}
     if status:
         params["jobStatus"] = status
@@ -309,21 +323,21 @@ def st_jpm_jobs_list(
 @_handle_errors
 def st_jpm_jobs_get(ctx: Context, job_id: int) -> dict[str, Any]:
     """Get a single job by ID."""
-    return _get_client(ctx).get("jpm", f"jobs/{job_id}")
+    return cast(dict[str, Any], _get_client(ctx).get("jpm", f"jobs/{job_id}"))
 
 
 @mcp.tool(tags={"jpm", "write"})
 @_handle_errors
 def st_jpm_jobs_create(ctx: Context, data: dict[str, Any]) -> dict[str, Any]:
     """Create a new job."""
-    return _get_client(ctx).post("jpm", "jobs", json_body=data)
+    return cast(dict[str, Any], _get_client(ctx).post("jpm", "jobs", json_body=data))
 
 
 @mcp.tool(tags={"jpm", "write"})
 @_handle_errors
 def st_jpm_jobs_update(ctx: Context, job_id: int, data: dict[str, Any]) -> dict[str, Any]:
     """Update an existing job."""
-    return _get_client(ctx).patch("jpm", f"jobs/{job_id}", json_body=data)
+    return cast(dict[str, Any], _get_client(ctx).patch("jpm", f"jobs/{job_id}", json_body=data))
 
 
 @mcp.tool(tags={"jpm", "write"})
@@ -354,7 +368,7 @@ def st_jpm_appointments_list(
 @_handle_errors
 def st_jpm_appointments_get(ctx: Context, appointment_id: int) -> dict[str, Any]:
     """Get a single appointment by ID."""
-    return _get_client(ctx).get("jpm", f"appointments/{appointment_id}")
+    return cast(dict[str, Any], _get_client(ctx).get("jpm", f"appointments/{appointment_id}"))
 
 
 @mcp.tool(tags={"jpm", "read"})
@@ -373,7 +387,7 @@ def st_jpm_projects_list(
 @_handle_errors
 def st_jpm_projects_get(ctx: Context, project_id: int) -> dict[str, Any]:
     """Get a single project by ID."""
-    return _get_client(ctx).get("jpm", f"projects/{project_id}")
+    return cast(dict[str, Any], _get_client(ctx).get("jpm", f"projects/{project_id}"))
 
 
 # ===========================================================================
@@ -481,7 +495,9 @@ def st_dispatch_events_list(
 @_handle_errors
 def st_dispatch_events_create(ctx: Context, data: dict[str, Any]) -> dict[str, Any]:
     """Create a non-job appointment (event)."""
-    return _get_client(ctx).post("dispatch", "non-job-appointments", json_body=data)
+    return cast(
+        dict[str, Any], _get_client(ctx).post("dispatch", "non-job-appointments", json_body=data)
+    )
 
 
 @mcp.tool(tags={"dispatch", "read"})
@@ -600,7 +616,7 @@ def st_accounting_invoices_list(
 @_handle_errors
 def st_accounting_invoices_get(ctx: Context, invoice_id: int) -> dict[str, Any]:
     """Get a single invoice by ID."""
-    return _get_client(ctx).get("accounting", f"invoices/{invoice_id}")
+    return cast(dict[str, Any], _get_client(ctx).get("accounting", f"invoices/{invoice_id}"))
 
 
 @mcp.tool(tags={"accounting", "read"})
@@ -645,7 +661,7 @@ def st_memberships_list(
 @_handle_errors
 def st_memberships_get(ctx: Context, membership_id: int) -> dict[str, Any]:
     """Get a single membership by ID."""
-    return _get_client(ctx).get("memberships", f"memberships/{membership_id}")
+    return cast(dict[str, Any], _get_client(ctx).get("memberships", f"memberships/{membership_id}"))
 
 
 @mcp.tool(tags={"memberships", "read"})
@@ -714,7 +730,10 @@ def st_reporting_report_fields(
     Call this before st_reporting_report_data to discover what parameters
     (e.g. From, To dates) the report requires.
     """
-    return _get_client(ctx).get("reporting", f"report-category/{category_id}/reports/{report_id}")
+    return cast(
+        dict[str, Any],
+        _get_client(ctx).get("reporting", f"report-category/{category_id}/reports/{report_id}"),
+    )
 
 
 @mcp.tool(tags={"reporting", "read"})
@@ -824,7 +843,9 @@ def st_settings_business_units_list(
 @_handle_errors
 def st_settings_business_units_get(ctx: Context, business_unit_id: int) -> dict[str, Any]:
     """Get a single business unit by ID."""
-    return _get_client(ctx).get("settings", f"business-units/{business_unit_id}")
+    return cast(
+        dict[str, Any], _get_client(ctx).get("settings", f"business-units/{business_unit_id}")
+    )
 
 
 # ===========================================================================

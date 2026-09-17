@@ -16,16 +16,32 @@ def clear_env_vars(monkeypatch):
 
 
 class TestEnvironment:
+    """Exact equality, not ``in``.
+
+    ``"auth.servicetitan.io" in env.auth_url`` passes for
+    ``https://evil.example/auth.servicetitan.io`` — the substring-on-a-URL
+    pattern CodeQL flags as ``py/incomplete-url-substring-sanitization``. Here
+    the URLs are constants the code itself defines, so there was no
+    vulnerability to exploit, but the assertion was also weaker than it looked:
+    a typo'd host that still contained the substring would have passed. Pinning
+    the whole string removes the flagged pattern and catches the typo.
+    """
+
     def test_production_urls(self):
         env = Environment.PRODUCTION
-        assert "auth.servicetitan.io" in env.auth_url
-        assert "api.servicetitan.io" in env.api_base
-        assert "integration" not in env.auth_url
+        assert env.auth_url == "https://auth.servicetitan.io/connect/token"
+        assert env.api_base == "https://api.servicetitan.io"
 
     def test_integration_urls(self):
         env = Environment.INTEGRATION
-        assert "integration" in env.auth_url
-        assert "integration" in env.api_base
+        assert env.auth_url == "https://auth-integration.servicetitan.io/connect/token"
+        assert env.api_base == "https://api-integration.servicetitan.io"
+
+    def test_the_two_environments_share_no_urls(self):
+        """The reason the `integration`/`not integration` assertions existed:
+        production must never be served the integration host, or vice versa."""
+        assert Environment.PRODUCTION.auth_url != Environment.INTEGRATION.auth_url
+        assert Environment.PRODUCTION.api_base != Environment.INTEGRATION.api_base
 
 
 class TestSettings:
@@ -60,7 +76,7 @@ class TestSettings:
             environment=Environment.INTEGRATION,
             _env_file=None,
         )
-        assert "integration" in s.auth_url
+        assert s.auth_url == Environment.INTEGRATION.auth_url
 
     def test_api_base_delegates_to_environment(self):
         s = Settings(
@@ -71,4 +87,4 @@ class TestSettings:
             environment=Environment.INTEGRATION,
             _env_file=None,
         )
-        assert "integration" in s.api_base
+        assert s.api_base == Environment.INTEGRATION.api_base

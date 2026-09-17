@@ -17,7 +17,30 @@ from st_exporter.feeds.contacts import (
     ROUTES,
 )
 from st_exporter.feeds.financial import DEFAULT_MAX_TIMESHEET_JOBS
+from st_exporter.images.upload import (
+    DEFAULT_IMAGE_CONCURRENCY,
+    DEFAULT_REQUESTS_PER_SECOND,
+    MAX_IMAGE_CONCURRENCY,
+    NO_ASSET_CAP,
+)
 from st_exporter.window import FINANCIAL_WINDOW_DAYS
+
+# The reusable workflow's own default `job_timeout_minutes`, repeated here so a
+# local run and a CI run reason about the same clock.
+DEFAULT_JOB_TIMEOUT_MINUTES = 10
+
+# Taken off the job timeout before the image pass may start another asset. It
+# has to cover what happens OUTSIDE this process — checkout, setup-python and
+# `pip install -e .` all run before the exporter exists — and the ledger flush
+# that happens after the pass. A minute pessimistic costs a few images; a minute
+# optimistic costs the whole ledger to a SIGKILL, which is the failure this
+# whole mechanism exists to prevent.
+IMAGE_BUDGET_RESERVE_MINUTES = 2
+
+# Never hand the image pass a budget smaller than this, however small the job
+# timeout. Zero is not "run briefly", it is "never upload anything" — the bug
+# rather than a configuration of it.
+MIN_IMAGE_BUDGET_SECONDS = 60.0
 
 
 class ExporterSettings(BaseSettings):
@@ -110,6 +133,112 @@ class ExporterSettings(BaseSettings):
     pricebook_category_ids_raw: str = Field(
         default="", validation_alias="EXPORTER_PRICEBOOK_CATEGORY_IDS"
     )
+
+    # Which ServiceTitan report the `reporting.jobCosts` tab is built from, when
+    # the tenant's own report names cannot say. Blank (the default) resolves by
+    # name exactly as before; this is an escape hatch, not the normal path.
+    #
+    # It exists because of run 35155266960 on `BBTT-01/tr-doorservpro`, which
+    # found TWO distinct built-in reports both named "Job Costing Summary
+    # Report" — ids 21131704 and 21639096, both in the `operations` category,
+    # neither marked custom — and correctly refused to guess between them. No
+    # heuristic can tell those apart safely: preferring the lower id, the higher
+    # id, or the better column match is exactly the scoring `feeds/reporting.py`
+    # exists to reject, and getting it wrong means a contractor's own report
+    # silently supplying their cost numbers.
+    #
+    # So the choice is made by a HUMAN and recorded here. That keeps the guard's
+    # promise intact — the exporter still never picks a report on its own
+    # judgement; it is told which one. A pin is honoured whatever the report is
+    # called and whether or not it looks custom, but it does NOT skip the column
+    # checks: `require_columns` still runs against the report's metadata and the
+    # first page of its data, so a mistyped or stale id fails loudly rather than
+    # writing an empty tab. An id this tenant does not have is its own refusal
+    # and never falls back to the name, which could re-select the very report
+    # the pin was added to avoid.
+    #
+    # Not GOOGLE_-prefixed; see window_days. A string, not an int: ServiceTitan
+    # ids are identifiers, not quantities, and the rest of this codebase carries
+    # them as text.
+    job_cost_report_id: str = Field(default="", validation_alias="EXPORTER_JOB_COST_REPORT_ID")
+
+    # What the caller workflow's `timeout-minutes` is set to. The exporter is
+    # TOLD rather than left to guess, because the runner does not warn before it
+    # SIGKILLs the job and a killed process writes no image ledger: every upload
+    # that run made is forgotten and re-sent by the next one, for ever, on any
+    # tenant whose catalogue is bigger than one job. That is run 35130164187 on
+    # `BBTT-01/tr-doorservpro` — killed at 10m35s, 0 images uploaded, every hour.
+    # ge=1 because a job timeout of zero is not a thing GitHub accepts either.
+    # Not GOOGLE_-prefixed; see window_days.
+    job_timeout_minutes: int = Field(
+        default=DEFAULT_JOB_TIMEOUT_MINUTES,
+        ge=1,
+        validation_alias="EXPORTER_JOB_TIMEOUT_MINUTES",
+    )
+
+    # Cap on how many assets ONE image run fetches over the network. 0 — the
+    # default — is NO CAP, and that is deliberate: a number here would quietly
+    # truncate a large catalogue for ever on every caller that never chose one,
+    # and the symptom (a tenant permanently missing its last N images) looks
+    # exactly like a clean run. A caller that wants the pass bounded sets a
+    # number, and the run then says out loud when the cap bit
+    # (`images_stopped=per-run asset cap reached`).
+    #
+    # `modifiedOn` skips are free and do not count against it — the cap bounds
+    # WORK, not the scan — so a converged catalogue still sweeps end to end.
+    # ge=0 rather than ge=1 because 0 is the sentinel, not a degenerate cap; a
+    # cap of 1 would be legal and nearly useless, a cap of 0 meaning "fetch
+    # nothing" would be the bug rather than a configuration of it.
+    # Not GOOGLE_-prefixed; see window_days.
+    image_max_assets: int = Field(
+        default=NO_ASSET_CAP,
+        ge=0,
+        validation_alias="EXPORTER_IMAGE_MAX_ASSETS",
+    )
+
+    # How many pricebook images ONE image run fetches-and-uploads at once.
+    #
+    # The image pass is ~100% network wait, so this is the dial that decides
+    # whether a first sync of a 16,000-asset tenant takes twenty hours or two.
+    # The default is deliberately modest rather than maximal — see
+    # `images/upload.DEFAULT_IMAGE_CONCURRENCY` for the memory, throughput and
+    # rate arithmetic — and it is CLAMPED rather than rejected at the far end,
+    # because this is a performance dial on a side lane and a silly number must
+    # slow a tenant's images down, never fail their export.
+    # Not GOOGLE_-prefixed; see window_days.
+    image_concurrency: int = Field(
+        default=DEFAULT_IMAGE_CONCURRENCY,
+        ge=1,
+        le=MAX_IMAGE_CONCURRENCY,
+        validation_alias="EXPORTER_IMAGE_CONCURRENCY",
+    )
+
+    # The client-side ceiling, in requests per second, that the image pass holds
+    # ITSELF to — applied separately to ServiceTitan downloads and to TrueQuote
+    # uploads. Nothing in this codebase enforced a rate before; what existed was
+    # a per-request retry backoff, which under concurrency synchronises into
+    # waves rather than converging (`images/pacing.py`).
+    #
+    # Lower it for a tenant whose ServiceTitan instance complains. Raising it
+    # past TrueQuote's documented 8.33/s has no effect on the upload side: that
+    # limit is theirs, and a 429 from them ends the pass.
+    image_requests_per_second: float = Field(
+        default=DEFAULT_REQUESTS_PER_SECOND,
+        gt=0,
+        le=100.0,
+        validation_alias="EXPORTER_IMAGE_REQUESTS_PER_SECOND",
+    )
+
+    @property
+    def image_budget_seconds(self) -> float:
+        """How long, from the start of the run, the image pass may keep going.
+
+        One knob, not two: a caller that raises `job_timeout_minutes` must not
+        also have to remember a second number, and two numbers that can disagree
+        would eventually disagree in the direction that loses the ledger.
+        """
+        budget = (self.job_timeout_minutes - IMAGE_BUDGET_RESERVE_MINUTES) * 60.0
+        return max(MIN_IMAGE_BUDGET_SECONDS, budget)
 
     @property
     def pricebook_category_ids(self) -> tuple[str, ...]:

@@ -45,9 +45,37 @@ JOB_COLUMNS: tuple[str, ...] = (
     "summary",
     "business_unit",
     "modified_on",
+    # APPENDED, deliberately last. Appending is the one column change that is
+    # additive under `docs/export-contract.md` — consumers look columns up by
+    # name and ignore the rest — so `jobs.v2` does not become `jobs.v3`.
+    "completed_on",
+    "total_revenue",
+    # APPENDED after those, for Profit Wizard hosted parity — same rule. Read
+    # straight off the job record; every one is blank when ServiceTitan's export
+    # change-feed does not carry the field, never a guessed "0"/"false".
+    "recall_for_id",
+    "warranty_id",
+    "no_charge",
+    "total",
+    "business_unit_id",
+    "sold_by_id",
 )
 
-TECHNICIAN_COLUMNS: tuple[str, ...] = ("st_technician_id", "name", "email", "active")
+TECHNICIAN_COLUMNS: tuple[str, ...] = (
+    "st_technician_id",
+    "name",
+    "email",
+    "active",
+    # APPENDED, deliberately last, for Profit Wizard hosted parity — see
+    # `jobs.completed_on` above for why appending does not bump `technicians.v1`.
+    "phone",
+    "business_unit_id",
+    "business_unit_name",
+    "role_ids",
+    "home_address",
+    "home_latitude",
+    "home_longitude",
+)
 
 _ADDRESS_PARTS = ("street", "unit", "city", "state", "zip")
 
@@ -100,25 +128,94 @@ def build_job_grid(rows: list[dict[str, Any]]) -> list[list[str]]:
     return [list(JOB_COLUMNS)] + [format_job_row(row) for row in rows]
 
 
-def build_technician_grid(records: list[dict[str, Any]]) -> list[list[str]]:
+def build_technician_grid(
+    records: list[dict[str, Any]],
+    business_units: dict[str, dict[str, Any]] | None = None,
+) -> list[list[str]]:
     """Header row + one deduped row per ServiceTitan technician record.
 
     The whole `technicians` tab, derived from raw records alone — mapping, dedupe
     and formatting in one pure call, so both ``run.py`` and the contract fixtures
     go through the same code path rather than two that can drift.
+
+    ``business_units`` is the SAME reference lookup the `jobs` tab's
+    ``business_unit`` column resolves against (id -> record, see
+    ``feeds.reference.fetch_business_units``) — one reference table, read the same
+    way by both tabs, so a business unit's name can never disagree between them.
+    ``None``/``{}`` degrades to a blank ``business_unit_name`` rather than raising.
     """
-    rows = dedupe_technician_rows([technician_row(record) for record in records])
+    rows = dedupe_technician_rows([technician_row(record, business_units) for record in records])
     return [list(TECHNICIAN_COLUMNS)] + [format_technician_row(row) for row in rows]
 
 
-def technician_row(record: dict[str, Any]) -> dict[str, Any]:
-    """Map one ServiceTitan technician record onto the technician-tab columns."""
+def technician_row(
+    record: dict[str, Any],
+    business_units: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Map one ServiceTitan technician record onto the technician-tab columns.
+
+    ``phone``/``business_unit_id``/``role_ids``/``home_*`` are unverified against
+    a real tenant (see ``KNOWN_UNVERIFIED.md``, "Technician phone/business
+    unit/roles/home address fields") — each reads the documented-looking spelling
+    first and widens to an alternate one rather than guessing a single name, the
+    same defensive shape ``denormalize._contact_detail`` already uses for
+    customer contacts.
+    """
+    business_units = business_units or {}
+    business_unit_id = record.get("businessUnitId")
+    home = _obj(record.get("homeAddress")) or _obj(record.get("home"))
+    home_latitude, home_longitude = _home_coordinate(home)
     return {
         "st_technician_id": record.get("id"),
         "name": record.get("name"),
         "email": record.get("email"),
         "active": record.get("active"),
+        "phone": record.get("phoneNumber") or record.get("phone"),
+        "business_unit_id": business_unit_id,
+        "business_unit_name": _reference_name(business_unit_id, business_units),
+        "role_ids": _joined_ids(record.get("roleIds")),
+        "home_address": build_service_address(home) if home else "",
+        "home_latitude": home_latitude,
+        "home_longitude": home_longitude,
     }
+
+
+def _obj(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _reference_name(record_id: Any, reference: dict[str, dict[str, Any]]) -> str | None:
+    """The ``name`` of a reference-table entry (business units), or ``None``.
+
+    Same lookup shape as ``denormalize._business_unit_name`` — kept as a separate
+    copy here (rather than imported) because ``denormalize`` imports FROM this
+    module, and importing back would create a cycle.
+    """
+    if record_id is None:
+        return None
+    ref = reference.get(str(record_id))
+    return str(ref["name"]) if ref and ref.get("name") else None
+
+
+def _joined_ids(values: Any) -> str | None:
+    """``[1, 2, 3]`` -> ``"1,2,3"``; blank (``None``) for anything else, never ``"0"``."""
+    if not isinstance(values, list) or not values:
+        return None
+    return ",".join(str(v) for v in values if v is not None)
+
+
+def _home_coordinate(home: dict[str, Any]) -> tuple[Any, Any]:
+    """A technician's home latitude/longitude, or (None, None) if absent.
+
+    Membership-tested, not truthiness-tested, so a real ``0.0`` at the equator or
+    prime meridian is never mistaken for "missing" — same rule
+    ``denormalize._coordinate`` applies to a job's location.
+    """
+    if not home:
+        return None, None
+    lat = home.get("latitude") if "latitude" in home else None
+    lng = home.get("longitude") if "longitude" in home else None
+    return lat, lng
 
 
 def dedupe_technician_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -1,0 +1,28 @@
+{
+  "feed": "pricebook",
+  "contract_version": "pricebook.v2",
+  "tab": "pricebook.categories",
+  "grain": "one row per pricebook category; parent_id is blank at the top level",
+  "row_key": [
+    "st_id"
+  ],
+  "columns": [
+    "st_id",
+    "name",
+    "active",
+    "parent_id",
+    "description",
+    "image",
+    "position",
+    "category_type",
+    "business_unit_ids",
+    "sku_image_refs",
+    "sku_video_refs",
+    "source",
+    "external_id"
+  ],
+  "rows": [
+    ["10", "Service", "true", "", "Labour and maintenance", "Images/Pricebook/cat-10.jpg", "0", "Services", "1,2", "Images/Pricebook/sku-a.jpg,Images/Pricebook/sku-b.jpg", "", "Pricebook", "EXT-CAT-10"],
+    ["11", "Doors", "true", "10", "", "", "1", "Materials", "", "", "", "", ""]
+  ]
+}

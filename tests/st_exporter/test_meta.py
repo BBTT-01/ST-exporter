@@ -120,11 +120,11 @@ def test_meta_row_round_trips_contract_version() -> None:
             last_run_at="t1",
             row_count=2,
             exporter_version="0.2.8",
-            contract_version="pricebook.v1",
+            contract_version="pricebook.v2",
         )
     ]
     parsed = parse_meta_grid(build_meta_grid(rows))
-    assert parsed["pricebook.services"].contract_version == "pricebook.v1"
+    assert parsed["pricebook.services"].contract_version == "pricebook.v2"
     assert parsed["pricebook.services"].last_cursor == ""
 
 

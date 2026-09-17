@@ -45,6 +45,26 @@ on:
           Wizard reads, so this costs one request per job.
         type: number
         default: 500
+      job_cost_report_id:
+        description: >-
+          Which ServiceTitan report the `reporting.jobCosts` tab is built from.
+          Blank (the default) resolves it by NAME, which is what almost every
+          tenant should do.
+
+          Set it only when a tenant has more than one report sharing the built-in
+          report's name and the exporter has refused to choose between them — the
+          refusal in the run log names the candidate ids. `tr-doorservpro` has
+          two called "Job Costing Summary Report" (21131704 and 21639096).
+
+          It is a recorded HUMAN decision, not a hint: no heuristic can tell two
+          identically named reports apart safely, and picking the wrong one means
+          a contractor's own report silently supplying their cost numbers. A
+          pinned report is still checked for the columns the tab is built from,
+          so a mistyped or stale id fails loudly rather than writing an empty
+          tab, and an id the tenant does not have is refused rather than falling
+          back to the name.
+        type: string
+        default: ""
       contacts_route:
         description: >-
           Where the jobs feed reads customer phone/email from: `per-customer`
@@ -70,6 +90,82 @@ on:
           request), so leave it blank unless a tenant really needs it.
         type: string
         default: ""
+      image_max_assets:
+        description: >-
+          Cap on how many pricebook assets ONE `images` run fetches over the
+          network. 0 (the default) means NO CAP — a number here would silently
+          truncate a large catalogue for ever on any caller that never chose
+          one, and a tenant permanently missing its last N images looks exactly
+          like a clean run.
+
+          Set a number to bound a run while an image strategy settles. Assets
+          the pass skips for free (ServiceTitan says the item has not been
+          modified since the ledger last confirmed it) do NOT count against it:
+          the cap bounds work, not the scan.
+
+          Hitting it is announced on the run as
+          `images_stopped=per-run asset cap reached`, which is deliberately
+          distinct from the time budget's `images_stopped=time budget for the
+          image pass spent` — the two ask for different dials. The pass is
+          resumable either way: it works oldest-verification-first, so the next
+          run starts on the assets this one did not reach.
+        type: number
+        default: 0
+      image_concurrency:
+        description: >-
+          How many pricebook images ONE `images` run fetches and uploads AT
+          ONCE. 8 is the default and is what makes a first sync of a large
+          catalogue finish: the pass is almost entirely network wait, so this is
+          close to a linear speed-up, and one tenant's ~16,000 assets go from an
+          estimated ~20 hours serial to ~2.5 hours.
+
+          Raise it (up to 32) for a tenant with a very large catalogue and a
+          fast connection; lower it to 1 to get exactly the old serial
+          behaviour. Bounded rather than rejected at the top end — this is a
+          performance dial on a side lane and a silly number must slow the
+          images down, never fail the export.
+
+          It is NOT a rate limit: see `image_requests_per_second`, which is.
+        type: number
+        default: 8
+      image_requests_per_second:
+        description: >-
+          The client-side ceiling the `images` run holds ITSELF to, in requests
+          per second, applied separately to ServiceTitan downloads and TrueQuote
+          uploads. 6 is the default and never binds at the default concurrency —
+          it is a governor, not a target.
+
+          It exists because nothing in the exporter enforced a rate before: what
+          existed was a per-request retry backoff, which under concurrency does
+          not converge, it synchronises. The TrueQuote side is additionally
+          clamped to their documented 8.33/s whatever is set here, because a 429
+          from TrueQuote ends the pass.
+
+          Lower it for a tenant whose ServiceTitan instance starts answering
+          429s (the run says so: `images_rate_limited=`).
+        type: number
+        default: 6
+      job_timeout_minutes:
+        description: >-
+          How long this job may run before GitHub kills it. 10 — the old
+          hardcoded value — is still the default, so every existing caller and
+          every feed other than `images` is untouched.
+
+          Raise it ONLY for an `images` job whose tenant has a large image
+          catalogue. The exporter is handed this same number
+          (`EXPORTER_JOB_TIMEOUT_MINUTES`) and stops its image pass a couple of
+          minutes short of it, so the run ends with a WRITTEN image ledger
+          instead of a SIGKILL. It is one number rather than two on purpose: a
+          separate image budget could disagree with the job timeout, and the
+          direction it would eventually disagree in is the one that loses the
+          ledger.
+
+          The pass is resumable — it works oldest-verification-first, so each
+          run starts on the images the last one did not reach. A bigger number
+          means fewer runs to a first full sweep, not the difference between
+          working and not.
+        type: number
+        default: 10
     secrets:
       ST_CLIENT_ID:
         required: true
@@ -156,7 +252,21 @@ jobs:
     #               keeps the 5-minute drain off the back of an hourly
     #               pricebook run.
     #
-    # The comparison is against the exact string `outbox` and nothing fancier,
+    #   ...-images  a run that asks for `images` AND NOTHING ELSE. Same
+    #               reasoning, verified the same way: `cli.py` does not call
+    #               `run_export` for it either, `run_images` never opens the
+    #               Export Store at all, and the ONLY tab it read-modify-writes
+    #               is `_image_ledger` on the private raw-cache Sheet, which
+    #               nothing else reads or writes. `SheetsClient.replace_grid` is
+    #               scoped to one worksheet, so it cannot disturb the sibling
+    #               `_raw_*` tabs the jobs feed writes. No `_meta`, therefore its
+    #               own lock — and that is the whole point: a slow image pass can
+    #               no longer hold the export lock and delay the hourly pricebook
+    #               feed, which is what made one tenant's pricebook export red
+    #               every hour (run 35130164187, SIGKILL at 10m35s).
+    #
+    # The comparison is against the exact strings `outbox` and `images` and
+    # nothing fancier,
     # because the SAFE side of any ambiguity is the shared export lock. A run
     # asking for `jobs,outbox`, or for ` outbox ` with a stray space, writes
     # `_meta` (or might) and lands in `...-export` with everything else. Adding
@@ -173,85 +283,151 @@ jobs:
     # cancel-in-progress: false — killing a run mid-drain is exactly the
     # crash the ledger has to recover from; better to just queue.
     concurrency:
-      group: st-export-${{ github.repository }}-${{ inputs.feeds == 'outbox' && 'outbox' || 'export' }}
+      group: st-export-${{ github.repository }}-${{ (inputs.feeds == 'outbox' && 'outbox') || (inputs.feeds == 'images' && 'images') || 'export' }}
       cancel-in-progress: false
-    timeout-minutes: 10
+    timeout-minutes: ${{ inputs.job_timeout_minutes }}
     permissions:
       contents: read
-    env:
-      # ---------------------------------------------------------------------
-      # THE ONE VERSION LITERAL IN THIS FILE.
-      # Bump it and pyproject.toml together via `scripts/release.sh <version>`,
-      # in the same commit the new tag is cut from. Everything else — the
-      # checkout ref and the expected version the guard asserts — is derived
-      # from this string.
-      # ---------------------------------------------------------------------
-      EXPORTER_TAG: exporter-v0.2.10
     steps:
+      # =====================================================================
+      # THIS WORKFLOW CHECKS ITSELF OUT. THERE IS NO VERSION LITERAL HERE.
+      # =====================================================================
+      #
       # A reusable (workflow_call) workflow runs in the CALLER's context, so a
       # bare checkout would fetch the caller's repo (which has no pyproject.toml)
-      # and `pip install -e .` would fail. This repo and ref are pinned explicitly.
+      # and `pip install -e .` would fail. The repo and the ref are therefore
+      # explicit — but they are now RESOLVED, not written down.
       #
-      # `EXPORTER_TAG` (job env, top of this job) is the ONE version literal in
-      # this file. The checkout ref and the expected version are both derived from
-      # it, so they cannot disagree with each other — only with the code, which is
-      # exactly what the guard below is for.
+      # WHY THE LITERAL IS GONE. There used to be one `EXPORTER_TAG:` here, and
+      # `scripts/release.sh` rewrote it as part of every version bump. That made
+      # every release commit a commit that touches `.github/workflows/**`, and
+      # GITHUB_TOKEN — a GitHub App installation token — is refused any ref
+      # update carrying such a commit. Release runs 35024004355 and 35025492123
+      # both built the bump, ran the suite, made the commit, cut the tag, and
+      # were rejected at the final push (atomically, so nothing landed and no
+      # orphan tag survived). There is no `permissions:` entry that fixes it:
+      # `workflows` is not a scope that key can grant, at any level. The only
+      # alternative to deleting the literal was a STORED CREDENTIAL able to
+      # rewrite this file — the file every contractor runs against their own
+      # live ServiceTitan tenant, on a schedule, unattended. Deleting the
+      # literal removes that credential from the design entirely.
       #
-      # It is a literal and it STAYS one. Both candidate contexts have now been
-      # measured on a real customer run (Pioneer, run 34392888158, 2026-09-09):
+      # WHAT REPLACES IT: the `job` context. `job.workflow_sha` is documented as
+      # "the commit SHA of the workflow file that defines the current job", and
+      # `job.workflow_repository` as its owner/repo; GitHub's contexts reference
+      # carries a worked example titled "check out its own source code, rather
+      # than the caller's", which is exactly this job. `actions/checkout`
+      # accepts a full SHA for `ref:`, so the exporter that runs is always the
+      # exporter this file was published with — by construction, with nothing to
+      # keep in sync and nothing for a release to rewrite.
       #
-      #   github.job_workflow_ref = <EMPTY>
+      # DO NOT SUBSTITUTE ANYTHING FROM THE `github` CONTEXT. All of `github.*`
+      # describes the CALLER, by design, and two attempts died on that. Both
+      # were measured on a real customer run (Pioneer, run 34392888158,
+      # 2026-09-09):
+      #
+      #   github.job_workflow_ref = <EMPTY>   (not a `github` property at all —
+      #                                        it is an OIDC claim)
       #   github.workflow_ref     = BBTT-01/tr-pioneer-overhead-door/
       #                             .github/workflows/export.yml@refs/heads/main
       #
-      # `workflow_ref` names the CALLER — deriving from it on 2026-09-08 checked
-      # out this repo's `main` and ran an exporter with no `--feeds` flag.
-      # `job_workflow_ref` is documented to name the reusable workflow itself, but
-      # is simply empty here, so deriving from it yields an empty ref. Neither is
-      # usable. Do not try a third time without re-measuring first.
+      # Deriving from `workflow_ref` on 2026-09-08 checked out THIS repo's
+      # `main` and ran an exporter with no `--feeds` flag, against a live
+      # tenant. `job.*` is a different mechanism, not a third guess at the same
+      # one.
       #
-      # `scripts/release.sh <version>` bumps this and pyproject.toml together.
-      # Do not hand-edit one of them.
+      # CAVEAT, recorded so nobody rediscovers it: `job.workflow_sha` and its
+      # siblings are documented as NOT available on GitHub Enterprise Server.
+      # Every contractor here is on github.com, so this is fine; it would not be
+      # if a connector ever moved to GHES.
       #
-      # The guard exists because the bump was missed once and the failure was
-      # invisible — v0.2.1 was cut, the caller repointed, and the run logged
-      # `Uses: ...@exporter-v0.2.1` while `HEAD is now at c96d08a` named v0.2.0's
-      # commit. The wrong code ran successfully.
+      # THE GUARD BELOW COMES BEFORE THE CHECKOUT, AND THAT ORDER IS THE WHOLE
+      # SAFETY STORY. An empty `ref:` does not error. `actions/checkout`
+      # silently fetches the default branch and the wrong exporter runs
+      # successfully against a live customer tenant — which is precisely how
+      # v0.2.1 shipped wrong: the run logged `Uses: ...@exporter-v0.2.1` while
+      # `HEAD is now at c96d08a` named v0.2.0's commit, and nothing errored. So
+      # the resolution is asserted non-empty and asserted to name THIS
+      # repository before a single line of code is fetched.
+      - name: Self-discovery resolved
+        env:
+          # `job.*`, NOT `github.*`. See the block above before changing these.
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: |
+          set -euo pipefail
+          echo "job.workflow_sha        = '${JOB_WORKFLOW_SHA}'"
+          echo "job.workflow_repository = '${JOB_WORKFLOW_REPOSITORY}'"
+          echo "job.workflow_ref        = '${JOB_WORKFLOW_REF}'"
+          if [ -z "$JOB_WORKFLOW_SHA" ] || [ -z "$JOB_WORKFLOW_REPOSITORY" ]; then
+            echo "::error::this workflow could not resolve its own source" \
+                 "(sha='$JOB_WORKFLOW_SHA' repository='$JOB_WORKFLOW_REPOSITORY')." \
+                 "An empty ref does not fail the checkout — it takes the default branch" \
+                 "and runs the WRONG exporter against this tenant, which is how v0.2.1" \
+                 "shipped. Refusing before anything is fetched."
+            exit 1
+          fi
+          if [ "$JOB_WORKFLOW_REPOSITORY" != "BBTT-01/ST-exporter" ]; then
+            echo "::error::self-discovery resolved to '$JOB_WORKFLOW_REPOSITORY', not" \
+                 "BBTT-01/ST-exporter. The checkout below would fetch code from somewhere" \
+                 "this repository does not publish. Refusing."
+            exit 1
+          fi
+          echo "resolved own source: $JOB_WORKFLOW_REPOSITORY @ $JOB_WORKFLOW_SHA"
+
       - uses: actions/checkout@v4
         with:
-          repository: BBTT-01/ST-exporter
-          ref: ${{ env.EXPORTER_TAG }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
 
+      # The dependency cache is keyed on `pyproject.toml`, and the checkout
+      # above is what puts that file on disk — so this step can only follow it.
+      #
+      # `pip install -e .` costs ~15 seconds of resolving and downloading on a
+      # cold runner, and this workflow is not run once: every connector repo
+      # calls it on a five-minute schedule, several jobs per cycle. That is a
+      # quarter of a minute of dependency download per job, for ever, to install
+      # a dependency set that changes only when this repo's `pyproject.toml`
+      # changes — which is exactly the hash the cache is keyed on, so a release
+      # that changes dependencies misses the cache and repopulates it by itself.
+      #
+      # It caches pip's own download/wheel directory, NOT the environment, so the
+      # install still runs and still resolves: nothing about which code the job
+      # runs moves, and a corrupt or absent cache costs the 15 seconds back
+      # rather than failing. `cache-dependency-path` is explicit because
+      # setup-python's default hashes `requirements.txt`, which this repo does
+      # not have — and it FAILS the job when its path matches nothing, which for
+      # a workflow contractors run against live tenants is not a risk worth
+      # taking on a default.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
 
       - name: Install
         run: pip install -e .
 
-      # The pinned tag above and the code it fetches can drift, and when they do
-      # nothing errors — the wrong exporter just runs. This turns that into a hard
-      # failure: EXPORTER_VERSION is bumped in the same commit a tag is cut from,
-      # so a mismatch means `ref:` points somewhere other than this file's own tag.
-      # It is also the version stamped into the Export Store's `_meta` tab, so the
-      # Sheet itself records which exporter wrote it.
-      - name: Verify the checked-out exporter matches the pinned tag
+      # THE VERSION IS RECORDED, NOT CROSS-CHECKED, AND THAT IS THE POINT.
+      #
+      # This step used to compare the checked-out code's EXPORTER_VERSION against
+      # a tag literal written at the top of this file, because those two could
+      # drift and nothing errored when they did (v0.2.1). There is no second name
+      # to disagree with any more: the checkout ref IS this file's own commit, so
+      # "the code that ran" and "the workflow that ran it" cannot be different
+      # things. The guard that replaced the cross-check is the self-discovery
+      # refusal above, which runs before the fetch rather than after it.
+      #
+      # What is still worth doing is saying out loud which exporter ran. A
+      # contractor's failure arrives as a link to a finished run, and the same
+      # version is stamped into the Export Store's `_meta` tab, so the Sheet and
+      # the run log can be lined up after the fact.
+      - name: Record the exporter version
         run: |
-          # Derived from the single literal, not typed a second time.
-          EXPECTED_EXPORTER_VERSION="${EXPORTER_TAG#exporter-v}"
-          if [ "$EXPECTED_EXPORTER_VERSION" = "$EXPORTER_TAG" ]; then
-            echo "::error::EXPORTER_TAG ('$EXPORTER_TAG') is not of the form" \
-                 "exporter-vX.Y.Z, so the expected version cannot be derived."
-            exit 1
-          fi
+          set -euo pipefail
           actual="$(python -c 'from st_exporter import EXPORTER_VERSION; print(EXPORTER_VERSION)')"
-          if [ "$actual" != "$EXPECTED_EXPORTER_VERSION" ]; then
-            echo "::error::exporter version mismatch — this workflow expects" \
-                 "$EXPECTED_EXPORTER_VERSION but the checked-out code is $actual." \
-                 "The 'ref:' in the checkout step is pointing at the wrong commit."
-            exit 1
-          fi
-          echo "exporter $actual matches the pinned tag"
+          echo "::notice title=Exporter version::$actual"
 
       # THE DRAIN ANNOUNCES ITSELF. The one-drain rule is enforced structurally
       # (the drain needs `feeds: outbox`, and only the drain job is given a
@@ -311,8 +487,16 @@ jobs:
           EXPORTER_PRICEBOOK_CATEGORY_IDS: ${{ inputs.pricebook_category_ids }}
           EXPORTER_FINANCIAL_WINDOW_DAYS: ${{ inputs.financial_window }}
           EXPORTER_FINANCIAL_MAX_JOBS: ${{ inputs.financial_max_jobs }}
+          EXPORTER_JOB_COST_REPORT_ID: ${{ inputs.job_cost_report_id }}
           EXPORTER_CONTACTS_ROUTE: ${{ inputs.contacts_route }}
           EXPORTER_CONTACTS_MAX_CUSTOMERS: ${{ inputs.contacts_max_customers }}
+          # The exporter is told the runner's own deadline so the image pass can
+          # stop short of it. Forgetting to forward it does not fail anything —
+          # it silently restores the SIGKILL, so `test_workflow.py` asserts it.
+          EXPORTER_JOB_TIMEOUT_MINUTES: ${{ inputs.job_timeout_minutes }}
+          EXPORTER_IMAGE_MAX_ASSETS: ${{ inputs.image_max_assets }}
+          EXPORTER_IMAGE_CONCURRENCY: ${{ inputs.image_concurrency }}
+          EXPORTER_IMAGE_REQUESTS_PER_SECOND: ${{ inputs.image_requests_per_second }}
           FEEDS: ${{ inputs.feeds }}
         run: |
           # Per-segment check rather than an enumeration of every combination —
@@ -321,7 +505,7 @@ jobs:
           IFS=',' read -ra FEED_PARTS <<< "$FEEDS"
           for feed in "${FEED_PARTS[@]}"; do
             case "$(echo "$feed" | tr -d '[:space:]')" in
-              jobs|technicians|pricebook|financial|outbox) ;;
+              jobs|technicians|pricebook|financial|images|outbox) ;;
               *) echo "::error::invalid feeds input: $FEEDS" >&2; exit 1 ;;
             esac
           done

@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 from st_exporter.denormalize import build_job_rows
+from st_exporter.feeds.pricebook import apply_category_names, category_name_index
 from st_exporter.feeds.raw_cache import RawCache
 from tests.st_exporter.fixtures import tenant_financial, tenant_pricebook, tenant_run1
 
@@ -106,6 +107,9 @@ _APPOINTMENT_300_UNASSIGNED = {
 #: than sitting on the job, and whose location carries coordinates. Pins the
 #: `latitude`/`longitude`/`job_type`/`business_unit` columns as non-blank — a
 #: column blank on every fixture row is a column whose spelling nothing checks.
+#: Pins the 7 appended Profit Wizard hosted-parity columns as NON-blank — a
+#: column blank on every fixture row is a column whose spelling nothing checks.
+#: `_JOB_3_NO_LOCATION` (above) already pins the blank case for all seven.
 _JOB_4 = {
     "id": 4,
     "jobNumber": "J-4",
@@ -116,6 +120,12 @@ _JOB_4 = {
     "jobStatus": "Scheduled",
     "summary": "Install, whole crew",
     "modifiedOn": f"{_SECOND_DAY}T00:00:00Z",
+    "completedOn": f"{_SECOND_DAY}T16:00:00Z",
+    "recallForId": 2,
+    "warrantyId": 9,
+    "noCharge": False,
+    "total": 1250.5,
+    "soldById": 901,
 }
 _LOCATION_22 = {
     "id": 22,
@@ -174,10 +184,33 @@ def job_rows() -> list[dict[str, Any]]:
 
 # --- technicians --------------------------------------------------------------
 
-_TECHNICIAN_901 = {"id": 901, "name": "Tech Two", "email": "tech2@example.invalid", "active": True}
+#: Pins the 7 appended Profit Wizard hosted-parity columns as NON-blank.
+#: `_TECHNICIAN_902_UNKNOWN_ACTIVE` (below) pins the blank case for all seven.
+_TECHNICIAN_901 = {
+    "id": 901,
+    "name": "Tech Two",
+    "email": "tech2@example.invalid",
+    "active": True,
+    "phoneNumber": "555-0155",
+    "businessUnitId": 3,
+    "roleIds": [10, 11],
+    "homeAddress": {
+        "street": "9 Fixture Ln",
+        "city": "Springfield",
+        "state": "IL",
+        "zip": "62701",
+        "latitude": 39.79,
+        "longitude": -89.65,
+    },
+}
 #: No `active` field at all. Blank, never "false" — guessing false retires a live
-#: technician.
+#: technician. Also carries none of the seven appended columns, pinning them
+#: blank rather than a guessed default.
 _TECHNICIAN_902_UNKNOWN_ACTIVE = {"id": 902, "name": "Tech Three", "email": None}
+
+#: The reference table `technicians.business_unit_name` resolves against — the
+#: SAME shape `jobs.business_unit` already joins to (see `job_rows()` above).
+_TECHNICIAN_BUSINESS_UNITS: dict[str, Any] = {"3": {"name": "Doors"}}
 
 # --- pricebook ----------------------------------------------------------------
 
@@ -193,6 +226,99 @@ _SERVICE_3_UNKNOWN_ACTIVE = {
     "assets": [],
     "modifiedOn": "2026-09-05T00:00:00Z",
 }
+
+
+#: A material whose cost is explicitly null, sitting on the same tab as one whose
+#: cost is a real ``0``. Blank-is-not-zero is the rule a pricing formula breaks
+#: most expensively: a null cost read as zero prices the item at pure margin.
+_MATERIAL_2_NULL_COST = {
+    "id": 201,
+    "code": "MAT-2",
+    "displayName": "Bottom Seal",
+    "description": "Cost not recorded upstream",
+    "price": 24,
+    "cost": None,
+    "hours": 0,
+    "active": True,
+    "categories": [{"id": 11, "name": "Doors"}],
+    "assets": [],
+    "modifiedOn": "2026-09-06T00:00:00Z",
+}
+
+
+#: The category-name lookup a live run builds from the categories endpoint, over
+#: the same two categories the `pricebook.categories` fixture pins.
+_CATEGORY_NAMES = category_name_index([tenant_pricebook.CATEGORY_10, tenant_pricebook.CATEGORY_11])
+
+
+def _as_fetched(*records: dict[str, Any]) -> list[dict[str, Any]]:
+    """Item records as ``feeds.pricebook`` hands them to the row builder.
+
+    `equipment` and `materials` send ``categories`` as bare int ids with no names
+    (`tenant-pricebook-v2`: ``Pricebook.V2.{Equipment,Material}Response``), and the
+    fetch layer resolves those names off the categories endpoint. Putting the raw
+    records through that same pure pass here is what keeps the fixture a record of
+    what a RUN writes; hand-writing the resolved shape instead is precisely how the
+    object-only reader looked correct while blanking both columns on every
+    equipment and material row of run 35134016237.
+    """
+    return apply_category_names([dict(record) for record in records], _CATEGORY_NAMES)
+
+
+# --- sales.estimates -----------------------------------------------------------
+
+#: A sold estimate with two items — a normal money-and-hours item next to one
+#: whose cost/hours are absent (blank, never "0"), pinning that distinction on
+#: the tab's own money/hours columns the way `tenant_financial.INVOICE_1` does
+#: for `accounting.invoices`.
+_ESTIMATE_1_SOLD = {
+    "id": 700,
+    "job": {"id": 7, "jobNumber": "J-7"},
+    "name": "Door replacement",
+    "status": {"value": 2, "name": "Sold"},
+    "active": True,
+    "soldOn": f"{_APPOINTMENT_DAY}T00:00:00Z",
+    # Bare employee id, as the Estimates API returns it (and as this repo's own
+    # `estimates-sell` docs send it) — not a nested `{id}`.
+    "soldBy": 901,
+    # No `total` on the response: `Total` is `subtotal + tax`, both present. Tax
+    # is a real 0 here so the derived cell still traces to a fixture literal
+    # (`test_every_fixture_cell_traces_back_to_a_synthetic_source_record`); the
+    # non-zero sum is pinned by `test_sales.py`.
+    "subtotal": 1000,
+    "tax": 0,
+    "modifiedOn": f"{_APPOINTMENT_DAY}T00:00:00Z",
+    "items": [
+        {
+            "id": 7001,
+            "sku": {"id": 55, "type": "Service", "soldHours": 2.5},
+            "qty": 1,
+            "total": 300,
+            "unitCost": 40,
+            "totalCost": 40,
+        },
+        {
+            "id": 7002,
+            "sku": {"id": 56, "type": "Material"},
+            "qty": 4,
+            "total": 700,
+            "unitCost": None,
+            "totalCost": None,
+        },
+    ],
+}
+#: Never sold — `SoldOn`/`SoldById` blank, not a guessed date — and no items at
+#: all, so it writes exactly one row with every `Item*` column blank.
+_ESTIMATE_2_UNSOLD_NO_ITEMS = {
+    "id": 701,
+    "jobId": 8,
+    "name": "Follow-up estimate",
+    "status": "Open",
+    "active": True,
+    "items": [],
+}
+#: No id: dropped entirely, same rule as a keyless pricebook item or invoice.
+_ESTIMATE_NO_ID = {"jobId": 9, "name": "Dropped", "items": []}
 
 
 def _report_rows() -> list[dict[str, Any]]:
@@ -227,8 +353,12 @@ SOURCE_RECORDS: dict[str, list[dict[str, Any]]] = {
         # No id: dropped entirely rather than written as a keyless row.
         {"code": "SVC-NO-ID", "displayName": "Dropped", "price": 1},
     ],
-    "pricebook.equipment": [tenant_pricebook.EQUIPMENT_1],
-    "pricebook.materials": [tenant_pricebook.MATERIAL_1],
+    "pricebook.equipment": _as_fetched(tenant_pricebook.EQUIPMENT_1),
+    # Both intents kept: the new null-cost material rides through the SAME
+    # `_as_fetched` category-name pass as its sibling. Dropping that wrapper to
+    # take the new record is what blanked category_ids/category_names on 15031
+    # live rows of run 35134016237.
+    "pricebook.materials": _as_fetched(tenant_pricebook.MATERIAL_1, _MATERIAL_2_NULL_COST),
     "pricebook.categories": [tenant_pricebook.CATEGORY_10, tenant_pricebook.CATEGORY_11],
     "accounting.invoices": [tenant_financial.INVOICE_1, tenant_financial.INVOICE_2_NO_ITEMS],
     "payroll.timesheets": (
@@ -236,6 +366,7 @@ SOURCE_RECORDS: dict[str, list[dict[str, Any]]] = {
     ),
     "settings.businessUnits": tenant_financial.BUSINESS_UNITS,
     "reporting.jobCosts": _report_rows(),
+    "sales.estimates": [_ESTIMATE_1_SOLD, _ESTIMATE_2_UNSOLD_NO_ITEMS, _ESTIMATE_NO_ID],
 }
 
 SOURCE_RECORDS["jobs"] = job_rows()

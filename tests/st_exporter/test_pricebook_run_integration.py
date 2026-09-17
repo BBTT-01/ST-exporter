@@ -80,7 +80,7 @@ def test_each_tab_gets_its_own_meta_row_with_the_contract_version(
 
     meta = parse_meta_grid(export_store.tabs["_meta"])
     for tab in PRICEBOOK_TABS:
-        assert meta[tab].contract_version == "pricebook.v1"
+        assert meta[tab].contract_version == "pricebook.v2"
         # Catalogue: full replace, so no cursor is ever carried.
         assert meta[tab].last_cursor == ""
         assert meta[tab].last_run_at == FIXED_NOW.isoformat()
@@ -191,12 +191,15 @@ def test_not_selecting_pricebook_leaves_its_tabs_and_meta_untouched(
     respx.get(f"{st_settings.api_base}/settings/v2/tenant/12345/technicians").mock(
         return_value=httpx.Response(200, json={"data": [], "hasMore": False})
     )
+    respx.get(f"{st_settings.api_base}/settings/v2/tenant/12345/business-units").mock(
+        return_value=httpx.Response(200, json={"data": [], "hasMore": False})
+    )
     summary = _run(st_settings, exporter_settings, export_store, feeds=frozenset({"technicians"}))
 
     assert summary.pricebook_row_counts is None
     assert export_store.tabs["pricebook.services"] == before
     meta = parse_meta_grid(export_store.tabs["_meta"])
-    assert meta["pricebook.services"].contract_version == "pricebook.v1"
+    assert meta["pricebook.services"].contract_version == "pricebook.v2"
 
 
 # --- image upload lane -------------------------------------------------------
@@ -210,7 +213,13 @@ TQ_BASE = "https://truequote.example.com/api/outbox"
 TQ_UPLOAD = f"{TQ_BASE}/pricebook-image"
 # tenant_pricebook's EQUIPMENT_1 carries this as its default asset.
 EQUIPMENT_IMAGE_URL = "https://cdn.example.com/a1.jpg"
-PNG = b"\x89PNG\r\n\x1a\n" + b"body"
+# Enough bytes that these fixtures clear `MIN_PLAUSIBLE_IMAGE_BYTES`. A real
+# pricebook photograph is kilobytes; a byte-valid image under the floor is a
+# blank placeholder and is refused on purpose (`assets.is_placeholder_image`),
+# so a fixture standing in for a REAL image has to look like one.
+_REAL_IMAGE_PADDING = b"\x00" * 2048
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"body" + _REAL_IMAGE_PADDING
 
 
 def _image_client():

@@ -102,6 +102,24 @@ class TestExemptions:
             for column, reason in columns.items():
                 assert reason.strip(), f"{tab}.{column} is exempt with no reason given"
 
+    def test_the_category_columns_are_never_exempt(self) -> None:
+        """Run 35134016237's four blank columns are a BUG, and stay reportable.
+
+        `equipment`/`materials` send `categories` as bare int ids and the reader
+        only understood objects. Exempting these would have hidden the whole
+        catalogue losing its category linkage — the exact failure this detector is
+        for — so they must never appear in ALL_BLANK_OK.
+        """
+        for tab in ("pricebook.services", "pricebook.equipment", "pricebook.materials"):
+            for column in ("category_ids", "category_names"):
+                assert column not in ALL_BLANK_OK.get(tab, {}), f"{tab}.{column} must not be exempt"
+
+    def test_business_unit_code_is_exempt_because_the_api_has_no_such_field(self) -> None:
+        # The one of run 35132986620's blank columns that is NOT a wrong field
+        # name: `TenantSettings.V2.BusinessUnitResponse` has no `code` at all, so
+        # no tenant can fill it. Pinned so the exemption cannot quietly widen.
+        assert set(ALL_BLANK_OK["settings.businessUnits"]) == {"Code"}
+
     def test_the_unverified_columns_are_not_exempt_anywhere(self) -> None:
         """The spellings this detector exists to catch must never be suppressed."""
         for column in ("job_number", "customer_phone", "customer_email", "st_technician_id"):
@@ -133,7 +151,7 @@ class TestHookedIntoTheFeeds:
         new_meta_rows = MetaRowSet()
         guard = _TabGuard(
             label="pricebook",
-            contract_version="pricebook.v1",
+            contract_version="pricebook.v2",
             meta_rows={},
             new_meta_rows=new_meta_rows,
             run_at="2026-09-15T00:00:00+00:00",
@@ -155,7 +173,10 @@ class TestHookedIntoTheFeeds:
         ]
         store = InMemorySheetsStore()
         new_meta_rows = MetaRowSet()
-        with patch("st_exporter.run.fetch_technicians", return_value=technicians):
+        with (
+            patch("st_exporter.run.fetch_technicians", return_value=technicians),
+            patch("st_exporter.run.fetch_business_units", return_value={}),
+        ):
             row_count = _run_technicians_feed(
                 Mock(),
                 store,
