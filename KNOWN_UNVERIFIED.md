@@ -968,9 +968,11 @@ missing), so the tag list has never been read.
   name; that line settles it.
 - **The create body is `{"tagName", "description"}`** and the response carries
   `id`. The name is matched on `tagName`, falling back to `name`.
-- **Whether the list returns inactive tags.** If it is active-only by default,
-  an inactive `TrueQuote` tag is invisible and one new tag would be created. The
-  code refuses an inactive match it can see; it cannot refuse one it is not shown.
+- **Whether the list returns inactive tags.** The same schema gives
+  `BookingProviderTags_GetList` no `active` parameter at all (pricebook lists have
+  `ActiveRequestArg`; this one does not), while the response carries `active` —
+  so the list most likely returns every tag, and none is sent. If a tenant ever
+  shows an inactive `TrueQuote` tag missing from the list, this is the place.
 
 ## Profit Wizard's items: three of the four are now performed; `update_job` is not
 

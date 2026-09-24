@@ -326,7 +326,7 @@ class TestPerformBooking:
         )
         client = ServiceTitanClient(st_settings)
         try:
-            assert perform_booking(client, item) == "90210"
+            assert perform_booking(client, item, TrueQuoteBookingProvider(client)) == "90210"
         finally:
             client.close()
         assert route.called
@@ -352,7 +352,7 @@ class TestPerformBooking:
         )
         client = ServiceTitanClient(st_settings)
         try:
-            assert perform_booking(client, item) == "4"
+            assert perform_booking(client, item, TrueQuoteBookingProvider(client)) == "4"
         finally:
             client.close()
         assert route.called
@@ -409,7 +409,7 @@ class TestPerformBooking:
 
         client = ServiceTitanClient(st_settings)
         try:
-            perform_booking(client, item)
+            perform_booking(client, item, TrueQuoteBookingProvider(client))
         finally:
             client.close()
 
@@ -478,6 +478,74 @@ class TestBookingProviderTag:
         assert create.call_count == 1
         assert json.loads(create.calls.last.request.content)["tagName"] == "TrueQuote"
         assert bookings.call_count == 3
+
+    @respx.mock
+    def test_a_name_with_stray_whitespace_still_matches(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        _tags_route(st_settings, [{"id": 42, "tagName": "  TrueQuote ", "active": True}])
+        create = respx.post(f"{_crm(st_settings)}/booking-provider-tags").mock(
+            return_value=httpx.Response(200, json={"id": 999})
+        )
+        client = ServiceTitanClient(st_settings)
+        try:
+            assert TrueQuoteBookingProvider(client).tag_id() == 42
+        finally:
+            client.close()
+        assert not create.called
+
+    @respx.mock
+    def test_the_list_sends_no_active_filter_so_inactive_tags_are_seen(
+        self, st_settings: Settings
+    ) -> None:
+        """BookingProviderTags_GetList documents no `active` parameter, so none is
+        sent; the inactive tag in the answer is refused, not shadowed by a new one."""
+        mock_auth_token(st_settings.auth_url)
+        tags = _tags_route(
+            st_settings,
+            [
+                {"id": 10, "tagName": "Website", "active": True},
+                {"id": 55, "tagName": "TrueQuote", "active": False},
+            ],
+        )
+        create = respx.post(f"{_crm(st_settings)}/booking-provider-tags").mock(
+            return_value=httpx.Response(200, json={"id": 999})
+        )
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(BookingProviderTagError, match="id 55"):
+                TrueQuoteBookingProvider(client).tag_id()
+        finally:
+            client.close()
+        assert "active" not in tags.calls.last.request.url.params
+        assert not create.called
+
+    @respx.mock
+    def test_after_a_403_an_item_with_its_own_provider_id_still_posts(
+        self, st_settings: Settings
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(f"{_crm(st_settings)}/booking-provider-tags").mock(
+            return_value=httpx.Response(403, json={"title": "Scope validation failed"})
+        )
+        direct = respx.post(f"{_crm(st_settings)}/booking-provider/77/bookings").mock(
+            return_value=httpx.Response(200, json={"id": 5})
+        )
+        carried = OutboxItem(
+            id="i-direct",
+            idempotency_key="k-direct",
+            kind="booking",
+            payload={"summary": "x"},
+            extra={"booking_provider_id": "77"},
+        )
+        client = ServiceTitanClient(st_settings)
+        try:
+            provider = TrueQuoteBookingProvider(client)
+            with pytest.raises(BookingProviderTagError):
+                perform_booking(client, _hosted_item(1), provider)
+            assert perform_booking(client, carried, provider) == "5"
+        finally:
+            client.close()
+        assert direct.call_count == 1
 
     @respx.mock
     def test_an_inactive_tag_is_refused_rather_than_duplicated(self, st_settings: Settings) -> None:

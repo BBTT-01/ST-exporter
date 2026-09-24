@@ -1,34 +1,6 @@
-"""Find-or-create the one Booking Provider Tag every TrueQuote booking is filed under.
+"""Find-or-create the "TrueQuote" Booking Provider Tag a Hosted runner files bookings under.
 
-ServiceTitan files a booking under a *booking provider*: ``POST crm/booking-
-provider/{id}/bookings``. Before this module, the id came from TrueQuote's
-database on every queued item (``booking_provider_id``), which meant somebody
-had to create a Booking Provider Tag by hand inside the contractor's
-ServiceTitan and type its id into TrueQuote. For a Hosted company the runner
-already holds the tenant's credentials, so it owns the tag instead: look for one
-named ``TrueQuote``, create it on the first booking that needs it, and reuse it
-forever after. TrueQuote stops sending the id at all
-(TrueQuote ``servicetitan-hosted-parity`` spec, "Booking without a provider id").
-
-Same shape as :class:`~st_exporter.outbox.campaign.ReferralCampaign`, for the
-same reasons: resolved lazily (a run with no booking makes no tag call), cached
-for the lane's whole drain (ten bookings cost one lookup, not ten), and matched
-by name over the full list rather than trusting a server-side filter.
-
-**Never a duplicate.** A tag is created only after the full, paginated list has
-been read and holds no ``TrueQuote`` tag at all — active or not. An inactive
-match is refused with instructions rather than shadowed by a second tag: two
-tags with one name would split the contractor's booking attribution in half,
-and there is no API call that merges them afterwards.
-
-**A 403 names the permission.** ServiceTitan's own text ("Scope validation
-failed … ``GET /tenant/{tenant}/booking-provider-tags``") does not say which box
-to tick. The error raised here does, and it is cached so every remaining item
-in the batch fails with the same sentence instead of making its own 403 call.
-
-That the booking provider id IS the Booking Provider Tag's id is still
-unconfirmed live (``KNOWN_UNVERIFIED.md``). So the first resolution logs the
-whole tag list — ids and names — which is the evidence that settles it.
+A tag is created only when the full list holds none by that name, so it is never duplicated.
 """
 
 from __future__ import annotations
@@ -84,8 +56,10 @@ class TrueQuoteBookingProvider:
         return self._tag_id
 
     def _find(self) -> int | None:
-        wanted = self._name.casefold()
+        wanted = self._name.strip().casefold()
         try:
+            # No `active` filter: the CRM v2 schema's BookingProviderTags_GetList has none
+            # (unlike pricebook's ActiveRequestArg), and an unknown one risks a 400.
             tags = list(fetch_all(self._client, _MODULE, _RESOURCE, page_size=_PAGE_SIZE))
         except Exception as exc:
             raise self._describe(exc, "list") from exc
@@ -95,7 +69,9 @@ class TrueQuoteBookingProvider:
             ", ".join(f"{tag.get('id')}={_tag_name(tag)!r}" for tag in tags) or "(none)",
         )
 
-        matches = [tag for tag in tags if _tag_name(tag).casefold() == wanted and "id" in tag]
+        matches = [
+            tag for tag in tags if _tag_name(tag).strip().casefold() == wanted and "id" in tag
+        ]
         active = sorted(int(tag["id"]) for tag in matches if tag.get("active", True))
         if active:
             if len(active) > 1:

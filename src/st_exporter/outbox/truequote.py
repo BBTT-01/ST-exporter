@@ -137,7 +137,7 @@ def _to_item(raw: dict[str, Any]) -> OutboxItem:
 def perform_booking(
     client: ServiceTitanClient,
     item: OutboxItem,
-    provider: TrueQuoteBookingProvider | None = None,
+    provider: TrueQuoteBookingProvider,
 ) -> str:
     """Create the ServiceTitan booking ``item`` describes; return its id.
 
@@ -154,10 +154,7 @@ def perform_booking(
     untouched would post camelCase junk and lose every phone number, which is
     the same mistake `referral_lead` made on 2026-09-08.
     """
-    provider_id = (
-        item.extra.get("booking_provider_id")
-        or (provider or TrueQuoteBookingProvider(client)).tag_id()
-    )
+    provider_id = item.extra.get("booking_provider_id") or provider.tag_id()
 
     body = build_booking_body(item.payload)
     created = client.post("crm", f"booking-provider/{provider_id}/bookings", json_body=body)
