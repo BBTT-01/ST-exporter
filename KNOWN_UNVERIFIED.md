@@ -952,6 +952,26 @@ TrueQuote ever moves the transform to *before* the enqueue, this exporter would
 double-transform and every booking would lose its contacts. That is the one
 change on their side that would silently break this lane.
 
+## TrueQuote's Booking Provider Tag — three shapes read from public schema copies
+
+`src/st_exporter/outbox/booking_provider.py`
+
+None of these has been seen against a live tenant. TrueQuote's own direct app
+got a 403 on `GET crm/v2/tenant/{t}/booking-provider-tags` on 2026-09-24 (scope
+missing), so the tag list has never been read.
+
+- **The booking provider id IS the tag's `id`.** High-medium confidence: the CRM
+  v2 schema describes `GetBookingProviderTagResponse.id` as "id of booking
+  provider tag", and ServiceTitan's setup guidance has integrators create a tag
+  under Settings -> Integrations -> Booking Providers and record its id. Door Serv
+  Pro's working id is `105684521`. The first resolution logs every tag's id and
+  name; that line settles it.
+- **The create body is `{"tagName", "description"}`** and the response carries
+  `id`. The name is matched on `tagName`, falling back to `name`.
+- **Whether the list returns inactive tags.** If it is active-only by default,
+  an inactive `TrueQuote` tag is invisible and one new tag would be created. The
+  code refuses an inactive match it can see; it cannot refuse one it is not shown.
+
 ## Profit Wizard's items: three of the four are now performed; `update_job` is not
 
 `src/st_exporter/outbox/profitwizard.py`, `src/st_exporter/outbox/profitwizard_writes.py`

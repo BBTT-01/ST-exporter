@@ -18,7 +18,9 @@ Token of scope ``booking_outbox``; the ``image_upload`` token earns a flat 401
 ``apps/admin/app/api/outbox/booking/claim/route.ts:22-35``: the id field is
 ``item_id``, the payload field is ``booking``, there is no ``kind`` (the queue
 is single-purpose — every row is a ServiceTitan booking), and each item also
-carries ``tenant_id`` and ``booking_provider_id``. Items are leased, not
+carries ``tenant_id`` and, for a company that still has one configured,
+``booking_provider_id``. A Hosted company sends none: the runner files its
+bookings under its own ``TrueQuote`` Booking Provider Tag instead. Items are leased, not
 deleted: ``lease_seconds`` (300) after a claim an unreported item is handed out
 again, which is the at-least-once redelivery the ledger exists to absorb.
 
@@ -49,6 +51,7 @@ from typing import Any
 import httpx
 
 from st_cli.client import ServiceTitanClient
+from st_exporter.outbox.booking_provider import TrueQuoteBookingProvider
 from st_exporter.outbox.client import OutboxItem, drop_unidentified
 from st_exporter.outbox.routes import TRUEQUOTE_ROUTES, LaneRoutes
 
@@ -131,8 +134,17 @@ def _to_item(raw: dict[str, Any]) -> OutboxItem:
     )
 
 
-def perform_booking(client: ServiceTitanClient, item: OutboxItem) -> str:
+def perform_booking(
+    client: ServiceTitanClient,
+    item: OutboxItem,
+    provider: TrueQuoteBookingProvider | None = None,
+) -> str:
     """Create the ServiceTitan booking ``item`` describes; return its id.
+
+    The booking provider is the item's own ``booking_provider_id`` when it
+    carries one (direct-era rows, and any company still configured with an id),
+    and otherwise the runner's ``TrueQuote`` Booking Provider Tag, found or
+    created once per run by ``provider`` (``booking_provider.py``).
 
     ``item.payload`` is TrueQuote's OWN ``ServiceTitanBookingInput`` — the thing
     `dispatch.ts:240` enqueues — not a ServiceTitan request body. The transform
@@ -142,9 +154,10 @@ def perform_booking(client: ServiceTitanClient, item: OutboxItem) -> str:
     untouched would post camelCase junk and lose every phone number, which is
     the same mistake `referral_lead` made on 2026-09-08.
     """
-    provider_id = item.extra.get("booking_provider_id")
-    if not provider_id:
-        raise ValueError("TrueQuote booking item carried no booking_provider_id")
+    provider_id = (
+        item.extra.get("booking_provider_id")
+        or (provider or TrueQuoteBookingProvider(client)).tag_id()
+    )
 
     body = build_booking_body(item.payload)
     created = client.post("crm", f"booking-provider/{provider_id}/bookings", json_body=body)

@@ -4,6 +4,31 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · The runner owns TrueQuote's booking provider
+
+### Added: find-or-create the `TrueQuote` Booking Provider Tag
+
+A TrueQuote booking used to need a `booking_provider_id` on every queued item,
+which meant somebody created a Booking Provider Tag by hand in the contractor's
+ServiceTitan and typed its id into TrueQuote. A Hosted company now queues no id:
+the TrueQuote lane lists the tenant's booking provider tags (every page), reuses
+the one named `TrueQuote`, creates it once if there is none, and files the
+booking under it (`src/st_exporter/outbox/booking_provider.py`). The id is
+resolved on the first booking that needs it and cached for the rest of the run,
+so a batch costs one lookup. An item that still carries an id posts exactly as
+before and never touches the tag endpoints.
+
+It never duplicates: a tag is created only when the full list holds no
+`TrueQuote` tag at all. An inactive one is refused with instructions to
+reactivate it rather than shadowed by a second tag.
+
+A 403 on the tag endpoints fails the booking with an error naming the missing
+ServiceTitan permission — **CRM -> Booking Provider Tags (Read + Write)** — and
+a red Actions annotation. The failure is cached too, so the rest of the batch
+fails with the same sentence without asking ServiceTitan again. The first
+resolution logs every tag's id and name, which is the live check still owed on
+whether the booking provider id is the tag id (`KNOWN_UNVERIFIED.md`).
+
 ## [Unreleased] · `jobs.booking_id` for TrueQuote hosted calibration
 
 ### Added: `booking_id` appended as the last `jobs` column

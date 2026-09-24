@@ -402,3 +402,58 @@ def test_unreachable_outbox_does_not_fail_the_run(
     assert "jobs=2 technicians=0" in captured.out
     assert "traderated_lane_error=1" in captured.out
     assert "Traceback" not in captured.err
+
+
+@respx.mock
+def test_hosted_bookings_with_no_provider_id_share_one_created_tag(
+    truequote_env, st_settings, exporter_settings
+) -> None:
+    """A Hosted company queues no `booking_provider_id`. Through the real wiring the
+    runner lists the tenant's tags once, creates `TrueQuote` once, and files every
+    booking in the batch under it."""
+    mock_auth_token(st_settings.auth_url)
+    crm = f"{st_settings.api_base}/crm/v2/tenant/{st_settings.tenant_id}"
+    tags = respx.get(f"{crm}/booking-provider-tags").mock(
+        return_value=httpx.Response(200, json={"data": [], "hasMore": False})
+    )
+    create = respx.post(f"{crm}/booking-provider-tags").mock(
+        return_value=httpx.Response(200, json={"id": 8080})
+    )
+    bookings = respx.post(f"{crm}/booking-provider/8080/bookings").mock(
+        side_effect=[
+            httpx.Response(200, json={"id": 1}),
+            httpx.Response(200, json={"id": 2}),
+        ]
+    )
+    respx.post(f"{TQ_BASE_URL}/booking/claim").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "item_id": f"item-{n}",
+                        "idempotency_key": f"servicetitan:booking:sess-{n}",
+                        "booking": {"sessionId": f"sess-{n}", "summary": "Two doors"},
+                    }
+                    for n in (1, 2)
+                ],
+            },
+        )
+    )
+    tq_report = respx.post(f"{TQ_BASE_URL}/booking/result").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+
+    with (
+        patch("st_exporter.cli.get_gspread_client"),
+        patch("st_exporter.cli.SheetsClient") as mock_sheets_client,
+    ):
+        mock_sheets_client.open.return_value = InMemorySheetsStore()
+        outcomes = _drain_outboxes(st_settings, exporter_settings)
+
+    assert [outcome.summary for outcome in outcomes] == [DrainSummary(2, 2, 0, 0)]
+    assert tags.call_count == 1
+    assert create.call_count == 1
+    assert bookings.call_count == 2
+    reported = [json.loads(c.request.content)["booking_id"] for c in tq_report.calls]
+    assert reported == ["1", "2"]
