@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from st_exporter.contracts import appended_columns
 from st_exporter.format import (
     JOB_COLUMNS,
+    JOBS_CONTRACT_VERSION,
     TECHNICIAN_COLUMNS,
     build_service_address,
     build_technician_grid,
@@ -107,8 +109,8 @@ def test_format_technician_row_matches_column_order_exactly() -> None:
 
 
 def test_job_columns_end_with_the_appended_hosted_parity_columns() -> None:
-    """`completed_on`/`total_revenue` were appended first; these six follow them."""
-    assert JOB_COLUMNS[-8:] == (
+    """`completed_on`/`total_revenue` were appended first; six follow them, then `booking_id`."""
+    assert JOB_COLUMNS[-9:] == (
         "completed_on",
         "total_revenue",
         "recall_for_id",
@@ -117,7 +119,50 @@ def test_job_columns_end_with_the_appended_hosted_parity_columns() -> None:
         "total",
         "business_unit_id",
         "sold_by_id",
+        "booking_id",
     )
+
+
+_JOB_COLUMNS_BEFORE_BOOKING_ID = (
+    "st_job_id",
+    "st_appointment_id",
+    "job_number",
+    "st_technician_id",
+    "customer_name",
+    "customer_phone",
+    "customer_email",
+    "service_address",
+    "latitude",
+    "longitude",
+    "appointment_start",
+    "appointment_end",
+    "job_status",
+    "job_type",
+    "summary",
+    "business_unit",
+    "modified_on",
+    "completed_on",
+    "total_revenue",
+    "recall_for_id",
+    "warranty_id",
+    "no_charge",
+    "total",
+    "business_unit_id",
+    "sold_by_id",
+)
+
+
+class TestBookingIdColumn:
+    def test_booking_id_is_the_last_jobs_column(self) -> None:
+        assert JOB_COLUMNS[-1] == "booking_id"
+        assert JOB_COLUMNS.count("booking_id") == 1
+
+    def test_every_earlier_column_keeps_its_name_and_position(self) -> None:
+        assert JOB_COLUMNS[:-1] == _JOB_COLUMNS_BEFORE_BOOKING_ID
+
+    def test_the_append_is_pure_so_the_contract_version_stays_jobs_v2(self) -> None:
+        assert JOBS_CONTRACT_VERSION == "jobs.v2"
+        assert appended_columns(_JOB_COLUMNS_BEFORE_BOOKING_ID, JOB_COLUMNS) == ["booking_id"]
 
 
 class TestTechnicianRowHostedParityColumns:

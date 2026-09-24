@@ -543,6 +543,9 @@ def build_job_rows(
                     "total": job.get("total"),
                     "business_unit_id": job.get("businessUnitId"),
                     "sold_by_id": job.get("soldById"),
+                    # The booking this job came from; null (blank) for a job that
+                    # was not booked, never a placeholder id.
+                    "booking_id": job.get("bookingId"),
                     # Not a contract column; used by run.py to sort deterministically
                     # without re-deriving ints from formatted text.
                     "_sort_key": _sort_key(job.get("id"), appointment_id),

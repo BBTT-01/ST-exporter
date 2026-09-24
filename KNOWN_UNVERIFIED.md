@@ -512,6 +512,20 @@ The contract describes `modified_on` only as "for drift debugging" without
 specifying which entity's timestamp it should reflect. This mapping is a
 reasonable guess, not a confirmed requirement.
 
+## `jobs.booking_id` read from the export feed's `bookingId`
+
+`src/st_exporter/denormalize.py` — `row["booking_id"] = job.get("bookingId")`
+
+Confirmed on the JPM **list/get** endpoints (2026-09-24, Door Serv Pro): every
+job carries a top-level `bookingId`, e.g. job `115409266` → `115382913`, and 15
+of the 200 most recent jobs were non-null. NOT yet confirmed on
+`jpm/v2/tenant/{tenant}/export/jobs`, the change-feed that fills `_raw_jobs` —
+the same list-vs-export gap that left `recall_for_id`/`warranty_id` near-blank
+(see below). `booking_id` stays OUT of `blank_columns.ALL_BLANK_OK`, so a
+whole-column blank on a tenant that does take bookings is reported. **Check on
+the first run after release:** the `jobs` tab should carry `115382913` on job
+`115409266`'s rows.
+
 ## Profit Wizard hosted-parity columns (jobs, technicians, sales.estimates)
 
 `src/st_exporter/denormalize.py`, `src/st_exporter/format.py`, `src/st_exporter/sales.py`,

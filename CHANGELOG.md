@@ -4,6 +4,24 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · `jobs.booking_id` for TrueQuote hosted calibration
+
+### Added: `booking_id` appended as the last `jobs` column
+
+TrueQuote's calibration chain is booking → the jobs it became → their invoice
+totals. The Export Store `jobs` tab had no way to walk the first link, so a
+hosted company could not be calibrated at all. `booking_id` is now appended
+after `sold_by_id`, read straight from the job record's top-level `bookingId`
+("ID of the Booking that resulted in this job", `int64 | null` in ServiceTitan's
+JPM v2 schema). A job that did not come from a booking is blank, never `0` or a
+placeholder; every technician row of a booked job carries the same id.
+
+Appending is additive under `docs/export-contract.md`: **`jobs.v2` is
+unchanged**, every earlier column keeps its name and position, and the
+released `jobs.v2` fixture is left frozen (the generator reports the append and
+writes nothing). Pinned by unit tests instead, per the contract's rule for
+appended columns. Consumers that do not read `booking_id` are unaffected.
+
 ## [Unreleased] · A Google 500 on a Sheets write is retried, not fatal
 
 ### Fixed: one transient Google error no longer reds a whole feed

@@ -59,6 +59,8 @@ JOB_COLUMNS: tuple[str, ...] = (
     "total",
     "business_unit_id",
     "sold_by_id",
+    # APPENDED last for TrueQuote hosted calibration (booking -> jobs -> invoices).
+    "booking_id",
 )
 
 TECHNICIAN_COLUMNS: tuple[str, ...] = (
