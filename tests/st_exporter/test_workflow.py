@@ -31,6 +31,8 @@ def workflow_text() -> str:
         "TRUEQUOTE_OUTBOX_URL",
         "PROFITWIZARD_MACHINE_TOKEN",
         "PROFITWIZARD_OUTBOX_URL",
+        "TRUEQUOTE_BUSINESS_UNIT_ID",
+        "TRUEQUOTE_BOOKING_TIMEZONE",
     ],
 )
 def test_every_lane_secret_is_declared_and_forwarded(workflow_text: str, secret: str) -> None:
@@ -49,7 +51,16 @@ def test_every_lane_secret_is_optional(workflow_text: str) -> None:
     secrets_block = workflow_text.split("jobs:", 1)[0]
     for line in secrets_block.splitlines():
         stripped = line.strip().rstrip(":")
-        if stripped.endswith(("_MACHINE_TOKEN", "_OUTBOX_URL", "_OUTBOX_BASE_URL", "_IMAGE_TOKEN")):
+        if stripped.endswith(
+            (
+                "_MACHINE_TOKEN",
+                "_OUTBOX_URL",
+                "_OUTBOX_BASE_URL",
+                "_IMAGE_TOKEN",
+                "_BUSINESS_UNIT_ID",
+                "_BOOKING_TIMEZONE",
+            )
+        ):
             index = secrets_block.index(line)
             assert "required: false" in secrets_block[index : index + 200], stripped
 

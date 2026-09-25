@@ -64,6 +64,8 @@ def clear_traderated_env(monkeypatch):
             "IMAGE_TOKEN",
         ):
             monkeypatch.delenv(f"{prefix}_{suffix}", raising=False)
+    for name in ("TRUEQUOTE_BUSINESS_UNIT_ID", "TRUEQUOTE_BOOKING_TIMEZONE"):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)

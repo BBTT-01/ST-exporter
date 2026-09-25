@@ -44,6 +44,17 @@ def traderated_env(monkeypatch):
     monkeypatch.setenv("TRADERATED_OUTBOX_BASE_URL", OUTBOX_BASE_URL)
 
 
+def _business_units_route(settings) -> respx.Route:
+    return respx.get(
+        f"{settings.api_base}/settings/v2/tenant/{settings.tenant_id}/business-units"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"id": 12, "name": "Garage Doors", "active": True}], "hasMore": False},
+        )
+    )
+
+
 @pytest.fixture()
 def truequote_env(monkeypatch):
     monkeypatch.setenv("TRUEQUOTE_MACHINE_TOKEN", TQ_TOKEN)
@@ -165,6 +176,7 @@ def test_two_products_drain_in_one_run_against_their_own_endpoints(
     """Ticket 12's headline case. Two apps, two base URLs, two path shapes, two
     result vocabularies — and one ledger, one run, one ServiceTitan client."""
     mock_auth_token(st_settings.auth_url)
+    _business_units_route(st_settings)
     respx.get(f"{st_settings.api_base}/marketing/v2/tenant/{st_settings.tenant_id}/campaigns").mock(
         return_value=httpx.Response(
             200,
@@ -250,6 +262,7 @@ def test_one_dead_lane_does_not_stop_the_other(
 ) -> None:
     """The per-lane isolation requirement, end to end through the real clients."""
     mock_auth_token(st_settings.auth_url)
+    _business_units_route(st_settings)
     booking_route = respx.post(
         f"{st_settings.api_base}/crm/v2/tenant/{st_settings.tenant_id}/booking-provider/77/bookings"
     ).mock(return_value=httpx.Response(200, json={"id": 90210}))
@@ -295,6 +308,7 @@ def test_a_lane_returning_garbage_does_not_stop_the_other(
 ) -> None:
     """Not merely "down": a 200 whose body is not the JSON this exporter reads."""
     mock_auth_token(st_settings.auth_url)
+    _business_units_route(st_settings)
     respx.post(
         f"{st_settings.api_base}/crm/v2/tenant/{st_settings.tenant_id}/booking-provider/77/bookings"
     ).mock(return_value=httpx.Response(200, json={"id": 90210}))
@@ -412,6 +426,7 @@ def test_hosted_bookings_with_no_provider_id_share_one_created_tag(
     runner lists the tenant's tags once, creates `TrueQuote` once, and files every
     booking in the batch under it."""
     mock_auth_token(st_settings.auth_url)
+    units = _business_units_route(st_settings)
     crm = f"{st_settings.api_base}/crm/v2/tenant/{st_settings.tenant_id}"
     tags = respx.get(f"{crm}/booking-provider-tags").mock(
         return_value=httpx.Response(200, json={"data": [], "hasMore": False})
@@ -457,3 +472,10 @@ def test_hosted_bookings_with_no_provider_id_share_one_created_tag(
     assert bookings.call_count == 2
     reported = [json.loads(c.request.content)["booking_id"] for c in tq_report.calls]
     assert reported == ["1", "2"]
+    assert units.call_count == 1
+    posted = [json.loads(c.request.content) for c in bookings.calls]
+    assert [body["businessUnitId"] for body in posted] == [12, 12]
+    assert all(
+        body["start"].endswith("T09:00:00-04:00") or body["start"].endswith("T09:00:00-05:00")
+        for body in posted
+    )

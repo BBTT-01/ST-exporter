@@ -4,6 +4,36 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · TrueQuote bookings arrive schedulable
+
+### Added: `start` and `businessUnitId` on every TrueQuote booking
+
+Booking 115584114 (staging, 2026-09-25) reached ServiceTitan with `start`
+0001-01-01 and no business unit, so a dispatcher had nothing to schedule against
+and it was dismissed within minutes. The TrueQuote lane now adds both
+(`src/st_exporter/outbox/booking_schedule.py`); every other booking field is
+unchanged, and direct mode's `createBookingPayload` sets neither field nor
+`priority`, so nothing else is added.
+
+- **`start`**: the payload's `preferredTime` when it is an ISO 8601 date or
+  datetime still in the future (a naive value is read as tenant-local, a date alone
+  as 09:00 that day); otherwise 09:00 on the next Monday-to-Friday. Written as an
+  ISO datetime with the tenant's offset, in `TRUEQUOTE_BOOKING_TIMEZONE` (an IANA
+  name, optional secret, default `America/New_York`). The exporter knows no tenant
+  time zone of its own, so it is a setting. Free-text `preferredTime` still reaches
+  the office through the summary and falls back to the next business morning.
+- **`businessUnitId`**: `TRUEQUOTE_BUSINESS_UNIT_ID` when set (no lookup),
+  otherwise the lowest-id active unit from `settings/v2/tenant/{t}/business-units`.
+  Resolved once per run and cached, a failure included. It is resolved before the
+  provider tag, so a booking that cannot be scheduled never posts and never creates
+  a tag. A 403 fails the booking with an error naming **Settings -> Business Units
+  (Read)** plus a red Actions annotation; no active unit, a malformed override or an
+  unknown time zone fail it by name too.
+
+Both secrets are optional, declared and forwarded by `export.yml`, and listed on
+the drain job in `docs/examples/connector-export.yml`. No new ServiceTitan scope:
+Business Units read is already on the connector app.
+
 ## [Unreleased] · Invoice-level totals on `accounting.invoices` for TrueQuote hosted calibration
 
 ### Added: `InvoiceSubTotal`, `InvoiceSalesTax`, `InvoiceTotal` appended as the last `accounting.invoices` columns
