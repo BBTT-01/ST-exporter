@@ -6,9 +6,10 @@ Wizard's own direct-CRM implementation:
 - `push_prices`: `lib/crm/index.ts` (`pushToCRM`, ``kind: "push_prices"``)
   enqueues ``{crm_item_id, new_price}`` per item. `lib/crm/servicetitan.ts`'s
   `pushPrices` PATCHes `pricebook/v2/tenant/{id}/services/{id}` when
-  `crm_item_id` starts with ``svc_`` (with that prefix stripped) or
-  `pricebook/v2/tenant/{id}/materials/{id}` otherwise, body ``{"price": ...}``.
-  There is no equipment branch on their side, so there is none here either.
+  `crm_item_id` starts with ``svc_`` (with that prefix stripped); otherwise it
+  is a material or equipment SKU (PW does not store which), so this tries
+  `pricebook/v2/tenant/{id}/materials/{id}` first and falls back to
+  `pricebook/v2/tenant/{id}/equipment/{id}` on a 404, body ``{"price": ...}``.
 
 - `push_estimate`: `app/api/servicetitan/push-estimate/route.ts` enqueues
   ``{crmJobId, name, items: [{skuId, description, quantity, price, total}]}``
@@ -21,6 +22,7 @@ from __future__ import annotations
 from typing import Any
 
 from st_cli.client import ServiceTitanClient
+from st_cli.exceptions import NotFoundError
 from st_exporter.outbox.client import OutboxItem
 
 
@@ -38,9 +40,22 @@ def perform_push_prices(client: ServiceTitanClient, item: OutboxItem) -> str:
 
     is_service = crm_item_id.startswith("svc_")
     actual_id = crm_item_id[len("svc_") :] if is_service else crm_item_id
-    endpoint = "services" if is_service else "materials"
+    body = {"price": new_price}
 
-    client.patch("pricebook", f"{endpoint}/{actual_id}", json_body={"price": new_price})
+    if is_service:
+        client.patch("pricebook", f"services/{actual_id}", json_body=body)
+        return actual_id
+
+    try:
+        client.patch("pricebook", f"materials/{actual_id}", json_body=body)
+    except NotFoundError:
+        try:
+            client.patch("pricebook", f"equipment/{actual_id}", json_body=body)
+        except NotFoundError as exc:
+            raise NotFoundError(
+                f"item {actual_id} not found at pricebook/materials/{actual_id} "
+                f"or pricebook/equipment/{actual_id}"
+            ) from exc
     return actual_id
 
 
