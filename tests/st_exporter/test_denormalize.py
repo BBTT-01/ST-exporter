@@ -1100,3 +1100,47 @@ class TestHostedParityJobColumns:
         row = self._row({"total": 0})
         assert row["total"] == 0
         assert row["total"] is not None
+
+
+class TestBookingIdJobColumn:
+    def _grid_cells(self, *jobs: dict) -> list[str]:
+        from st_exporter.format import JOB_COLUMNS, build_job_grid
+
+        appointments = _cache(
+            *(
+                {"id": job["id"] * 100, "jobId": job["id"], "start": "2026-09-03T09:00:00-05:00"}
+                for job in jobs
+            )
+        )
+        result = build_job_rows(_cache(*jobs), appointments, _cache(), _cache(), _cache())
+        grid = build_job_grid(result.rows)
+        column = JOB_COLUMNS.index("booking_id")
+        return [row[column] for row in grid[1:]]
+
+    def test_populated_from_the_jobs_booking_id(self) -> None:
+        assert self._grid_cells({"id": 115409266, "bookingId": 115382913}) == ["115382913"]
+
+    def test_blank_when_servicetitan_sends_null(self) -> None:
+        assert self._grid_cells({"id": 115493106, "bookingId": None}) == [""]
+
+    def test_blank_when_the_field_is_absent(self) -> None:
+        assert self._grid_cells({"id": 1}) == [""]
+
+    def test_an_unbooked_job_is_never_zero_or_a_placeholder(self) -> None:
+        cells = self._grid_cells(
+            {"id": 1, "bookingId": 115382913},
+            {"id": 2, "bookingId": None},
+            {"id": 3},
+        )
+        assert cells == ["115382913", "", ""]
+        assert "0" not in cells
+
+    def test_every_technician_row_of_a_booked_job_carries_the_booking(self) -> None:
+        jobs = _cache({"id": 1, "bookingId": 115382913})
+        appointments = _cache({"id": 100, "jobId": 1, "start": "2026-09-03T09:00:00-05:00"})
+        assignments = _cache(
+            {"id": 1, "appointmentId": 100, "technicianId": 7, "status": "Active"},
+            {"id": 2, "appointmentId": 100, "technicianId": 8, "status": "Active"},
+        )
+        result = build_job_rows(jobs, appointments, assignments, _cache(), _cache())
+        assert [row["booking_id"] for row in result.rows] == [115382913, 115382913]
