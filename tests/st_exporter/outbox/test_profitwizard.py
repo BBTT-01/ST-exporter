@@ -556,7 +556,8 @@ def _push_prices_item(**overrides) -> OutboxItem:
 class TestPushPrices:
     """Mirrors `ServiceTitanClient.pushPrices` (`lib/crm/servicetitan.ts`):
     a ``svc_``-prefixed `crm_item_id` PATCHes `pricebook/.../services/{id}`
-    with the prefix stripped; anything else PATCHes `.../materials/{id}`."""
+    with the prefix stripped; anything else PATCHes `.../materials/{id}`
+    first and falls back to `.../equipment/{id}` on a 404."""
 
     @respx.mock
     def test_a_service_item_patches_the_services_endpoint(self, st_settings: Settings) -> None:
@@ -591,6 +592,71 @@ class TestPushPrices:
 
         assert st_id == "900"
         assert json.loads(route.calls.last.request.content) == {"price": 12.5}
+
+    @respx.mock
+    def test_a_material_404_falls_back_to_equipment(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        materials_route = respx.patch(
+            f"{st_settings.api_base}/pricebook/v2/tenant/{st_settings.tenant_id}/materials/900"
+        ).mock(return_value=httpx.Response(404, json={"message": "not found"}))
+        equipment_route = respx.patch(
+            f"{st_settings.api_base}/pricebook/v2/tenant/{st_settings.tenant_id}/equipment/900"
+        ).mock(return_value=httpx.Response(200, json={"id": 900, "price": 12.5}))
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            st_id = perform_profitwizard_item(
+                client, _push_prices_item(payload={"crm_item_id": "900", "new_price": 12.5})
+            )
+        finally:
+            client.close()
+
+        assert st_id == "900"
+        assert materials_route.called
+        assert equipment_route.called
+        assert json.loads(equipment_route.calls.last.request.content) == {"price": 12.5}
+
+    @respx.mock
+    def test_both_materials_and_equipment_404_raises_naming_both(
+        self, st_settings: Settings
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.patch(
+            f"{st_settings.api_base}/pricebook/v2/tenant/{st_settings.tenant_id}/materials/900"
+        ).mock(return_value=httpx.Response(404, json={"message": "not found"}))
+        respx.patch(
+            f"{st_settings.api_base}/pricebook/v2/tenant/{st_settings.tenant_id}/equipment/900"
+        ).mock(return_value=httpx.Response(404, json={"message": "not found"}))
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(APIError, match="pricebook/materials/900.*pricebook/equipment/900"):
+                perform_profitwizard_item(
+                    client, _push_prices_item(payload={"crm_item_id": "900", "new_price": 12.5})
+                )
+        finally:
+            client.close()
+
+    @respx.mock
+    def test_a_non_404_material_error_does_not_call_equipment(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.patch(
+            f"{st_settings.api_base}/pricebook/v2/tenant/{st_settings.tenant_id}/materials/900"
+        ).mock(return_value=httpx.Response(500, json={"message": "boom"}))
+        equipment_route = respx.patch(
+            f"{st_settings.api_base}/pricebook/v2/tenant/{st_settings.tenant_id}/equipment/900"
+        ).mock(return_value=httpx.Response(200, json={"id": 900, "price": 12.5}))
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(APIError):
+                perform_profitwizard_item(
+                    client, _push_prices_item(payload={"crm_item_id": "900", "new_price": 12.5})
+                )
+        finally:
+            client.close()
+
+        assert not equipment_route.called
 
     def test_a_missing_crm_item_id_raises(self, st_settings: Settings) -> None:
         client = ServiceTitanClient(st_settings)
