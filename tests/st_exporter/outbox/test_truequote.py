@@ -17,7 +17,13 @@ import respx
 
 from st_cli.client import ServiceTitanClient
 from st_cli.config import Settings
+from st_exporter.outbox.booking_provider import (
+    BOOKING_PROVIDER_TAGS_PERMISSION,
+    BookingProviderTagError,
+    TrueQuoteBookingProvider,
+)
 from st_exporter.outbox.client import OutboxItem
+from st_exporter.outbox.lanes import TrueQuoteLane
 from st_exporter.outbox.truequote import (
     TrueQuoteBookingOutboxClient,
     build_booking_body,
@@ -31,6 +37,26 @@ TOKEN = "tqm_booking_scope"
 
 def _client() -> TrueQuoteBookingOutboxClient:
     return TrueQuoteBookingOutboxClient(BASE, TOKEN)
+
+
+def _crm(settings: Settings) -> str:
+    return f"{settings.api_base}/crm/v2/tenant/{settings.tenant_id}"
+
+
+def _tags_route(settings: Settings, tags: list[dict], has_more: bool = False) -> respx.Route:
+    return respx.get(f"{_crm(settings)}/booking-provider-tags").mock(
+        return_value=httpx.Response(200, json={"data": tags, "hasMore": has_more})
+    )
+
+
+def _hosted_item(n: int) -> OutboxItem:
+    return OutboxItem(
+        id=f"i-{n}",
+        idempotency_key=f"k-{n}",
+        kind="booking",
+        payload={"sessionId": f"s-{n}", "summary": "x"},
+        extra={"booking_provider_id": None},
+    )
 
 
 class TestClaim:
@@ -300,21 +326,59 @@ class TestPerformBooking:
         )
         client = ServiceTitanClient(st_settings)
         try:
-            assert perform_booking(client, item) == "90210"
+            assert perform_booking(client, item, TrueQuoteBookingProvider(client)) == "90210"
         finally:
             client.close()
         assert route.called
 
-    def test_an_item_with_no_provider_id_fails_rather_than_guessing(
+    @respx.mock
+    def test_an_item_with_no_provider_id_posts_under_the_runners_tag(
         self, st_settings: Settings
     ) -> None:
-        item = OutboxItem(id="i", idempotency_key="k", kind="booking", payload={}, extra={})
+        """A Hosted company sends no provider id: the runner's own `TrueQuote`
+        tag is resolved and the booking is filed under it."""
+        mock_auth_token(st_settings.auth_url)
+        _tags_route(st_settings, [{"id": 501, "tagName": "TrueQuote", "active": True}])
+        route = respx.post(f"{_crm(st_settings)}/booking-provider/501/bookings").mock(
+            return_value=httpx.Response(200, json={"id": 4})
+        )
+
+        item = OutboxItem(
+            id="i",
+            idempotency_key="k",
+            kind="booking",
+            payload={"summary": "x"},
+            extra={"booking_provider_id": None},
+        )
         client = ServiceTitanClient(st_settings)
         try:
-            with pytest.raises(ValueError, match="booking_provider_id"):
-                perform_booking(client, item)
+            assert perform_booking(client, item, TrueQuoteBookingProvider(client)) == "4"
         finally:
             client.close()
+        assert route.called
+
+    @respx.mock
+    def test_an_item_that_carries_a_provider_id_never_touches_the_tags(
+        self, st_settings: Settings
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        tags = _tags_route(st_settings, [])
+        respx.post(f"{_crm(st_settings)}/booking-provider/77/bookings").mock(
+            return_value=httpx.Response(200, json={"id": 1})
+        )
+        item = OutboxItem(
+            id="i",
+            idempotency_key="k",
+            kind="booking",
+            payload={"summary": "x"},
+            extra={"booking_provider_id": "77"},
+        )
+        client = ServiceTitanClient(st_settings)
+        try:
+            perform_booking(client, item, TrueQuoteBookingProvider(client))
+        finally:
+            client.close()
+        assert not tags.called
 
     @respx.mock
     def test_the_queued_tenant_id_never_redirects_the_write(self, st_settings: Settings) -> None:
@@ -345,9 +409,241 @@ class TestPerformBooking:
 
         client = ServiceTitanClient(st_settings)
         try:
-            perform_booking(client, item)
+            perform_booking(client, item, TrueQuoteBookingProvider(client))
         finally:
             client.close()
 
         assert route.called
         assert "666666" not in str(route.calls.last.request.url)
+
+
+class TestBookingProviderTag:
+    """The runner owns the `TrueQuote` Booking Provider Tag: found, or created
+    once, and never duplicated."""
+
+    @respx.mock
+    def test_an_existing_tag_is_reused_across_pages_and_never_recreated(
+        self, st_settings: Settings
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        tags = respx.get(f"{_crm(st_settings)}/booking-provider-tags").mock(
+            side_effect=[
+                httpx.Response(
+                    200,
+                    json={"data": [{"id": 10, "tagName": "Website"}], "hasMore": True},
+                ),
+                httpx.Response(
+                    200,
+                    json={"data": [{"id": 105684521, "tagName": "truequote"}], "hasMore": False},
+                ),
+            ]
+        )
+        create = respx.post(f"{_crm(st_settings)}/booking-provider-tags").mock(
+            return_value=httpx.Response(200, json={"id": 999})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            provider = TrueQuoteBookingProvider(client)
+            assert provider.tag_id() == 105684521
+            assert provider.tag_id() == 105684521
+        finally:
+            client.close()
+
+        assert tags.call_count == 2, "both pages read once, then cached for the run"
+        assert [c.request.url.params["page"] for c in tags.calls] == ["1", "2"]
+        assert not create.called
+
+    @respx.mock
+    def test_a_missing_tag_is_created_once_for_a_whole_batch(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        tags = _tags_route(st_settings, [{"id": 10, "tagName": "Website", "active": True}])
+        create = respx.post(f"{_crm(st_settings)}/booking-provider-tags").mock(
+            return_value=httpx.Response(200, json={"id": 777, "tagName": "TrueQuote"})
+        )
+        bookings = respx.post(f"{_crm(st_settings)}/booking-provider/777/bookings").mock(
+            return_value=httpx.Response(200, json={"id": 1})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            lane = TrueQuoteLane(_client(), TrueQuoteBookingProvider(client))
+            for n in range(3):
+                lane.perform(client, _hosted_item(n))
+            lane.close()
+        finally:
+            client.close()
+
+        assert tags.call_count == 1
+        assert create.call_count == 1
+        assert json.loads(create.calls.last.request.content)["tagName"] == "TrueQuote"
+        assert bookings.call_count == 3
+
+    @respx.mock
+    def test_a_name_with_stray_whitespace_still_matches(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        _tags_route(st_settings, [{"id": 42, "tagName": "  TrueQuote ", "active": True}])
+        create = respx.post(f"{_crm(st_settings)}/booking-provider-tags").mock(
+            return_value=httpx.Response(200, json={"id": 999})
+        )
+        client = ServiceTitanClient(st_settings)
+        try:
+            assert TrueQuoteBookingProvider(client).tag_id() == 42
+        finally:
+            client.close()
+        assert not create.called
+
+    @respx.mock
+    def test_the_list_sends_no_active_filter_so_inactive_tags_are_seen(
+        self, st_settings: Settings
+    ) -> None:
+        """BookingProviderTags_GetList documents no `active` parameter, so none is
+        sent; the inactive tag in the answer is refused, not shadowed by a new one."""
+        mock_auth_token(st_settings.auth_url)
+        tags = _tags_route(
+            st_settings,
+            [
+                {"id": 10, "tagName": "Website", "active": True},
+                {"id": 55, "tagName": "TrueQuote", "active": False},
+            ],
+        )
+        create = respx.post(f"{_crm(st_settings)}/booking-provider-tags").mock(
+            return_value=httpx.Response(200, json={"id": 999})
+        )
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(BookingProviderTagError, match="id 55"):
+                TrueQuoteBookingProvider(client).tag_id()
+        finally:
+            client.close()
+        assert "active" not in tags.calls.last.request.url.params
+        assert not create.called
+
+    @respx.mock
+    def test_after_a_403_an_item_with_its_own_provider_id_still_posts(
+        self, st_settings: Settings
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(f"{_crm(st_settings)}/booking-provider-tags").mock(
+            return_value=httpx.Response(403, json={"title": "Scope validation failed"})
+        )
+        direct = respx.post(f"{_crm(st_settings)}/booking-provider/77/bookings").mock(
+            return_value=httpx.Response(200, json={"id": 5})
+        )
+        carried = OutboxItem(
+            id="i-direct",
+            idempotency_key="k-direct",
+            kind="booking",
+            payload={"summary": "x"},
+            extra={"booking_provider_id": "77"},
+        )
+        client = ServiceTitanClient(st_settings)
+        try:
+            provider = TrueQuoteBookingProvider(client)
+            with pytest.raises(BookingProviderTagError):
+                perform_booking(client, _hosted_item(1), provider)
+            assert perform_booking(client, carried, provider) == "5"
+        finally:
+            client.close()
+        assert direct.call_count == 1
+
+    @respx.mock
+    def test_an_inactive_tag_is_refused_rather_than_duplicated(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        _tags_route(st_settings, [{"id": 55, "tagName": "TrueQuote", "active": False}])
+        create = respx.post(f"{_crm(st_settings)}/booking-provider-tags").mock(
+            return_value=httpx.Response(200, json={"id": 999})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(BookingProviderTagError, match="inactive"):
+                TrueQuoteBookingProvider(client).tag_id()
+        finally:
+            client.close()
+        assert not create.called
+
+    @respx.mock
+    def test_a_403_names_the_missing_permission_and_is_asked_only_once(
+        self, st_settings: Settings
+    ) -> None:
+        mock_auth_token(st_settings.auth_url)
+        tags = respx.get(f"{_crm(st_settings)}/booking-provider-tags").mock(
+            return_value=httpx.Response(
+                403,
+                json={
+                    "title": "Scope validation failed. Access token does not have permission "
+                    "to access 'GET /tenant/{tenant}/booking-provider-tags'"
+                },
+            )
+        )
+        bookings = respx.post(url__regex=r".*/booking-provider/.+/bookings").mock(
+            return_value=httpx.Response(200, json={"id": 1})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            provider = TrueQuoteBookingProvider(client)
+            for n in range(2):
+                with pytest.raises(BookingProviderTagError) as caught:
+                    perform_booking(client, _hosted_item(n), provider)
+                assert BOOKING_PROVIDER_TAGS_PERMISSION in str(caught.value)
+                assert "403" in str(caught.value)
+        finally:
+            client.close()
+
+        assert BOOKING_PROVIDER_TAGS_PERMISSION == "CRM -> Booking Provider Tags (Read + Write)"
+        assert tags.call_count == 1
+        assert not bookings.called
+
+    @respx.mock
+    def test_a_403_on_create_names_the_permission_too(self, st_settings: Settings) -> None:
+        """Read granted, Write not: the list works, the create is refused."""
+        mock_auth_token(st_settings.auth_url)
+        _tags_route(st_settings, [])
+        respx.post(f"{_crm(st_settings)}/booking-provider-tags").mock(
+            return_value=httpx.Response(403, json={"title": "Scope validation failed"})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(BookingProviderTagError, match="create") as caught:
+                TrueQuoteBookingProvider(client).tag_id()
+        finally:
+            client.close()
+        assert BOOKING_PROVIDER_TAGS_PERMISSION in str(caught.value)
+
+    @respx.mock
+    def test_a_non_403_failure_is_not_blamed_on_the_permission(self, st_settings: Settings) -> None:
+        mock_auth_token(st_settings.auth_url)
+        respx.get(f"{_crm(st_settings)}/booking-provider-tags").mock(
+            return_value=httpx.Response(404, json={"title": "nope"})
+        )
+
+        client = ServiceTitanClient(st_settings)
+        try:
+            with pytest.raises(BookingProviderTagError) as caught:
+                TrueQuoteBookingProvider(client).tag_id()
+        finally:
+            client.close()
+        assert BOOKING_PROVIDER_TAGS_PERMISSION not in str(caught.value)
+
+    @respx.mock
+    def test_the_tag_list_is_logged_as_evidence(self, st_settings: Settings, caplog) -> None:
+        """Whether the booking provider id IS the tag id is unconfirmed live; the
+        first resolution's log line is what settles it."""
+        mock_auth_token(st_settings.auth_url)
+        _tags_route(
+            st_settings,
+            [{"id": 10, "tagName": "Website"}, {"id": 105684521, "tagName": "TrueQuote"}],
+        )
+        client = ServiceTitanClient(st_settings)
+        try:
+            with caplog.at_level(logging.INFO, logger="st_exporter"):
+                TrueQuoteBookingProvider(client).tag_id()
+        finally:
+            client.close()
+        assert any(
+            "10='Website'" in r.getMessage() and "105684521='TrueQuote'" in r.getMessage()
+            for r in caplog.records
+        )

@@ -26,6 +26,7 @@ from typing import Protocol
 from st_cli.client import ServiceTitanClient
 from st_exporter.logging_setup import logger
 from st_exporter.outbox.actions import perform_item
+from st_exporter.outbox.booking_provider import TrueQuoteBookingProvider
 from st_exporter.outbox.campaign import ReferralCampaign
 from st_exporter.outbox.client import OutboxItem, TradeRatedOutboxClient
 from st_exporter.outbox.profitwizard import ProfitWizardOutboxClient, perform_profitwizard_item
@@ -112,20 +113,30 @@ class TrueQuoteLane:
     ``booking_outbox`` token here and the ``image_upload`` token in
     ``TRADERATED_IMAGE_TOKEN`` are two separate secrets that happen to share a
     base URL.
+
+    One :class:`TrueQuoteBookingProvider` is held for the lane's whole drain,
+    exactly as TradeRated's lane holds its campaign: the tag is resolved on the
+    first booking that carries no provider id, and never again this run.
     """
 
-    def __init__(self, client: TrueQuoteBookingOutboxClient, product: str = TRUEQUOTE) -> None:
+    def __init__(
+        self,
+        client: TrueQuoteBookingOutboxClient,
+        provider: TrueQuoteBookingProvider,
+        product: str = TRUEQUOTE,
+    ) -> None:
         self._client = client
+        self._provider = provider
         # See TradeRatedLane.__init__ — a borrowed shape keeps its own identity.
         self.product = product
 
     @classmethod
     def build(cls, credentials: LaneCredentials, st_client: ServiceTitanClient) -> "TrueQuoteLane":
-        del st_client  # this lane resolves nothing up front
         return cls(
             TrueQuoteBookingOutboxClient(
                 credentials.base_url, credentials.machine_token, credentials.routes
             ),
+            TrueQuoteBookingProvider(st_client),
             credentials.product,
         )
 
@@ -133,7 +144,7 @@ class TrueQuoteLane:
         return self._client.claim(limit=limit)
 
     def perform(self, client: ServiceTitanClient, item: OutboxItem) -> str:
-        return perform_booking(client, item)
+        return perform_booking(client, item, self._provider)
 
     def report_success(self, item: OutboxItem, st_id: str) -> None:
         self._client.report_success(item, st_id)
