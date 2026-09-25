@@ -70,8 +70,7 @@ INVOICE_COLUMNS: tuple[str, ...] = (
     "SkuId",
     "SkuName",
     "BusinessUnitId",
-    # APPENDED last for TrueQuote hosted calibration: invoice-level, tax-inclusive
-    # totals, repeated on every line of the same invoice (dedupe by InvoiceId).
+    # APPENDED last for TrueQuote hosted calibration; invoice-level, repeated per line.
     "InvoiceSubTotal",
     "InvoiceSalesTax",
     "InvoiceTotal",

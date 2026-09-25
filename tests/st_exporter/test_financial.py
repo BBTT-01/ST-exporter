@@ -387,8 +387,6 @@ class TestInvoiceTotalsColumns:
         assert _rows(grid)[0]["InvoiceSalesTax"] == "0"
 
     def test_lines_summing_below_the_total_are_represented_faithfully(self) -> None:
-        # Tax lives only at invoice level, so the lines' ItemTotals sum to the
-        # pre-tax figure. Both numbers must reach the Sheet unaltered.
         grid = build_invoice_grid(
             [
                 {
