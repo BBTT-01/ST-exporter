@@ -11,6 +11,10 @@ silent change.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+from st_exporter.contracts import appended_columns
 from st_exporter.financial import (
     BUSINESS_UNIT_COLUMNS,
     CONTRACT_VERSION,
@@ -287,3 +291,121 @@ class TestJobCosts:
         first = build_job_cost_grid([{"JobNumber": "A", "TotalCosts": 1}])
         second = build_job_cost_grid([{"TotalCosts": 1, "JobNumber": "A"}])
         assert first == second
+
+
+_INVOICE_COLUMNS_BEFORE_TOTALS = (
+    "JobId",
+    "ReferenceNumber",
+    "ItemType",
+    "ItemTotal",
+    "ItemCost",
+    "ItemTotalCost",
+    "ItemQuantity",
+    "InvoiceId",
+    "InvoiceDate",
+    "SkuId",
+    "SkuName",
+    "BusinessUnitId",
+)
+
+_TOTALS = ("InvoiceSubTotal", "InvoiceSalesTax", "InvoiceTotal")
+
+
+class TestInvoiceTotalsColumns:
+    def test_the_three_totals_are_the_last_columns_in_order(self) -> None:
+        assert INVOICE_COLUMNS[-3:] == _TOTALS
+        assert all(INVOICE_COLUMNS.count(column) == 1 for column in _TOTALS)
+
+    def test_every_earlier_column_keeps_its_name_and_position(self) -> None:
+        assert INVOICE_COLUMNS[:-3] == _INVOICE_COLUMNS_BEFORE_TOTALS
+
+    def test_the_append_is_pure_so_the_contract_version_stays_financial_v1(self) -> None:
+        assert CONTRACT_VERSION == "financial.v1"
+        assert appended_columns(_INVOICE_COLUMNS_BEFORE_TOTALS, INVOICE_COLUMNS) == list(_TOTALS)
+
+    def test_the_released_fixture_stays_frozen_without_the_totals(self) -> None:
+        fixture = (
+            Path(__file__).resolve().parents[2]
+            / "contracts/fixtures/financial.v1/accounting.invoices.json"
+        )
+        assert tuple(json.loads(fixture.read_text())["columns"]) == _INVOICE_COLUMNS_BEFORE_TOTALS
+
+    def test_totals_come_from_the_invoice_record_and_repeat_on_every_line(self) -> None:
+        grid = build_invoice_grid(
+            [
+                {
+                    "id": 500,
+                    "jobId": 7,
+                    "subTotal": "400.00",
+                    "salesTax": "33.00",
+                    "total": "433.00",
+                    "items": [
+                        {"type": "Material", "total": 100},
+                        {"type": "Service", "total": 300},
+                    ],
+                }
+            ]
+        )
+        assert [tuple(r[c] for c in _TOTALS) for r in _rows(grid)] == [
+            ("400.00", "33.00", "433.00"),
+            ("400.00", "33.00", "433.00"),
+        ]
+
+    def test_each_invoice_carries_its_own_totals(self) -> None:
+        grid = build_invoice_grid(
+            [
+                {"id": 1, "jobId": 7, "total": 10, "items": [{"type": "Service"}]},
+                {"id": 2, "jobId": 7, "total": 20, "items": [{"type": "Service"}]},
+            ]
+        )
+        assert [(r["InvoiceId"], r["InvoiceTotal"]) for r in _rows(grid)] == [
+            ("1", "10"),
+            ("2", "20"),
+        ]
+
+    def test_blank_when_the_invoice_record_lacks_them_never_zero(self) -> None:
+        grid = build_invoice_grid(
+            [
+                {"id": 1, "jobId": 2, "items": [{"type": "Service"}]},
+                {
+                    "id": 3,
+                    "jobId": 4,
+                    "subTotal": None,
+                    "salesTax": None,
+                    "total": None,
+                    "items": [{"type": "Service"}],
+                },
+            ]
+        )
+        cells = [r[c] for r in _rows(grid) for c in _TOTALS]
+        assert cells == [""] * 6
+
+    def test_a_genuine_zero_tax_stays_zero(self) -> None:
+        grid = build_invoice_grid(
+            [{"id": 1, "jobId": 2, "salesTax": 0, "items": [{"type": "Service"}]}]
+        )
+        assert _rows(grid)[0]["InvoiceSalesTax"] == "0"
+
+    def test_lines_summing_below_the_total_are_represented_faithfully(self) -> None:
+        # Tax lives only at invoice level, so the lines' ItemTotals sum to the
+        # pre-tax figure. Both numbers must reach the Sheet unaltered.
+        grid = build_invoice_grid(
+            [
+                {
+                    "id": 500,
+                    "jobId": 7,
+                    "subTotal": "1000.00",
+                    "salesTax": "82.50",
+                    "total": "1082.50",
+                    "items": [
+                        {"type": "Equipment", "total": "850.00"},
+                        {"type": "Service", "total": "150.00"},
+                    ],
+                }
+            ]
+        )
+        rows = _rows(grid)
+        assert sum(float(r["ItemTotal"]) for r in rows) == 1000.0
+        assert {r["InvoiceTotal"] for r in rows} == {"1082.50"}
+        assert {r["InvoiceSubTotal"] for r in rows} == {"1000.00"}
+        assert {r["InvoiceSalesTax"] for r in rows} == {"82.50"}

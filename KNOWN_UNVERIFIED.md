@@ -512,6 +512,24 @@ The contract describes `modified_on` only as "for drift debugging" without
 specifying which entity's timestamp it should reflect. This mapping is a
 reasonable guess, not a confirmed requirement.
 
+## `accounting.invoices` invoice totals read from `subTotal`/`salesTax`/`total`
+
+`src/st_exporter/financial.py` — `_invoice_item_row` maps `InvoiceSubTotal`,
+`InvoiceSalesTax`, `InvoiceTotal` from the invoice record's `subTotal`,
+`salesTax`, `total`.
+
+Confirmed only against the public generated Accounting v2 OpenAPI schema
+(`Accounting.V2.InvoiceResponse`, decimal strings), not a live tenant. The
+read-only probe of `accounting/v2/.../invoices` on Door Serv Pro was written but
+NOT run (2026-09-24), so it is still owed: **do Door Serv Pro invoices carry a
+non-zero `salesTax`, and does `sum(ItemTotal)` fall below `total` on them?** If
+tax is always `0` there, hosted and direct calibration agree either way and the
+columns are merely correct; if it is non-zero, these columns are what make them
+agree. None of the three is in `blank_columns.ALL_BLANK_OK`, so a whole-column
+blank on the first run after release is reported. **Check on that run:** the
+three columns are populated and `InvoiceTotal` = `InvoiceSubTotal` +
+`InvoiceSalesTax` on a sample of invoices.
+
 ## `jobs.booking_id` read from the export feed's `bookingId`
 
 `src/st_exporter/denormalize.py` — `row["booking_id"] = job.get("bookingId")`
