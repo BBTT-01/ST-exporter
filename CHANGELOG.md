@@ -4,6 +4,30 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Invoice-level totals on `accounting.invoices` for TrueQuote hosted calibration
+
+### Added: `InvoiceSubTotal`, `InvoiceSalesTax`, `InvoiceTotal` appended as the last `accounting.invoices` columns
+
+TrueQuote's direct-mode calibration reconciles on the tax-inclusive invoice
+`total`. The hosted path could only sum `ItemTotal`, which is pre-tax: ServiceTitan
+keeps sales tax at invoice level (`InvoiceItemResponse` has no per-line tax), so
+the lines of a taxed invoice sum BELOW its total. The exporter already fetched
+the whole invoice record from `accounting/v2/tenant/{t}/invoices` and dropped
+`subTotal`, `salesTax` and `total` in `_invoice_item_row`. They are now appended,
+in that order, after `BusinessUnitId`. No new ServiceTitan permission is needed.
+
+The values are invoice-level and **repeat on every line row of the same
+invoice**: a reader must dedupe by `InvoiceId` before summing. Money rules
+apply: blank when the record lacks the field or sends null, never `0`; a genuine
+`0` tax stays `"0"`. An invoice with no items still writes no rows, so its total
+is not visible on this tab (known gap, unchanged).
+
+Appending is additive under `docs/export-contract.md`: **`financial.v1` is
+unchanged**, every earlier column keeps its name and position, and the released
+`financial.v1/accounting.invoices` fixture is left frozen (the generator reports
+the append and writes nothing). Pinned by unit tests instead. Profit Wizard reads
+columns by name and is unaffected.
+
 ## [Unreleased] · The runner owns TrueQuote's booking provider
 
 ### Added: find-or-create the `TrueQuote` Booking Provider Tag

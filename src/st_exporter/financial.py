@@ -30,7 +30,11 @@ tab                          columns Profit Wizard reads
 
 Columns beyond those are additive: Profit Wizard looks columns up by name and
 ignores the rest, so the few extras carried here (invoice id, sku, dispatch time)
-cost nothing and save a second ticket when someone needs them.
+cost nothing and save a second ticket when someone needs them. The last three
+``accounting.invoices`` columns — ``InvoiceSubTotal``, ``InvoiceSalesTax``,
+``InvoiceTotal`` — are INVOICE-level, read by TrueQuote's hosted calibration, and
+repeat on every line of the same invoice: summing them across lines multiplies
+the invoice by its line count, so a reader dedupes by ``InvoiceId`` first.
 
 The rules that are easiest to break, and are therefore enforced here in one place:
 
@@ -66,6 +70,10 @@ INVOICE_COLUMNS: tuple[str, ...] = (
     "SkuId",
     "SkuName",
     "BusinessUnitId",
+    # APPENDED last for TrueQuote hosted calibration; invoice-level, repeated per line.
+    "InvoiceSubTotal",
+    "InvoiceSalesTax",
+    "InvoiceTotal",
 )
 
 #: `payroll.timesheets` — one row per timesheet segment, as returned by
@@ -119,6 +127,9 @@ _MONEY_COLUMNS: frozenset[str] = frozenset(
         "ItemCost",
         "ItemTotalCost",
         "ItemQuantity",
+        "InvoiceSubTotal",
+        "InvoiceSalesTax",
+        "InvoiceTotal",
         "MaterialEquipmentPurchaseOrderCosts",
         "MaterialTotals",
         "EquipmentCosts",
@@ -217,6 +228,9 @@ def _invoice_item_row(
         "SkuId": _sku(item, "id", "skuId"),
         "SkuName": _sku(item, "name", "skuName"),
         "BusinessUnitId": _ref_id(record, "businessUnit", "businessUnitId"),
+        "InvoiceSubTotal": _money(record.get("subTotal")),
+        "InvoiceSalesTax": _money(record.get("salesTax")),
+        "InvoiceTotal": _money(record.get("total")),
     }
 
 
