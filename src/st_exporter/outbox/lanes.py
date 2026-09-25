@@ -27,6 +27,11 @@ from st_cli.client import ServiceTitanClient
 from st_exporter.logging_setup import logger
 from st_exporter.outbox.actions import perform_item
 from st_exporter.outbox.booking_provider import TrueQuoteBookingProvider
+from st_exporter.outbox.booking_schedule import (
+    TrueQuoteBookingSchedule,
+    TrueQuoteBusinessUnit,
+    booking_settings,
+)
 from st_exporter.outbox.campaign import ReferralCampaign
 from st_exporter.outbox.client import OutboxItem, TradeRatedOutboxClient
 from st_exporter.outbox.profitwizard import ProfitWizardOutboxClient, perform_profitwizard_item
@@ -116,27 +121,35 @@ class TrueQuoteLane:
 
     One :class:`TrueQuoteBookingProvider` is held for the lane's whole drain,
     exactly as TradeRated's lane holds its campaign: the tag is resolved on the
-    first booking that carries no provider id, and never again this run.
+    first booking that carries no provider id, and never again this run. The
+    business unit is held the same way.
     """
 
     def __init__(
         self,
         client: TrueQuoteBookingOutboxClient,
         provider: TrueQuoteBookingProvider,
+        business_unit: TrueQuoteBusinessUnit,
+        schedule: TrueQuoteBookingSchedule | None = None,
         product: str = TRUEQUOTE,
     ) -> None:
         self._client = client
         self._provider = provider
+        self._business_unit = business_unit
+        self._schedule = schedule or TrueQuoteBookingSchedule()
         # See TradeRatedLane.__init__ — a borrowed shape keeps its own identity.
         self.product = product
 
     @classmethod
     def build(cls, credentials: LaneCredentials, st_client: ServiceTitanClient) -> "TrueQuoteLane":
+        business_unit_override, timezone_name = booking_settings()
         return cls(
             TrueQuoteBookingOutboxClient(
                 credentials.base_url, credentials.machine_token, credentials.routes
             ),
             TrueQuoteBookingProvider(st_client),
+            TrueQuoteBusinessUnit(st_client, business_unit_override),
+            TrueQuoteBookingSchedule(timezone_name),
             credentials.product,
         )
 
@@ -144,7 +157,7 @@ class TrueQuoteLane:
         return self._client.claim(limit=limit)
 
     def perform(self, client: ServiceTitanClient, item: OutboxItem) -> str:
-        return perform_booking(client, item, self._provider)
+        return perform_booking(client, item, self._provider, self._business_unit, self._schedule)
 
     def report_success(self, item: OutboxItem, st_id: str) -> None:
         self._client.report_success(item, st_id)

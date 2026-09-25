@@ -22,6 +22,7 @@ from st_exporter.outbox.booking_provider import (
     BookingProviderTagError,
     TrueQuoteBookingProvider,
 )
+from st_exporter.outbox.booking_schedule import TrueQuoteBookingSchedule, TrueQuoteBusinessUnit
 from st_exporter.outbox.client import OutboxItem
 from st_exporter.outbox.lanes import TrueQuoteLane
 from st_exporter.outbox.truequote import (
@@ -46,6 +47,14 @@ def _crm(settings: Settings) -> str:
 def _tags_route(settings: Settings, tags: list[dict], has_more: bool = False) -> respx.Route:
     return respx.get(f"{_crm(settings)}/booking-provider-tags").mock(
         return_value=httpx.Response(200, json={"data": tags, "hasMore": has_more})
+    )
+
+
+def _perform(
+    client: ServiceTitanClient, item: OutboxItem, provider: TrueQuoteBookingProvider
+) -> str:
+    return perform_booking(
+        client, item, provider, TrueQuoteBusinessUnit(client, "7"), TrueQuoteBookingSchedule()
     )
 
 
@@ -326,7 +335,7 @@ class TestPerformBooking:
         )
         client = ServiceTitanClient(st_settings)
         try:
-            assert perform_booking(client, item, TrueQuoteBookingProvider(client)) == "90210"
+            assert _perform(client, item, TrueQuoteBookingProvider(client)) == "90210"
         finally:
             client.close()
         assert route.called
@@ -352,7 +361,7 @@ class TestPerformBooking:
         )
         client = ServiceTitanClient(st_settings)
         try:
-            assert perform_booking(client, item, TrueQuoteBookingProvider(client)) == "4"
+            assert _perform(client, item, TrueQuoteBookingProvider(client)) == "4"
         finally:
             client.close()
         assert route.called
@@ -375,7 +384,7 @@ class TestPerformBooking:
         )
         client = ServiceTitanClient(st_settings)
         try:
-            perform_booking(client, item, TrueQuoteBookingProvider(client))
+            _perform(client, item, TrueQuoteBookingProvider(client))
         finally:
             client.close()
         assert not tags.called
@@ -409,7 +418,7 @@ class TestPerformBooking:
 
         client = ServiceTitanClient(st_settings)
         try:
-            perform_booking(client, item, TrueQuoteBookingProvider(client))
+            _perform(client, item, TrueQuoteBookingProvider(client))
         finally:
             client.close()
 
@@ -467,7 +476,9 @@ class TestBookingProviderTag:
 
         client = ServiceTitanClient(st_settings)
         try:
-            lane = TrueQuoteLane(_client(), TrueQuoteBookingProvider(client))
+            lane = TrueQuoteLane(
+                _client(), TrueQuoteBookingProvider(client), TrueQuoteBusinessUnit(client, "7")
+            )
             for n in range(3):
                 lane.perform(client, _hosted_item(n))
             lane.close()
@@ -541,8 +552,8 @@ class TestBookingProviderTag:
         try:
             provider = TrueQuoteBookingProvider(client)
             with pytest.raises(BookingProviderTagError):
-                perform_booking(client, _hosted_item(1), provider)
-            assert perform_booking(client, carried, provider) == "5"
+                _perform(client, _hosted_item(1), provider)
+            assert _perform(client, carried, provider) == "5"
         finally:
             client.close()
         assert direct.call_count == 1
@@ -586,7 +597,7 @@ class TestBookingProviderTag:
             provider = TrueQuoteBookingProvider(client)
             for n in range(2):
                 with pytest.raises(BookingProviderTagError) as caught:
-                    perform_booking(client, _hosted_item(n), provider)
+                    _perform(client, _hosted_item(n), provider)
                 assert BOOKING_PROVIDER_TAGS_PERMISSION in str(caught.value)
                 assert "403" in str(caught.value)
         finally:

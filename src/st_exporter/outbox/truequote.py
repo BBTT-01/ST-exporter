@@ -46,12 +46,14 @@ and answers ``status: "duplicate"`` with a 200.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
 from st_cli.client import ServiceTitanClient
 from st_exporter.outbox.booking_provider import TrueQuoteBookingProvider
+from st_exporter.outbox.booking_schedule import TrueQuoteBookingSchedule, TrueQuoteBusinessUnit
 from st_exporter.outbox.client import OutboxItem, drop_unidentified
 from st_exporter.outbox.routes import TRUEQUOTE_ROUTES, LaneRoutes
 
@@ -138,6 +140,9 @@ def perform_booking(
     client: ServiceTitanClient,
     item: OutboxItem,
     provider: TrueQuoteBookingProvider,
+    business_unit: TrueQuoteBusinessUnit,
+    schedule: TrueQuoteBookingSchedule,
+    now: datetime | None = None,
 ) -> str:
     """Create the ServiceTitan booking ``item`` describes; return its id.
 
@@ -153,10 +158,16 @@ def perform_booking(
     company the push happens on this runner instead. Forwarding the payload
     untouched would post camelCase junk and lose every phone number, which is
     the same mistake `referral_lead` made on 2026-09-08.
-    """
-    provider_id = item.extra.get("booking_provider_id") or provider.tag_id()
 
+    The runner adds ``start`` and ``businessUnitId`` (``booking_schedule.py``),
+    resolved before the provider tag so a booking that cannot be scheduled never
+    creates a tag or posts.
+    """
     body = build_booking_body(item.payload)
+    body["start"] = schedule.start(item.payload, now or datetime.now(timezone.utc))
+    body["businessUnitId"] = business_unit.unit_id()
+
+    provider_id = item.extra.get("booking_provider_id") or provider.tag_id()
     created = client.post("crm", f"booking-provider/{provider_id}/bookings", json_body=body)
     return str(created["id"])
 

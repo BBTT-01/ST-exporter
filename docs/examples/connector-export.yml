@@ -426,5 +426,9 @@ jobs:
       TRADERATED_OUTBOX_BASE_URL: ${{ secrets.PLATFORM_OUTBOX_URL }}
       TRUEQUOTE_MACHINE_TOKEN: ${{ secrets.TRUEQUOTE_MACHINE_TOKEN }}
       TRUEQUOTE_OUTBOX_URL: ${{ secrets.TRUEQUOTE_OUTBOX_URL }}
+      # Optional. Unset = the tenant's lowest-id active business unit, and
+      # bookings requested for 09:00 America/New_York on the next business day.
+      TRUEQUOTE_BUSINESS_UNIT_ID: ${{ secrets.TRUEQUOTE_BUSINESS_UNIT_ID }}
+      TRUEQUOTE_BOOKING_TIMEZONE: ${{ secrets.TRUEQUOTE_BOOKING_TIMEZONE }}
       PROFITWIZARD_MACHINE_TOKEN: ${{ secrets.PROFITWIZARD_MACHINE_TOKEN }}
       PROFITWIZARD_OUTBOX_URL: ${{ secrets.PROFITWIZARD_OUTBOX_URL }}

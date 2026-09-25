@@ -198,6 +198,13 @@ on:
         required: false
       TRUEQUOTE_OUTBOX_URL:
         required: false
+      # Optional TrueQuote booking settings. The business unit every booking is
+      # filed under (default: the lowest-id active unit) and the IANA zone its
+      # requested start is written in (default America/New_York).
+      TRUEQUOTE_BUSINESS_UNIT_ID:
+        required: false
+      TRUEQUOTE_BOOKING_TIMEZONE:
+        required: false
       PROFITWIZARD_MACHINE_TOKEN:
         required: false
       PROFITWIZARD_OUTBOX_URL:
@@ -480,6 +487,8 @@ jobs:
           TRADERATED_OUTBOX_BASE_URL: ${{ secrets.TRADERATED_OUTBOX_BASE_URL }}
           TRUEQUOTE_MACHINE_TOKEN: ${{ secrets.TRUEQUOTE_MACHINE_TOKEN }}
           TRUEQUOTE_OUTBOX_URL: ${{ secrets.TRUEQUOTE_OUTBOX_URL }}
+          TRUEQUOTE_BUSINESS_UNIT_ID: ${{ secrets.TRUEQUOTE_BUSINESS_UNIT_ID }}
+          TRUEQUOTE_BOOKING_TIMEZONE: ${{ secrets.TRUEQUOTE_BOOKING_TIMEZONE }}
           PROFITWIZARD_MACHINE_TOKEN: ${{ secrets.PROFITWIZARD_MACHINE_TOKEN }}
           PROFITWIZARD_OUTBOX_URL: ${{ secrets.PROFITWIZARD_OUTBOX_URL }}
           TRUEQUOTE_IMAGE_TOKEN: ${{ secrets.TRUEQUOTE_IMAGE_TOKEN }}

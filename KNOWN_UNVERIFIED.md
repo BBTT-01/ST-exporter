@@ -929,6 +929,30 @@ The wire format was derived by READING TrueQuote's receiving route
   image, and whether real assets ever exceed the 8 MiB cap are all unconfirmed.
 
 
+## TrueQuote booking `start` and `businessUnitId` — shapes not yet seen live
+
+`src/st_exporter/outbox/booking_schedule.py`
+
+- **ServiceTitan accepts an offset datetime for `start`** (`2026-09-28T09:00:00-04:00`)
+  and treats it as the requested slot. The CRM v2 booking schema types it
+  `date-time`; no booking carrying one has been posted to a real tenant yet.
+- **The business unit list reads `id` / `name` / `active`** and paging is the
+  usual `hasMore` envelope, as `feeds/reference.py` already assumes. "Lowest active
+  id" is a stand-in for "the tenant's default unit": ServiceTitan exposes no default
+  flag, so a multi-unit contractor should set `TRUEQUOTE_BUSINESS_UNIT_ID`.
+- **No tenant time zone is read.** The business-unit record carries none that this
+  repo knows of, so `TRUEQUOTE_BOOKING_TIMEZONE` (default America/New_York) stands
+  in. A contractor outside Eastern time who leaves it unset gets bookings requested
+  for 09:00 Eastern.
+- **TrueQuote sends no structured preferred slot today.** `preferredTime` is free
+  text (`/api/v1/lead` caps it at 200 chars) and the widget's booking modal does not
+  collect it, so every booking currently takes the next-business-morning fallback.
+  The runner honours `preferredTime` once TrueQuote sends it as ISO 8601.
+- **Whether `start` + `businessUnitId` keep a booking from being dismissed** is the
+  contractor's workflow, not a ServiceTitan rule; 115584114 was dismissed by a
+  person. What would settle both: the next staging booking read back through
+  `booking-provider/{id}/bookings/{bookingId}`.
+
 ## Three outbox path shapes — confirmed, not a bug to reconcile
 
 `src/st_exporter/outbox/routes.py`
