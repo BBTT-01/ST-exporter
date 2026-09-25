@@ -73,6 +73,18 @@ appended columns. Consumers that do not read `booking_id` are unaffected.
 
 ## [Unreleased] · A Google 500 on a Sheets write is retried, not fatal
 
+### Fixed: `payroll.timesheets` scope hint named a Developer Portal row that doesn't exist
+
+`TAB_PERMISSIONS["payroll.timesheets"]` told a tenant to grant "Payroll ->
+Timesheets", but the Developer Portal has no such row: the endpoint
+`payroll/v2/tenant/{t}/jobs/{jobId}/timesheets` is actually granted by
+"Payroll -> Jobs" (Read), which shows up under a tenant's Has Access To as
+"Payroll Jobs". The hint now says `Payroll -> Jobs (Read); the Developer
+Portal has no Timesheets row (plus JPM -> Jobs, to list the completed jobs)`.
+`reporting.jobCosts`'s hint now also names both required rows explicitly:
+`Reporting -> Report Categories (Read) and Reports within the category
+(Read)`.
+
 ### Fixed: one transient Google error no longer reds a whole feed
 
 Pro Garage Doors run 35248585567 fetched its entire pricebook cleanly — 9917
