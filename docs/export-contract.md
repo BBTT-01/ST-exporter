@@ -39,6 +39,7 @@ beside `exporter_version`.
 | `pricebook` | **`pricebook.v2`** | `pricebook.services`, `pricebook.equipment`, `pricebook.materials`, `pricebook.categories` |
 | `financial` | **`financial.v1`** | `accounting.invoices`, `payroll.timesheets`, `settings.businessUnits`, `reporting.jobCosts` |
 | `sales` | **`sales.v1`** | `sales.estimates` |
+| `pricebook_bom` | **`pricebook_bom.v1`** | `pricebook.serviceMaterials`, `pricebook.serviceEquipment`, `pricebook.equipmentMaterials` |
 
 The source of truth is `src/st_exporter/contracts.py`, and
 `contracts/fixtures/manifest.json` carries the same numbers in machine-readable
@@ -119,7 +120,7 @@ honestly is worse than no column at all:
 | Not exported | Why |
 |---|---|
 | `externalData` | An arbitrary key/value bag any other integration can write to this tenant's SKUs — the one field here that could plausibly hold a token. The Export Store is not the place to find that out. |
-| `serviceMaterials`, `serviceEquipment`, `equipmentMaterials` | A bill of materials, `{skuId, quantity}` per entry. A CSV of sku ids would look like a usable BOM with every quantity silently dropped. It needs its own tab at its own grain. |
+| `serviceMaterials`, `serviceEquipment`, `equipmentMaterials` | A bill of materials, `{skuId, quantity}` per entry. A CSV of sku ids would look like a usable BOM with every quantity silently dropped, so it is not a column here: it has its own tabs at its own grain, under `pricebook_bom.v1` (see "Why the bill of materials has its own version"). |
 | `recommendations`, `upgrades` | Cross-sell links; same objection, no costing value. |
 | `subcategories` | A recursive tree. `parent_id` already carries every edge in it, one row at a time. |
 
@@ -145,6 +146,32 @@ than joining `financial.v1` — it is a wholly new tab, and a tab added to an
 already-published contract version is refused by
 `scripts/gen_contract_fixtures.py` (see that file). Which run schedule refreshes
 a tab and what version a consumer pins its reader against are independent.
+
+### Why the bill of materials has its own version
+
+`pricebook.serviceMaterials`, `pricebook.serviceEquipment` and
+`pricebook.equipmentMaterials` are one row per `{skuId, quantity}` entry in the
+parent item's ServiceTitan list — columns `parent_st_id, sku_id, quantity`,
+joined to the item tabs on `sku_id = st_id`. `parent_st_id` is a service id on the
+two `service*` tabs and an equipment id on `pricebook.equipmentMaterials`. They
+exist because `Pricebook.V2.ServiceResponse` has no cost field: on a flat-rate
+price book a service's material cost is `sum(material.cost x quantity)` over its
+links, and without them a consumer sees a service's hours and price but never
+what it costs to deliver.
+
+They are wholly new tabs, so — exactly like `sales.estimates` — they carry their
+own version rather than joining the published `pricebook.v2`, and are written on
+the `pricebook` feed's cadence from the payloads it already fetches. Two rules a
+consumer needs:
+
+- **A link tab is only as complete as its parent.** It is written only when the
+  parent item tab was read in full the same run, and otherwise keeps its previous
+  contents and `_meta` row. So compare its `_meta.last_run_at` with the parent
+  tab's before trusting an absence: a service with no rows here has no links only
+  if both were refreshed by the same run.
+- **No row key.** No sku was seen twice on one parent on a live tenant, but that
+  is evidence rather than a documented rule, so a repeat is two rows. Sum
+  `quantity` per `(parent_st_id, sku_id)` rather than assuming uniqueness.
 
 ### A blank `contract_version`
 
@@ -280,6 +307,8 @@ contracts/fixtures/pricebook.v2/…          (equipment, materials, categories)
 contracts/fixtures/financial.v1/accounting.invoices.json
 contracts/fixtures/financial.v1/…          (timesheets, businessUnits, jobCosts)
 contracts/fixtures/sales.v1/sales.estimates.json
+contracts/fixtures/pricebook_bom.v1/pricebook.serviceMaterials.json
+contracts/fixtures/pricebook_bom.v1/…     (serviceEquipment, equipmentMaterials)
 ```
 
 **Format is JSON**, because three of the four codebases are TypeScript and one is
@@ -383,7 +412,11 @@ are one careless edit from going wrong:
 - `job_number` **populated**, from `jobNumber`; the regression that started all this;
 - a customer whose phone/email are in ServiceTitan's array form, not the scalars;
 - a report row **dropped** for having no `JobNumber`, and an item **dropped** for
-  having no id.
+  having no id;
+- on the bill-of-materials tabs, a **fractional `quantity`** beside a **null**
+  one (blank, never `0`), an entry **dropped** for having no `skuId` and one
+  dropped for not being an object, and a parent with **no id** whose links are
+  dropped with it.
 
 ## How a consumer verifies itself — without vendoring a copy that can drift
 

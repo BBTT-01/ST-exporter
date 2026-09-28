@@ -43,9 +43,12 @@ SERVICE_1 = {
     # Never exported: an arbitrary bag another integration writes to, and the one
     # field here that could plausibly carry a credential.
     "externalData": [{"key": "legacy_ref", "value": "do-not-publish"}],
-    # Never exported: {skuId, quantity}. A CSV of ids would read as a usable bill
-    # of materials with every quantity silently dropped.
+    # Not a column on the item tabs — a CSV of ids would read as a usable bill of
+    # materials with every quantity silently dropped. Exported one entry per row
+    # to `pricebook.serviceMaterials` / `pricebook.serviceEquipment` instead
+    # (`pricebook_bom.py`). skuId 200 is MATERIAL_1, and 100 is EQUIPMENT_1.
     "serviceMaterials": [{"skuId": 200, "quantity": 2}],
+    "serviceEquipment": [{"skuId": 100, "quantity": 1}],
     "active": True,
     "categories": [{"id": 10, "name": "Service"}],
     "manufacturer": None,
@@ -102,6 +105,9 @@ EQUIPMENT_1 = {
     ],
     "source": "Pricebook",
     "externalId": None,
+    # Exported to `pricebook.equipmentMaterials`, one entry per row. skuId 200 is
+    # MATERIAL_1.
+    "equipmentMaterials": [{"skuId": 200, "quantity": 4}],
     "active": True,
     # Bare ids, no names: the real `EquipmentResponse.categories` shape.
     "categories": [10, 11],

@@ -82,6 +82,26 @@
           "row_count": 3
         }
       }
+    },
+    "pricebook_bom": {
+      "contract_version": "pricebook_bom.v1",
+      "tabs": {
+        "pricebook.serviceMaterials": {
+          "path": "pricebook_bom.v1/pricebook.serviceMaterials.json",
+          "sha256": "a2b9b5ee061f30e539ee33ed117394b58e6ee40f819fd344fc3ad8ad75242312",
+          "row_count": 3
+        },
+        "pricebook.serviceEquipment": {
+          "path": "pricebook_bom.v1/pricebook.serviceEquipment.json",
+          "sha256": "5512349850cd214f56fa0d0a3b0d8d1c2ec16b6bf66bcbc2ad77681b12005269",
+          "row_count": 2
+        },
+        "pricebook.equipmentMaterials": {
+          "path": "pricebook_bom.v1/pricebook.equipmentMaterials.json",
+          "sha256": "9a72f201122f6cdb56867db95cdb31167c5339d5adc763d9bd6c190d74153d13",
+          "row_count": 1
+        }
+      }
     }
   }
 }

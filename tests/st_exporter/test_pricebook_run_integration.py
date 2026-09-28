@@ -65,6 +65,9 @@ def test_writes_all_four_tabs_with_contract_headers(st_settings, exporter_settin
         "pricebook.equipment": 1,
         "pricebook.materials": 1,
         "pricebook.categories": 2,
+        "pricebook.serviceMaterials": 1,
+        "pricebook.serviceEquipment": 1,
+        "pricebook.equipmentMaterials": 1,
     }
 
 
@@ -297,6 +300,9 @@ def test_a_refused_upload_does_not_abort_the_run(st_settings, exporter_settings)
         "pricebook.equipment": 1,
         "pricebook.materials": 1,
         "pricebook.categories": 2,
+        "pricebook.serviceMaterials": 1,
+        "pricebook.serviceEquipment": 1,
+        "pricebook.equipmentMaterials": 1,
     }
     assert set(export_store.tabs) >= set(PRICEBOOK_TABS)
     assert summary.images is not None and summary.images.upload_rejected == 1
@@ -378,10 +384,16 @@ def test_one_failing_tab_does_not_cost_the_other_three(st_settings, exporter_set
         "pricebook.services",
         "pricebook.materials",
         "pricebook.categories",
+        "pricebook.serviceMaterials",
+        "pricebook.serviceEquipment",
     }
     assert "pricebook.equipment" in summary.pricebook_failures
     assert "pricebook.equipment" not in export_store.tabs
     assert export_store.tabs["pricebook.services"][0] == list(ITEM_COLUMNS)
+    # Built from equipment payloads that never arrived, so never written: an
+    # empty tab here would read as "no equipment consumes any material".
+    assert "pricebook.equipmentMaterials" not in export_store.tabs
+    assert "pricebook.equipmentMaterials" not in summary.pricebook_failures
 
 
 @respx.mock
@@ -693,3 +705,133 @@ def test_a_failed_item_tab_stops_the_image_pass_pruning_the_ledger(
         assert third.images.already_uploaded == 1
     finally:
         client.close()
+
+
+# --- the bill-of-materials tabs ----------------------------------------------
+
+LINK_TABS = (
+    "pricebook.serviceMaterials",
+    "pricebook.serviceEquipment",
+    "pricebook.equipmentMaterials",
+)
+
+
+@respx.mock
+def test_the_link_tabs_are_written_from_the_same_payloads_under_their_own_version(
+    st_settings, exporter_settings
+) -> None:
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    export_store = InMemorySheetsStore()
+
+    _run(st_settings, exporter_settings, export_store)
+
+    assert export_store.tabs["pricebook.serviceMaterials"] == [
+        ["parent_st_id", "sku_id", "quantity"],
+        ["1", "200", "2"],
+    ]
+    assert export_store.tabs["pricebook.serviceEquipment"] == [
+        ["parent_st_id", "sku_id", "quantity"],
+        ["1", "100", "1"],
+    ]
+    assert export_store.tabs["pricebook.equipmentMaterials"] == [
+        ["parent_st_id", "sku_id", "quantity"],
+        ["100", "200", "4"],
+    ]
+    meta = parse_meta_grid(export_store.tabs["_meta"])
+    for tab in LINK_TABS:
+        assert meta[tab].contract_version == "pricebook_bom.v1"
+        assert meta[tab].last_cursor == ""
+        assert meta[tab].last_run_at == FIXED_NOW.isoformat()
+        assert meta[tab].row_count == 1
+    # The item tabs' own version is untouched by the new tabs.
+    assert meta["pricebook.services"].contract_version == "pricebook.v2"
+    # No extra request: exactly the four list endpoints the feed always called.
+    called = {call.request.url.path.rsplit("/", 1)[-1] for call in respx.calls}
+    assert called - {"token"} == {"services", "equipment", "materials", "categories"}
+
+
+@respx.mock
+def test_a_failed_parent_leaves_its_link_tabs_exactly_as_they_were(
+    st_settings, exporter_settings
+) -> None:
+    """A link tab rebuilt from services that never arrived would say "this
+    service consumes nothing" — a wrong answer, not a stale one."""
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    export_store = InMemorySheetsStore()
+    _run(st_settings, exporter_settings, export_store)
+    before = {tab: [row[:] for row in export_store.tabs[tab]] for tab in LINK_TABS}
+    meta_before = parse_meta_grid(export_store.tabs["_meta"])
+
+    tenant_pricebook.register(
+        st_settings.api_base,
+        equipment=[{**tenant_pricebook.EQUIPMENT_1, "equipmentMaterials": []}],
+    )
+    respx.get(f"{st_settings.api_base}/pricebook/v2/tenant/12345/services").mock(
+        return_value=httpx.Response(500, text="pricebook is unwell")
+    )
+    later = datetime(2026, 9, 15, 12, 0, tzinfo=timezone.utc)
+    with patch("st_exporter.run.datetime", **{"now.return_value": later}):
+        summary = run_export(
+            st_settings,
+            exporter_settings,
+            feeds=frozenset({"pricebook"}),
+            export_store=export_store,
+            raw_cache_store=InMemorySheetsStore(),
+        )
+
+    meta = parse_meta_grid(export_store.tabs["_meta"])
+    for tab in ("pricebook.serviceMaterials", "pricebook.serviceEquipment"):
+        assert export_store.tabs[tab] == before[tab]
+        assert meta[tab] == meta_before[tab]
+        # The parent's failure is the one named; the derived tabs add no noise.
+        assert tab not in summary.pricebook_failures
+    assert "pricebook.services" in summary.pricebook_failures
+    # Equipment WAS read in full, so its link tab is refreshed — here, emptied.
+    assert export_store.tabs["pricebook.equipmentMaterials"] == [
+        ["parent_st_id", "sku_id", "quantity"]
+    ]
+    assert meta["pricebook.equipmentMaterials"].last_run_at == later.isoformat()
+    assert meta["pricebook.equipmentMaterials"].row_count == 0
+
+
+@respx.mock
+def test_a_run_that_skips_pricebook_keeps_the_link_tabs_meta_rows(
+    st_settings, exporter_settings
+) -> None:
+    """`_meta` is rewritten whole every run, so a tab nobody carries is a tab
+    that vanishes from it."""
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    export_store = InMemorySheetsStore()
+    _run(st_settings, exporter_settings, export_store)
+    meta_before = parse_meta_grid(export_store.tabs["_meta"])
+
+    for resource in ("technicians", "business-units"):
+        respx.get(f"{st_settings.api_base}/settings/v2/tenant/12345/{resource}").mock(
+            return_value=httpx.Response(200, json={"data": [], "hasMore": False})
+        )
+    _run(st_settings, exporter_settings, export_store, feeds=frozenset({"technicians"}))
+
+    meta = parse_meta_grid(export_store.tabs["_meta"])
+    for tab in LINK_TABS:
+        assert meta[tab] == meta_before[tab]
+
+
+@respx.mock
+def test_a_refused_services_box_costs_its_link_tabs_quietly(st_settings, exporter_settings) -> None:
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(st_settings.api_base)
+    respx.get(f"{st_settings.api_base}/pricebook/v2/tenant/12345/services").mock(
+        return_value=httpx.Response(403, json={"title": "Forbidden"})
+    )
+    export_store = InMemorySheetsStore()
+
+    summary = _run(st_settings, exporter_settings, export_store)
+
+    assert "pricebook.serviceMaterials" not in export_store.tabs
+    assert "pricebook.serviceEquipment" not in export_store.tabs
+    assert "pricebook.equipmentMaterials" in export_store.tabs
+    assert set(summary.scope_not_granted) == {"pricebook.services"}
+    assert not summary.pricebook_failures
