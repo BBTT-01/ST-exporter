@@ -1369,7 +1369,10 @@ def _run_pricebook_feed(
             continue
         guard.attempt(
             link_tab,
-            lambda records=parent_records, name=list_field: (build_link_grid(records, name), None),
+            lambda records=parent_records, list_field=list_field: (
+                build_link_grid(records, list_field),
+                None,
+            ),
             contract_version=BOM_CONTRACT_VERSION,
         )
 

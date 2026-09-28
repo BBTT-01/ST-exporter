@@ -15,10 +15,7 @@ from st_exporter.pricebook_bom import (
     LINK_TABS,
     SERVICE_EQUIPMENT_TAB,
     SERVICE_MATERIALS_TAB,
-    build_equipment_materials_grid,
     build_link_grid,
-    build_service_equipment_grid,
-    build_service_materials_grid,
 )
 
 
@@ -134,7 +131,10 @@ class TestRows:
         assert build_link_grid([], "serviceMaterials") == [list(LINK_COLUMNS)]
 
 
-class TestEachTabReadsOnlyItsOwnList:
+class TestEachContractTabReadsOnlyItsOwnList:
+    """The fixture path builds through `contracts`; it must pair each tab with the
+    same ServiceTitan list `run._run_pricebook_feed` reads via `LINK_TABS`."""
+
     RECORD = {
         "id": 7,
         "serviceMaterials": [{"skuId": 20, "quantity": 1}],
@@ -142,11 +142,19 @@ class TestEachTabReadsOnlyItsOwnList:
         "equipmentMaterials": [{"skuId": 40, "quantity": 3}],
     }
 
+    def _build(self, tab: str) -> list[list[str]]:
+        _feed, contract = contracts.tabs()[tab]
+        return contract.build([self.RECORD])
+
     def test_service_materials(self) -> None:
-        assert _data(build_service_materials_grid([self.RECORD])) == [["7", "20", "1"]]
+        assert _data(self._build(SERVICE_MATERIALS_TAB)) == [["7", "20", "1"]]
 
     def test_service_equipment(self) -> None:
-        assert _data(build_service_equipment_grid([self.RECORD])) == [["7", "30", "2"]]
+        assert _data(self._build(SERVICE_EQUIPMENT_TAB)) == [["7", "30", "2"]]
 
     def test_equipment_materials(self) -> None:
-        assert _data(build_equipment_materials_grid([self.RECORD])) == [["7", "40", "3"]]
+        assert _data(self._build(EQUIPMENT_MATERIALS_TAB)) == [["7", "40", "3"]]
+
+    def test_the_contract_and_the_run_read_the_same_list_for_every_tab(self) -> None:
+        for tab, (_parent, list_field) in LINK_TABS.items():
+            assert self._build(tab) == build_link_grid([self.RECORD], list_field)

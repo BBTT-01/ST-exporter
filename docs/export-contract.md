@@ -307,6 +307,8 @@ contracts/fixtures/pricebook.v2/…          (equipment, materials, categories)
 contracts/fixtures/financial.v1/accounting.invoices.json
 contracts/fixtures/financial.v1/…          (timesheets, businessUnits, jobCosts)
 contracts/fixtures/sales.v1/sales.estimates.json
+contracts/fixtures/pricebook_bom.v1/pricebook.serviceMaterials.json
+contracts/fixtures/pricebook_bom.v1/…     (serviceEquipment, equipmentMaterials)
 ```
 
 **Format is JSON**, because three of the four codebases are TypeScript and one is
@@ -410,7 +412,11 @@ are one careless edit from going wrong:
 - `job_number` **populated**, from `jobNumber`; the regression that started all this;
 - a customer whose phone/email are in ServiceTitan's array form, not the scalars;
 - a report row **dropped** for having no `JobNumber`, and an item **dropped** for
-  having no id.
+  having no id;
+- on the bill-of-materials tabs, a **fractional `quantity`** beside a **null**
+  one (blank, never `0`), an entry **dropped** for having no `skuId` and one
+  dropped for not being an object, and a parent with **no id** whose links are
+  dropped with it.
 
 ## How a consumer verifies itself — without vendoring a copy that can drift
 

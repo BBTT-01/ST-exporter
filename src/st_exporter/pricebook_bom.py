@@ -36,7 +36,6 @@ joins to the item tab, which already carries ``active``.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
 from st_exporter.format import to_cell_text
@@ -84,18 +83,3 @@ def build_link_grid(records: list[dict[str, Any]], field: str) -> list[list[str]
             quantity = entry.get("quantity")
             rows.append([parent_id, sku_id, "" if quantity is None else to_cell_text(quantity)])
     return [list(LINK_COLUMNS)] + rows
-
-
-def link_grid_builder(field: str) -> Callable[[list[dict[str, Any]]], list[list[str]]]:
-    """``build_link_grid`` bound to one list field, in the one-argument shape
-    ``contracts.TabContract.build`` takes."""
-
-    def build(records: list[dict[str, Any]]) -> list[list[str]]:
-        return build_link_grid(records, field)
-
-    return build
-
-
-build_service_materials_grid = link_grid_builder("serviceMaterials")
-build_service_equipment_grid = link_grid_builder("serviceEquipment")
-build_equipment_materials_grid = link_grid_builder("equipmentMaterials")

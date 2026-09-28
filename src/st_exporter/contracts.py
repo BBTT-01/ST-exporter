@@ -70,6 +70,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable
 
 from st_exporter import financial, pricebook, pricebook_bom, sales
@@ -260,28 +261,18 @@ _LINK_GRAIN = (
 PRICEBOOK_BOM = FeedContract(
     feed="pricebook_bom",
     version=pricebook_bom.CONTRACT_VERSION,
-    tabs=(
+    # Built from `pricebook_bom.LINK_TABS`, the same table `run._run_pricebook_feed`
+    # reads, so the fixture path and the live path cannot pair a tab with a
+    # different ServiceTitan list.
+    tabs=tuple(
         TabContract(
-            name=pricebook_bom.SERVICE_MATERIALS_TAB,
+            name=tab_name,
             columns=pricebook_bom.LINK_COLUMNS,
             grain=_LINK_GRAIN,
             row_key=(),
-            build=pricebook_bom.build_service_materials_grid,
-        ),
-        TabContract(
-            name=pricebook_bom.SERVICE_EQUIPMENT_TAB,
-            columns=pricebook_bom.LINK_COLUMNS,
-            grain=_LINK_GRAIN,
-            row_key=(),
-            build=pricebook_bom.build_service_equipment_grid,
-        ),
-        TabContract(
-            name=pricebook_bom.EQUIPMENT_MATERIALS_TAB,
-            columns=pricebook_bom.LINK_COLUMNS,
-            grain=_LINK_GRAIN,
-            row_key=(),
-            build=pricebook_bom.build_equipment_materials_grid,
-        ),
+            build=partial(pricebook_bom.build_link_grid, field=list_field),
+        )
+        for tab_name, (_parent_resource, list_field) in pricebook_bom.LINK_TABS.items()
     ),
 )
 
