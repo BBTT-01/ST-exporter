@@ -83,6 +83,9 @@ from st_exporter.meta import (
     parse_meta_grid,
 )
 from st_exporter.pricebook import CONTRACT_VERSION, build_category_grid, build_item_grid
+from st_exporter.pricebook_bom import CONTRACT_VERSION as BOM_CONTRACT_VERSION
+from st_exporter.pricebook_bom import LINK_TABS as PRICEBOOK_LINK_TABS
+from st_exporter.pricebook_bom import build_link_grid
 from st_exporter.sales import CONTRACT_VERSION as SALES_CONTRACT_VERSION
 from st_exporter.sales import build_estimate_grid
 from st_exporter.scopes import ScopeLedger, is_permission_denied
@@ -138,6 +141,12 @@ DEFAULT_FEEDS = frozenset({"jobs", "technicians"})
 PRICEBOOK_TABS: dict[str, str] = {f"pricebook.{resource}": resource for resource in ITEM_RESOURCES}
 PRICEBOOK_CATEGORIES_TAB = "pricebook.categories"
 PRICEBOOK_FEED_NAMES: tuple[str, ...] = tuple(PRICEBOOK_TABS) + (PRICEBOOK_CATEGORIES_TAB,)
+# The bill-of-materials tabs the `pricebook` feed also writes. DERIVED tabs, not
+# fetched ones: each is built from its parent resource's payloads, so it has no
+# ServiceTitan permission of its own and is deliberately NOT in `EXPORT_TABS` —
+# a 403 on `pricebook.services` is that tab's, and its link tabs simply go
+# unwritten with it. Their `_meta` rows are carried like every other tab's.
+PRICEBOOK_LINK_TAB_NAMES: tuple[str, ...] = tuple(PRICEBOOK_LINK_TABS)
 
 # The tabs the single `financial` feed writes. The names are Profit Wizard's, not
 # this exporter's — its reader (`lib/hosted/tabs.ts`) addresses these exact
@@ -630,7 +639,7 @@ def _run(
             dry_run=dry_run,
         )
     else:
-        for feed_name in PRICEBOOK_FEED_NAMES:
+        for feed_name in PRICEBOOK_FEED_NAMES + PRICEBOOK_LINK_TAB_NAMES:
             if feed_name in meta_rows:
                 new_meta_rows.carry(meta_rows[feed_name])
 
@@ -1303,6 +1312,15 @@ def _run_pricebook_feed(
     better answer than four tabs left at last run's contents. The failed tab is
     named in the run summary.
 
+    **The three bill-of-materials tabs** (`pricebook.serviceMaterials`,
+    `pricebook.serviceEquipment`, `pricebook.equipmentMaterials`, see
+    ``pricebook_bom.py``) are built from the service and equipment records this
+    feed already fetched, under their own version (`pricebook_bom.v1`). Each is
+    written only when its parent item tab was read in full THIS run: a link tab
+    built from a partial or missing parent would read as "this service has no
+    materials", which is a wrong answer rather than a stale one. Otherwise it is
+    left at its previous contents, with its previous `_meta` row carried.
+
     The fourth return value is ``catalogue_complete``: True iff all three ITEM
     tabs produced a grid. It is what the image pass needs and the only thing it
     needs — a missing item tab, whether it failed or was refused, means those
@@ -1319,6 +1337,7 @@ def _run_pricebook_feed(
     )
 
     item_records: list[dict[str, Any]] = []
+    records_by_resource: dict[str, list[dict[str, Any]]] = {}
 
     def build_items(resource: str) -> tuple[list[list[str]], list[dict[str, Any]]]:
         records = fetch_pricebook_items(client, resource, category_ids=category_ids)
@@ -1326,6 +1345,8 @@ def _run_pricebook_feed(
 
     for tab_name, tab_resource in PRICEBOOK_TABS.items():
         fetched = guard.attempt(tab_name, lambda r=tab_resource: build_items(r))
+        if fetched is not None:
+            records_by_resource[tab_resource] = fetched
         if fetched:
             item_records.extend(fetched)
 
@@ -1333,6 +1354,24 @@ def _run_pricebook_feed(
         PRICEBOOK_CATEGORIES_TAB,
         lambda: (build_category_grid(fetch_pricebook_categories(client)), None),
     )
+
+    for link_tab, (parent_resource, list_field) in PRICEBOOK_LINK_TABS.items():
+        parent_records = records_by_resource.get(parent_resource)
+        if parent_records is None:
+            logger.info(
+                "pricebook: %s was NOT written this run because pricebook.%s was not "
+                "read in full. Its previous contents and _meta row are unchanged.",
+                link_tab,
+                parent_resource,
+            )
+            if link_tab in meta_rows:
+                new_meta_rows.carry(meta_rows[link_tab])
+            continue
+        guard.attempt(
+            link_tab,
+            lambda records=parent_records, name=list_field: (build_link_grid(records, name), None),
+            contract_version=BOM_CONTRACT_VERSION,
+        )
 
     logger.info(
         "pricebook: %s",

@@ -321,6 +321,34 @@ _ESTIMATE_2_UNSOLD_NO_ITEMS = {
 _ESTIMATE_NO_ID = {"jobId": 9, "name": "Dropped", "items": []}
 
 
+# --- pricebook bill of materials -----------------------------------------------
+
+#: A flat-rate service whose cost lives entirely in its links: a fractional
+#: quantity (rendered as-is), a null quantity (blank, never "0"), an entry with no
+#: skuId (dropped), and a non-dict entry (dropped). Not part of the
+#: `pricebook.services` fixture, whose released rows are frozen.
+_SERVICE_4_LINKED = {
+    "id": 4,
+    "code": "SVC-4",
+    "displayName": "Door Install",
+    "price": 900,
+    "hours": 3,
+    "active": True,
+    "categories": [],
+    "assets": [],
+    "modifiedOn": "2026-09-07T00:00:00Z",
+    "serviceMaterials": [
+        {"skuId": 200, "quantity": 1.5},
+        {"skuId": 201, "quantity": None},
+        {"quantity": 3},
+        "not-an-entry",
+    ],
+    "serviceEquipment": [{"skuId": 100, "quantity": 2}],
+}
+#: A parent with no id: every one of its entries is dropped with it.
+_SERVICE_NO_ID_LINKED = {"code": "SVC-NO-ID", "serviceMaterials": [{"skuId": 202, "quantity": 1}]}
+
+
 def _report_rows() -> list[dict[str, Any]]:
     """The Job Costing Summary report's rows, keyed by its own field names.
 
@@ -367,6 +395,19 @@ SOURCE_RECORDS: dict[str, list[dict[str, Any]]] = {
     "settings.businessUnits": tenant_financial.BUSINESS_UNITS,
     "reporting.jobCosts": _report_rows(),
     "sales.estimates": [_ESTIMATE_1_SOLD, _ESTIMATE_2_UNSOLD_NO_ITEMS, _ESTIMATE_NO_ID],
+    # SERVICE_2_NO_PRICE carries no lists at all and contributes no rows.
+    "pricebook.serviceMaterials": [
+        tenant_pricebook.SERVICE_1,
+        tenant_pricebook.SERVICE_2_NO_PRICE,
+        _SERVICE_4_LINKED,
+        _SERVICE_NO_ID_LINKED,
+    ],
+    "pricebook.serviceEquipment": [
+        tenant_pricebook.SERVICE_1,
+        tenant_pricebook.SERVICE_2_NO_PRICE,
+        _SERVICE_4_LINKED,
+    ],
+    "pricebook.equipmentMaterials": [tenant_pricebook.EQUIPMENT_1],
 }
 
 SOURCE_RECORDS["jobs"] = job_rows()

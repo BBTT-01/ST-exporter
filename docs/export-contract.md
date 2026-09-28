@@ -39,6 +39,7 @@ beside `exporter_version`.
 | `pricebook` | **`pricebook.v2`** | `pricebook.services`, `pricebook.equipment`, `pricebook.materials`, `pricebook.categories` |
 | `financial` | **`financial.v1`** | `accounting.invoices`, `payroll.timesheets`, `settings.businessUnits`, `reporting.jobCosts` |
 | `sales` | **`sales.v1`** | `sales.estimates` |
+| `pricebook_bom` | **`pricebook_bom.v1`** | `pricebook.serviceMaterials`, `pricebook.serviceEquipment`, `pricebook.equipmentMaterials` |
 
 The source of truth is `src/st_exporter/contracts.py`, and
 `contracts/fixtures/manifest.json` carries the same numbers in machine-readable
@@ -119,7 +120,7 @@ honestly is worse than no column at all:
 | Not exported | Why |
 |---|---|
 | `externalData` | An arbitrary key/value bag any other integration can write to this tenant's SKUs — the one field here that could plausibly hold a token. The Export Store is not the place to find that out. |
-| `serviceMaterials`, `serviceEquipment`, `equipmentMaterials` | A bill of materials, `{skuId, quantity}` per entry. A CSV of sku ids would look like a usable BOM with every quantity silently dropped. It needs its own tab at its own grain. |
+| `serviceMaterials`, `serviceEquipment`, `equipmentMaterials` | A bill of materials, `{skuId, quantity}` per entry. A CSV of sku ids would look like a usable BOM with every quantity silently dropped, so it is not a column here: it has its own tabs at its own grain, under `pricebook_bom.v1` (see "Why the bill of materials has its own version"). |
 | `recommendations`, `upgrades` | Cross-sell links; same objection, no costing value. |
 | `subcategories` | A recursive tree. `parent_id` already carries every edge in it, one row at a time. |
 
@@ -145,6 +146,32 @@ than joining `financial.v1` — it is a wholly new tab, and a tab added to an
 already-published contract version is refused by
 `scripts/gen_contract_fixtures.py` (see that file). Which run schedule refreshes
 a tab and what version a consumer pins its reader against are independent.
+
+### Why the bill of materials has its own version
+
+`pricebook.serviceMaterials`, `pricebook.serviceEquipment` and
+`pricebook.equipmentMaterials` are one row per `{skuId, quantity}` entry in the
+parent item's ServiceTitan list — columns `parent_st_id, sku_id, quantity`,
+joined to the item tabs on `sku_id = st_id`. `parent_st_id` is a service id on the
+two `service*` tabs and an equipment id on `pricebook.equipmentMaterials`. They
+exist because `Pricebook.V2.ServiceResponse` has no cost field: on a flat-rate
+price book a service's material cost is `sum(material.cost x quantity)` over its
+links, and without them a consumer sees a service's hours and price but never
+what it costs to deliver.
+
+They are wholly new tabs, so — exactly like `sales.estimates` — they carry their
+own version rather than joining the published `pricebook.v2`, and are written on
+the `pricebook` feed's cadence from the payloads it already fetches. Two rules a
+consumer needs:
+
+- **A link tab is only as complete as its parent.** It is written only when the
+  parent item tab was read in full the same run, and otherwise keeps its previous
+  contents and `_meta` row. So compare its `_meta.last_run_at` with the parent
+  tab's before trusting an absence: a service with no rows here has no links only
+  if both were refreshed by the same run.
+- **No row key.** No sku was seen twice on one parent on a live tenant, but that
+  is evidence rather than a documented rule, so a repeat is two rows. Sum
+  `quantity` per `(parent_st_id, sku_id)` rather than assuming uniqueness.
 
 ### A blank `contract_version`
 

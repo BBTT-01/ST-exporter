@@ -72,7 +72,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from st_exporter import financial, pricebook, sales
+from st_exporter import financial, pricebook, pricebook_bom, sales
 from st_exporter import format as tab_format
 
 #: A callable that turns a list of source records into the exact grid (header row
@@ -246,8 +246,47 @@ SALES = FeedContract(
     ),
 )
 
+_LINK_GRAIN = (
+    "one row per {skuId, quantity} entry in the parent item's ServiceTitan list, "
+    "in ServiceTitan's order; entries with no skuId, and parents with no id, are "
+    "dropped; a sku listed twice on one parent is two rows"
+)
+
+#: The bill-of-materials tabs are wholly NEW tabs, so — exactly like
+#: `sales.estimates` — they get their OWN version rather than joining the
+#: already-published `pricebook.v2`. They are written on the `pricebook` feed's
+#: cadence (``run._run_pricebook_feed``), from the same service and equipment
+#: payloads, with no extra request.
+PRICEBOOK_BOM = FeedContract(
+    feed="pricebook_bom",
+    version=pricebook_bom.CONTRACT_VERSION,
+    tabs=(
+        TabContract(
+            name=pricebook_bom.SERVICE_MATERIALS_TAB,
+            columns=pricebook_bom.LINK_COLUMNS,
+            grain=_LINK_GRAIN,
+            row_key=(),
+            build=pricebook_bom.build_service_materials_grid,
+        ),
+        TabContract(
+            name=pricebook_bom.SERVICE_EQUIPMENT_TAB,
+            columns=pricebook_bom.LINK_COLUMNS,
+            grain=_LINK_GRAIN,
+            row_key=(),
+            build=pricebook_bom.build_service_equipment_grid,
+        ),
+        TabContract(
+            name=pricebook_bom.EQUIPMENT_MATERIALS_TAB,
+            columns=pricebook_bom.LINK_COLUMNS,
+            grain=_LINK_GRAIN,
+            row_key=(),
+            build=pricebook_bom.build_equipment_materials_grid,
+        ),
+    ),
+)
+
 #: Every feed that writes a versioned tab, in the order they appear in `_meta`.
-FEEDS: tuple[FeedContract, ...] = (JOBS, TECHNICIANS, PRICEBOOK, FINANCIAL, SALES)
+FEEDS: tuple[FeedContract, ...] = (JOBS, TECHNICIANS, PRICEBOOK, FINANCIAL, SALES, PRICEBOOK_BOM)
 
 #: Feed name -> contract version, i.e. exactly what lands in `_meta.contract_version`.
 CONTRACT_VERSIONS: dict[str, str] = {contract.feed: contract.version for contract in FEEDS}

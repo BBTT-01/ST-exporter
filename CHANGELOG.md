@@ -4,6 +4,39 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Pricebook bill of materials for Profit Wizard service costing
+
+### Added: `pricebook.serviceMaterials`, `pricebook.serviceEquipment`, `pricebook.equipmentMaterials`
+
+`Pricebook.V2.ServiceResponse` has no cost field, so `pricebook.services.cost` is
+blank on every row of every tenant, and on a flat-rate price book a service's
+material cost lives entirely in the SKUs linked to it. The `pricebook` feed
+already fetched those links — `serviceMaterials` and `serviceEquipment` on each
+service, `equipmentMaterials` on each equipment item, `{skuId, quantity}` per
+entry — and dropped them, because a CSV cell of sku ids would lose every
+quantity. They now get tabs at their own grain: one row per entry, columns
+`parent_st_id, sku_id, quantity`, joined to the item tabs on `sku_id = st_id`.
+Profit Wizard costs a service as `sum(material.cost x quantity)` over them.
+
+- **No extra request and no new permission.** Built from the same service and
+  equipment payloads the item tabs are; the tabs carry no ServiceTitan
+  permission of their own and are not in `EXPORT_TABS`.
+- **Only as complete as the parent.** A link tab is written only when its
+  parent item tab was read in full that run. Otherwise it keeps its previous
+  contents and `_meta` row: a link tab built from services that never arrived
+  would say "this service consumes nothing", which is wrong rather than stale.
+  A 403 on `pricebook.services` is that tab's alone and adds no noise here.
+- **Cell rules are the item tabs'.** `quantity` blank when null, never `0`; an
+  entry with no `skuId`, or on a parent with no `id`, is dropped. Withdrawn
+  parents keep their links. A sku listed twice on one parent is two rows, so the
+  tabs promise no row key (no repeat was seen on a live tenant; that is
+  evidence, not a rule).
+
+A wholly new tab set, so — like `sales.estimates` — they are published under
+their **own** version, **`pricebook_bom.v1`**, and `pricebook.v2` is untouched:
+no released fixture moved, and TrueQuote's pricebook reader keeps parsing.
+Shape confirmed against a live tenant (`KNOWN_UNVERIFIED.md`).
+
 ## [Unreleased] · Invoice-level totals on `accounting.invoices` for TrueQuote hosted calibration
 
 ### Added: `InvoiceSubTotal`, `InvoiceSalesTax`, `InvoiceTotal` appended as the last `accounting.invoices` columns

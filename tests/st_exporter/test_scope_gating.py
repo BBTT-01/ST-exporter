@@ -557,26 +557,39 @@ class TestTheTwoTenantsThisBroke:
 
         summary = _run(st_settings, exporter_settings, store, "pricebook")
 
-        assert set(store.tabs) == {
-            "_meta",
-            "pricebook.services",
-            "pricebook.equipment",
-            "pricebook.categories",
+        # The bill-of-materials tabs come off the SERVICE and EQUIPMENT payloads,
+        # so a refused Materials box costs none of them.
+        link_tabs = {
+            "pricebook.serviceMaterials",
+            "pricebook.serviceEquipment",
+            "pricebook.equipmentMaterials",
         }
-        assert set(summary.pricebook_row_counts or {}) == {
-            "pricebook.services",
-            "pricebook.equipment",
-            "pricebook.categories",
-        }
+        assert (
+            set(store.tabs)
+            == {
+                "_meta",
+                "pricebook.services",
+                "pricebook.equipment",
+                "pricebook.categories",
+            }
+            | link_tabs
+        )
+        assert (
+            set(summary.pricebook_row_counts or {})
+            == {
+                "pricebook.services",
+                "pricebook.equipment",
+                "pricebook.categories",
+            }
+            | link_tabs
+        )
         assert set(summary.scope_not_granted) == {"pricebook.materials"}
         assert not summary.scope_revoked and not summary.pricebook_failures
         assert not [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("::")]
         written = _meta_feeds(store)
-        assert sorted(written) == [
-            "pricebook.categories",
-            "pricebook.equipment",
-            "pricebook.services",
-        ]
+        assert sorted(written) == sorted(
+            ["pricebook.categories", "pricebook.equipment", "pricebook.services", *link_tabs]
+        )
         assert len(written) == len(set(written))
 
     @respx.mock

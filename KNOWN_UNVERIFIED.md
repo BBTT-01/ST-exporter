@@ -883,6 +883,26 @@ a `||` chain fires on a real `0` — it would turn a genuinely free item into it
 member price. The exporter exports `price` and leaves the reconciliation to the
 consumer, which is the same reason `cost` and `hours` are blank-when-null here.
 
+## Pricebook bill of materials — shape CONFIRMED on a live tenant, uniqueness not
+
+`src/st_exporter/pricebook_bom.py`
+
+- **The entry shape — CONFIRMED 2026-09-28** against a live Direct tenant's
+  `/pricebook/v2/tenant/{t}/services` and `/equipment` (read-only list calls,
+  `active=Any`). `serviceMaterials` and `serviceEquipment` on services, and
+  `equipmentMaterials` on equipment, are arrays of objects whose ONLY keys are
+  `skuId` and `quantity`. Across 5234 services: 1088 entries, none with a missing
+  `skuId`, a null, zero or fractional `quantity`, or any other key. Just over half
+  of the first 200 services carried at least one link. Every `equipmentMaterials`
+  list on that tenant was empty, so that tab's shape rests on the same schema, not
+  on a populated row.
+- **No sku repeated on one parent** on that tenant. That is one tenant's evidence,
+  not a documented rule, so the tabs promise no row key and a repeat is written as
+  two rows rather than summed.
+- **Not yet seen from a hosted tenant.** The Export Store tabs have never been
+  written by a real run. The first run on a Profit Wizard connector is what
+  confirms the tabs end to end.
+
 ## Pricebook image upload — what could not be confirmed without a live TrueQuote
 
 `src/st_exporter/images/`

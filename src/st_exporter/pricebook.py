@@ -64,8 +64,9 @@ a cell that cannot carry the fact honestly is worse than an absent column:
 - ``serviceMaterials`` / ``serviceEquipment`` / ``equipmentMaterials`` — a bill of
   materials, ``{skuId, quantity}`` per entry. A CSV of sku ids would look exactly
   like a usable BOM while silently dropping every quantity, which is the precise
-  failure mode this whole contract exists to prevent. It needs its own tab at its
-  own grain, not a column.
+  failure mode this whole contract exists to prevent. So it is not a column
+  here: it has its own tabs at its own grain, under its own version
+  (``pricebook_bom.py``, `pricebook_bom.v1`).
 - ``recommendations`` / ``upgrades`` — cross-sell links, same objection, no costing
   value.
 - ``subcategories`` on the category tab — a recursive tree. ``parent_id`` already

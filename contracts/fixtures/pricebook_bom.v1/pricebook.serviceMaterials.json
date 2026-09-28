@@ -1,0 +1,17 @@
+{
+  "feed": "pricebook_bom",
+  "contract_version": "pricebook_bom.v1",
+  "tab": "pricebook.serviceMaterials",
+  "grain": "one row per {skuId, quantity} entry in the parent item's ServiceTitan list, in ServiceTitan's order; entries with no skuId, and parents with no id, are dropped; a sku listed twice on one parent is two rows",
+  "row_key": [],
+  "columns": [
+    "parent_st_id",
+    "sku_id",
+    "quantity"
+  ],
+  "rows": [
+    ["1", "200", "2"],
+    ["4", "200", "1.5"],
+    ["4", "201", ""]
+  ]
+}
