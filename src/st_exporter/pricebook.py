@@ -85,7 +85,7 @@ from typing import Any
 
 from st_exporter.format import to_cell_text
 
-CONTRACT_VERSION = "pricebook.v3"
+CONTRACT_VERSION = "pricebook.v2"
 
 ITEM_COLUMNS: tuple[str, ...] = (
     "st_id",
@@ -133,7 +133,7 @@ ITEM_COLUMNS: tuple[str, ...] = (
     "other_vendor_names",
     "source",
     "external_id",
-    # --- appended at pricebook.v3 ---------------------------------------------
+    # --- appended after pricebook.v2 shipped (no bump: a pure append) ---------
     # ServiceTitan fills these only when the services list is asked with
     # `calculatePrices=true` and the service has a Dynamic Pricing rule; a
     # fixed-price tenant is blank on every row.

@@ -4,7 +4,7 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] · Dynamic prices on `pricebook.services`: `pricebook.v3`
+## [Unreleased] · Dynamic prices on `pricebook.services`
 
 ### Added: `calculated_price`, `use_static_prices`, `is_price_locked`; services fetched with `calculatePrices=true`
 
@@ -26,10 +26,11 @@ useStaticPrices false` with the parameter and `calculatedPrice null` without).
   and `is_price_locked`. Blank on every row of `equipment` and `materials`
   (shared column set) and on every row of a fixed-price tenant, so all three
   are in `ALL_BLANK_OK`.
-* **`pricebook.v3`.** Additive by the contract rules, a bump anyway because the
-  register freezes `pricebook.v2`'s bytes and appending a column moves every
-  row — the same reasoning that made v2 (`docs/export-contract.md`).
-  `pricebook_bom.v1` is untouched.
+* **No version bump.** A pure append: `pricebook.v2` stays, its released
+  fixtures stay byte-identical, and every consumer pinned to v2 keeps parsing
+  (`docs/export-contract.md`, "What an appended column does to the fixture
+  suite"). The three columns have no committed fixture until the next bump;
+  `tests/st_exporter/test_pricebook.py` pins the mapping instead.
 
 ## [Unreleased] · Pricebook bill of materials for Profit Wizard service costing
 

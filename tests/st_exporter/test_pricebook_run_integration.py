@@ -83,7 +83,7 @@ def test_each_tab_gets_its_own_meta_row_with_the_contract_version(
 
     meta = parse_meta_grid(export_store.tabs["_meta"])
     for tab in PRICEBOOK_TABS:
-        assert meta[tab].contract_version == "pricebook.v3"
+        assert meta[tab].contract_version == "pricebook.v2"
         # Catalogue: full replace, so no cursor is ever carried.
         assert meta[tab].last_cursor == ""
         assert meta[tab].last_run_at == FIXED_NOW.isoformat()
@@ -202,7 +202,7 @@ def test_not_selecting_pricebook_leaves_its_tabs_and_meta_untouched(
     assert summary.pricebook_row_counts is None
     assert export_store.tabs["pricebook.services"] == before
     meta = parse_meta_grid(export_store.tabs["_meta"])
-    assert meta["pricebook.services"].contract_version == "pricebook.v3"
+    assert meta["pricebook.services"].contract_version == "pricebook.v2"
 
 
 # --- image upload lane -------------------------------------------------------
@@ -745,7 +745,7 @@ def test_the_link_tabs_are_written_from_the_same_payloads_under_their_own_versio
         assert meta[tab].last_run_at == FIXED_NOW.isoformat()
         assert meta[tab].row_count == 1
     # The item tabs' own version is untouched by the new tabs.
-    assert meta["pricebook.services"].contract_version == "pricebook.v3"
+    assert meta["pricebook.services"].contract_version == "pricebook.v2"
     # No extra request: exactly the four list endpoints the feed always called.
     called = {call.request.url.path.rsplit("/", 1)[-1] for call in respx.calls}
     assert called - {"token"} == {"services", "equipment", "materials", "categories"}

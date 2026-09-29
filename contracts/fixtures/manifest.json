@@ -24,26 +24,26 @@
       }
     },
     "pricebook": {
-      "contract_version": "pricebook.v3",
+      "contract_version": "pricebook.v2",
       "tabs": {
         "pricebook.services": {
-          "path": "pricebook.v3/pricebook.services.json",
-          "sha256": "5d3fe58edaad792b85bdf14f3d72149d651f9fb400623ebeb4f29d04fc0bb1d5",
-          "row_count": 4
+          "path": "pricebook.v2/pricebook.services.json",
+          "sha256": "b037b3522c5f46dd95d69bb842454de70fdc2b853b35f1716f2e941dfdd70e34",
+          "row_count": 3
         },
         "pricebook.equipment": {
-          "path": "pricebook.v3/pricebook.equipment.json",
-          "sha256": "ec72118f5c7aff8d98b203d1f6f14982a0ca1c7a18755c2e4127d025ac92ccf1",
+          "path": "pricebook.v2/pricebook.equipment.json",
+          "sha256": "b1f5140d037e2ba7f0523e2c46a50cde0a03e0d5899e5eb8dc89eb29fc0faae5",
           "row_count": 1
         },
         "pricebook.materials": {
-          "path": "pricebook.v3/pricebook.materials.json",
-          "sha256": "775b9b06ff6cd03a99c75cab0cb2c7510fc6115a0196ac0af968c91ef14388d4",
+          "path": "pricebook.v2/pricebook.materials.json",
+          "sha256": "0e3f76ae290aeef4dbac106c58fc5864aae9a63f79d5cf2413e9fcb2b1b09d29",
           "row_count": 2
         },
         "pricebook.categories": {
-          "path": "pricebook.v3/pricebook.categories.json",
-          "sha256": "e221120e0476bc658a7827927fe123ce3642386e68c1f777ec6082cd23e04019",
+          "path": "pricebook.v2/pricebook.categories.json",
+          "sha256": "40c33f6596e885e8fa6ad1090eeaaf59d694f6ab16e02cfcaade5df3de611c9b",
           "row_count": 2
         }
       }

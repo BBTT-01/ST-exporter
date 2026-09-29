@@ -440,7 +440,11 @@ def _fetch_image_catalogue(
     complete = True
     for resource in ITEM_RESOURCES:
         try:
-            records.extend(fetch_pricebook_items(client, resource, category_ids=category_ids))
+            records.extend(
+                fetch_pricebook_items(
+                    client, resource, category_ids=category_ids, calculate_prices=False
+                )
+            )
         except STCLIError as exc:
             complete = False
             if is_permission_denied(exc):

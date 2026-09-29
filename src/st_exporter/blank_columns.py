@@ -201,7 +201,6 @@ ALL_BLANK_OK: dict[str, dict[str, str]] = {
             "Dynamic Pricing rule, and only when the list is asked with "
             "`calculatePrices=true`; a fixed-price tenant is blank on every row."
         ),
-        "is_price_locked": ("Optional upstream; frequently unset across a whole catalogue."),
         "use_static_prices": (
             "Tri-state upstream: null until a tenant ever touches the setting, "
             "so a fixed-price tenant is blank on every row."

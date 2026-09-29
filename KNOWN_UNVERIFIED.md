@@ -838,6 +838,31 @@ pricebook tabs alone reach it. Still comfortable, no longer irrelevant. What has
 never been tested is a single `values.update` write of that size, or the write
 time for a six-figure catalogue.
 
+## Pricebook services: `calculatePrices=true` and the dynamic-price fields
+
+`src/st_exporter/feeds/pricebook.py`, `_fetch_pages`; `src/st_exporter/pricebook.py`,
+`build_item_row` (`calculated_price`, `use_static_prices`, `is_price_locked`)
+
+- **`calculatePrices` — CONFIRMED 2026-09-29** on one live tenant (Rightly Garage
+  Doors, a Dynamic Pricing tenant), by a one-off dispatch from its connector
+  against `pricebook/v2/tenant/{id}/services?ids=…`. With the parameter a
+  dynamically priced service answered `price 0.00, calculatedPrice 1224.0,
+  useStaticPrices false`; without it the same service answered `calculatedPrice
+  null, useStaticPrices null`. A flat-priced service on the same tenant answered
+  `price 89.00, calculatedPrice null, useStaticPrices null` either way.
+- **`isPriceLocked` — CONFIRMED present** in the same probe (`false` on all three
+  services), so on `services` it is a bool that never renders blank; it has no
+  services exemption in `blank_columns.py` for that reason.
+- **Assumed, not verified:** that `useStaticPrices` stays `null` until a tenant
+  ever touches the setting (the probe only shows null on a flat-priced service);
+  that the parameter is harmless (no 400, no measurable slowdown) on a tenant
+  with no Dynamic Pricing rules and on a ~24k-service catalogue. Dispatch
+  `pricebook` once on each before repinning broadly.
+- **What this trades away:** `calculated_price` is in `ALL_BLANK_OK` for
+  `pricebook.services` because a fixed-price tenant really is blank on every
+  row, so the blank-column detector will NOT shout if ServiceTitan ever stops
+  honouring the parameter. The unit tests pin only that it is sent.
+
 ## Pricebook full payload — spellings verified against the spec, not a tenant
 
 `src/st_exporter/pricebook.py`

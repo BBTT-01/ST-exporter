@@ -36,7 +36,7 @@ beside `exporter_version`.
 |---|---|---|
 | `jobs` | **`jobs.v2`** | `jobs` |
 | `technicians` | **`technicians.v1`** | `technicians` |
-| `pricebook` | **`pricebook.v3`** | `pricebook.services`, `pricebook.equipment`, `pricebook.materials`, `pricebook.categories` |
+| `pricebook` | **`pricebook.v2`** | `pricebook.services`, `pricebook.equipment`, `pricebook.materials`, `pricebook.categories` |
 | `financial` | **`financial.v1`** | `accounting.invoices`, `payroll.timesheets`, `settings.businessUnits`, `reporting.jobCosts` |
 | `sales` | **`sales.v1`** | `sales.estimates` |
 | `pricebook_bom` | **`pricebook_bom.v1`** | `pricebook.serviceMaterials`, `pricebook.serviceEquipment`, `pricebook.equipmentMaterials` |
@@ -87,15 +87,6 @@ So a consumer still pinned to `pricebook.v1` keeps its frozen fixtures and its
 twelve columns, and a consumer that wants the rest widens its supported range to
 include `pricebook.v2`. Until it does, its contract check refuses the tab —
 loudly, which is the intended order of events.
-
-### Why `pricebook` is v3
-
-`pricebook.v3` appends `calculated_price`, `use_static_prices` and
-`is_price_locked` to the three item tabs and changes nothing else. Same story as
-v2: additive by the rules below, a bump because the register freezes v2's bytes.
-The feed also asks ServiceTitan for `calculatePrices=true` on `services`, which
-is what fills `calculated_price` on a tenant using Dynamic Pricing; without it a
-dynamically priced service exports as `price = 0` and nothing else.
 
 ### Why the pricebook tabs carry the whole payload
 
@@ -442,7 +433,7 @@ the data:
   "supported": {
     "jobs": ["jobs.v2"],
     "technicians": ["technicians.v1"],
-    "pricebook": ["pricebook.v1", "pricebook.v2", "pricebook.v3"],
+    "pricebook": ["pricebook.v1", "pricebook.v2"],
     "financial": ["financial.v1"]
   }
 }

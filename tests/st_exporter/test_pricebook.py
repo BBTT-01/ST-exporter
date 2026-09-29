@@ -124,7 +124,7 @@ class TestColumns:
         )
 
     def test_contract_version_literal(self) -> None:
-        assert CONTRACT_VERSION == "pricebook.v3"
+        assert CONTRACT_VERSION == "pricebook.v2"
 
     def test_cost_and_hours_lead_the_appended_block(self) -> None:
         # Appended, never inserted: a consumer reading by position must not have
