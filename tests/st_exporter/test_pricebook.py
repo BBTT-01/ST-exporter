@@ -101,6 +101,9 @@ class TestColumns:
             "other_vendor_names",
             "source",
             "external_id",
+            "calculated_price",
+            "use_static_prices",
+            "is_price_locked",
         )
 
     def test_no_column_is_declared_twice(self) -> None:
@@ -155,6 +158,29 @@ class TestCellRules:
 
     def test_price_uses_a_dot_separator(self) -> None:
         assert build_item_row(_item(price=1299.5))["price"] == "1299.5"
+
+    def test_calculated_price_comes_from_the_service_titan_calculated_price_field(self) -> None:
+        assert build_item_row(_item(calculatedPrice=1224))["calculated_price"] == "1224"
+
+    def test_calculated_price_null_is_blank_not_zero(self) -> None:
+        # Null is what a static-priced service returns; a dynamic one carries a
+        # number. Collapsing null to 0 would mark every static item as free.
+        assert build_item_row(_item(calculatedPrice=None))["calculated_price"] == ""
+
+    def test_calculated_price_missing_key_is_blank(self) -> None:
+        record = _item()
+        record.pop("calculatedPrice", None)
+        assert build_item_row(record)["calculated_price"] == ""
+
+    def test_use_static_prices_is_tri_state(self) -> None:
+        # Blank / false / true all mean different things to the consumer: null
+        # is "never set" (static in practice), false is an explicit dynamic rule.
+        assert build_item_row(_item(useStaticPrices=None))["use_static_prices"] == ""
+        assert build_item_row(_item(useStaticPrices=False))["use_static_prices"] == "false"
+        assert build_item_row(_item(useStaticPrices=True))["use_static_prices"] == "true"
+
+    def test_is_price_locked_is_written_as_bool_text(self) -> None:
+        assert build_item_row(_item(isPriceLocked=False))["is_price_locked"] == "false"
 
     def test_cost_comes_from_the_service_titan_cost_field(self) -> None:
         assert build_item_row(_item(cost=640))["cost"] == "640"

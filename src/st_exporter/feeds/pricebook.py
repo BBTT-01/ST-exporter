@@ -53,6 +53,7 @@ def fetch_pricebook_items(
     resource: str,
     *,
     category_ids: Iterable[int | str] = (),
+    calculate_prices: bool = True,
 ) -> list[dict[str, Any]]:
     """Full list of one pricebook item resource (``services``/``equipment``/``materials``).
 
@@ -68,11 +69,15 @@ def fetch_pricebook_items(
     """
     ids = [str(category_id) for category_id in category_ids if str(category_id).strip()]
     if not ids:
-        return _name_categories(client, _fetch_pages(client, resource, None))
+        return _name_categories(
+            client, _fetch_pages(client, resource, None, calculate_prices=calculate_prices)
+        )
 
     merged: dict[str, dict[str, Any]] = {}
     for category_id in ids:
-        for record in _fetch_pages(client, resource, category_id):
+        for record in _fetch_pages(
+            client, resource, category_id, calculate_prices=calculate_prices
+        ):
             _merge_item(merged, record)
     return _name_categories(client, list(merged.values()))
 
@@ -87,9 +92,17 @@ def fetch_pricebook_categories(client: ServiceTitanClient) -> list[dict[str, Any
 
 
 def _fetch_pages(
-    client: ServiceTitanClient, resource: str, category_id: str | None
+    client: ServiceTitanClient,
+    resource: str,
+    category_id: str | None,
+    *,
+    calculate_prices: bool = True,
 ) -> list[dict[str, Any]]:
     params: dict[str, Any] = {"active": "Any"}
+    if resource == "services" and calculate_prices:
+        # Only services carry a Dynamic Pricing rule; without this ServiceTitan
+        # answers `price 0, calculatedPrice null` for every such service.
+        params["calculatePrices"] = "true"
     if category_id is not None:
         params["categoryIds"] = category_id
     records = fetch_all(client, MODULE, resource, params=params, page_size=_PAGE_SIZE)
