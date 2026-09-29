@@ -90,6 +90,8 @@ def _fetch_pages(
     client: ServiceTitanClient, resource: str, category_id: str | None
 ) -> list[dict[str, Any]]:
     params: dict[str, Any] = {"active": "Any"}
+    if resource == "services":
+        params["calculatePrices"] = "true"
     if category_id is not None:
         params["categoryIds"] = category_id
     records = fetch_all(client, MODULE, resource, params=params, page_size=_PAGE_SIZE)

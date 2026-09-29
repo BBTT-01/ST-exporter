@@ -85,7 +85,7 @@ from typing import Any
 
 from st_exporter.format import to_cell_text
 
-CONTRACT_VERSION = "pricebook.v2"
+CONTRACT_VERSION = "pricebook.v3"
 
 ITEM_COLUMNS: tuple[str, ...] = (
     "st_id",
@@ -133,6 +133,13 @@ ITEM_COLUMNS: tuple[str, ...] = (
     "other_vendor_names",
     "source",
     "external_id",
+    # --- appended at pricebook.v3 ---------------------------------------------
+    # ServiceTitan fills these only when the services list is asked with
+    # `calculatePrices=true` and the service has a Dynamic Pricing rule; a
+    # fixed-price tenant is blank on every row.
+    "calculated_price",
+    "use_static_prices",
+    "is_price_locked",
 )
 
 CATEGORY_COLUMNS: tuple[str, ...] = (
@@ -234,6 +241,9 @@ def build_item_row(record: dict[str, Any]) -> dict[str, str]:
         "other_vendor_names": other_vendor_names,
         "source": to_cell_text(record.get("source")),
         "external_id": to_cell_text(record.get("externalId")),
+        "calculated_price": _numeric(record.get("calculatedPrice")),
+        "use_static_prices": _bool_text(record.get("useStaticPrices")),
+        "is_price_locked": _bool_text(record.get("isPriceLocked")),
     }
 
 

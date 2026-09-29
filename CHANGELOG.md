@@ -4,6 +4,33 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Dynamic prices on `pricebook.services`: `pricebook.v3`
+
+### Added: `calculated_price`, `use_static_prices`, `is_price_locked`; services fetched with `calculatePrices=true`
+
+A service under a ServiceTitan Dynamic Pricing rule stores `price = 0`; the
+number the tenant actually charges is computed from hours, linked material cost
+and markup, and the API returns it only in `calculatedPrice` — and only when the
+services list is asked with `calculatePrices=true`. The feed never sent that
+parameter, so on such a tenant 684 of 758 active services exported as `0.0`
+and Profit Wizard showed them as free (Rightly Garage Doors, 2026-09-29; the
+probe on that tenant returned `price 0, calculatedPrice 1224,
+useStaticPrices false` with the parameter and `calculatedPrice null` without).
+
+* `_fetch_pages` sends `calculatePrices=true` on `services` only; `materials`
+  and `equipment` have no dynamic pricing and are fetched exactly as before.
+* Three columns APPENDED to the item tabs: `calculated_price` (blank when null,
+  never `0` — null is what a static-priced service returns), `use_static_prices`
+  (tri-state: blank / `false` / `true`, kept as-is because null and `false`
+  mean different things to a consumer deciding whether a price push will land)
+  and `is_price_locked`. Blank on every row of `equipment` and `materials`
+  (shared column set) and on every row of a fixed-price tenant, so all three
+  are in `ALL_BLANK_OK`.
+* **`pricebook.v3`.** Additive by the contract rules, a bump anyway because the
+  register freezes `pricebook.v2`'s bytes and appending a column moves every
+  row — the same reasoning that made v2 (`docs/export-contract.md`).
+  `pricebook_bom.v1` is untouched.
+
 ## [Unreleased] · Pricebook bill of materials for Profit Wizard service costing
 
 ### Added: `pricebook.serviceMaterials`, `pricebook.serviceEquipment`, `pricebook.equipmentMaterials`

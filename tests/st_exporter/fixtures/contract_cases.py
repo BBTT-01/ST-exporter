@@ -228,6 +228,26 @@ _SERVICE_3_UNKNOWN_ACTIVE = {
 }
 
 
+#: A dynamically priced service: `price` is 0 upstream and the real number only
+#: arrives in `calculatedPrice` (with `useStaticPrices` false) because the feed
+#: asks with `calculatePrices=true`. The reason `pricebook.v3` exists.
+_SERVICE_6_DYNAMIC_PRICE = {
+    "id": 6,
+    "code": "SVC-6",
+    "displayName": "Wall Mount Opener Install",
+    "description": "Priced by a Dynamic Pricing rule upstream",
+    "price": 0,
+    "hours": 1,
+    "active": True,
+    "calculatedPrice": 1224,
+    "useStaticPrices": False,
+    "isPriceLocked": False,
+    "categories": [{"id": 10, "name": "Service"}],
+    "assets": [],
+    "modifiedOn": "2026-09-29T00:00:00Z",
+}
+
+
 #: A material whose cost is explicitly null, sitting on the same tab as one whose
 #: cost is a real ``0``. Blank-is-not-zero is the rule a pricing formula breaks
 #: most expensively: a null cost read as zero prices the item at pure margin.
@@ -378,6 +398,7 @@ SOURCE_RECORDS: dict[str, list[dict[str, Any]]] = {
         tenant_pricebook.SERVICE_1,
         tenant_pricebook.SERVICE_2_NO_PRICE,
         _SERVICE_3_UNKNOWN_ACTIVE,
+        _SERVICE_6_DYNAMIC_PRICE,
         # No id: dropped entirely rather than written as a keyless row.
         {"code": "SVC-NO-ID", "displayName": "Dropped", "price": 1},
     ],

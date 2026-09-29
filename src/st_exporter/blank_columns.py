@@ -196,6 +196,16 @@ ALL_BLANK_OK: dict[str, dict[str, str]] = {
         ),
         "warranty_description": ("Optional upstream; frequently unset across a whole catalogue."),
         "warranty_duration": ("Optional upstream; frequently unset across a whole catalogue."),
+        "calculated_price": (
+            "ServiceTitan fills `calculatedPrice` only for a service with a "
+            "Dynamic Pricing rule, and only when the list is asked with "
+            "`calculatePrices=true`; a fixed-price tenant is blank on every row."
+        ),
+        "is_price_locked": ("Optional upstream; frequently unset across a whole catalogue."),
+        "use_static_prices": (
+            "Tri-state upstream: null until a tenant ever touches the setting, "
+            "so a fixed-price tenant is blank on every row."
+        ),
     },
     "pricebook.equipment": {
         "account": ("Optional upstream; frequently unset across a whole catalogue."),
@@ -254,6 +264,27 @@ ALL_BLANK_OK: dict[str, dict[str, str]] = {
         ),
         "warranty_duration": (
             "ServiceTitan's Pricebook.V2.EquipmentResponse has no `warranty` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "calculated_price": (
+            "ServiceTitan's Pricebook.V2.EquipmentResponse has no `calculatedPrice` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "is_price_locked": (
+            "ServiceTitan's Pricebook.V2.EquipmentResponse has no `isPriceLocked` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "use_static_prices": (
+            "ServiceTitan's Pricebook.V2.EquipmentResponse has no `useStaticPrices` "
             "field, so this column is blank on every row of every tenant. The "
             "three item tabs share one column set (the union of the three "
             "resources' fields) so they can share one parser; a column a "
@@ -332,6 +363,27 @@ ALL_BLANK_OK: dict[str, dict[str, str]] = {
         ),
         "warranty_duration": (
             "ServiceTitan's Pricebook.V2.MaterialResponse has no `warranty` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "calculated_price": (
+            "ServiceTitan's Pricebook.V2.MaterialResponse has no `calculatedPrice` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "is_price_locked": (
+            "ServiceTitan's Pricebook.V2.MaterialResponse has no `isPriceLocked` "
+            "field, so this column is blank on every row of every tenant. The "
+            "three item tabs share one column set (the union of the three "
+            "resources' fields) so they can share one parser; a column a "
+            "resource does not have is the price of that."
+        ),
+        "use_static_prices": (
+            "ServiceTitan's Pricebook.V2.MaterialResponse has no `useStaticPrices` "
             "field, so this column is blank on every row of every tenant. The "
             "three item tabs share one column set (the union of the three "
             "resources' fields) so they can share one parser; a column a "

@@ -29,8 +29,25 @@ def test_unfiltered_fetch_is_a_single_pass_over_the_whole_catalogue(mock_client)
     mock_client.get.return_value = _envelope([{"id": 1}])
     assert fetch_pricebook_items(mock_client, "services") == [{"id": 1}]
     mock_client.get.assert_called_once_with(
-        "pricebook", "services", params={"active": "Any", "page": 1, "pageSize": 200}
+        "pricebook",
+        "services",
+        params={"active": "Any", "calculatePrices": "true", "page": 1, "pageSize": 200},
     )
+
+
+def test_services_ask_service_titan_to_calculate_dynamic_prices(mock_client) -> None:
+    # Without calculatePrices=true a dynamically priced service comes back with
+    # price 0 and calculatedPrice null, and the consumer sees a free item.
+    mock_client.get.return_value = _envelope([])
+    fetch_pricebook_items(mock_client, "services")
+    assert mock_client.get.call_args.kwargs["params"]["calculatePrices"] == "true"
+
+
+def test_materials_and_equipment_do_not_ask_for_calculated_prices(mock_client) -> None:
+    mock_client.get.return_value = _envelope([])
+    for resource in ("materials", "equipment"):
+        fetch_pricebook_items(mock_client, resource)
+        assert "calculatePrices" not in mock_client.get.call_args.kwargs["params"]
 
 
 def test_active_any_so_withdrawn_items_still_export(mock_client) -> None:
