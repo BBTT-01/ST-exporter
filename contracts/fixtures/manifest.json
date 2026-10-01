@@ -102,6 +102,16 @@
           "row_count": 1
         }
       }
+    },
+    "dispatch": {
+      "contract_version": "dispatch.v1",
+      "tabs": {
+        "dispatch.nonJobAppointments": {
+          "path": "dispatch.v1/dispatch.nonJobAppointments.json",
+          "sha256": "cf54882beee949dc405b0e3640d4b092b6b0dee9e887fefed2211f24652426f0",
+          "row_count": 5
+        }
+      }
     }
   }
 }

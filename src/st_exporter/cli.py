@@ -35,10 +35,12 @@ def run_once(
         "--feeds",
         help=(
             "Comma-separated feeds to run this call: jobs, technicians, pricebook, "
-            "financial, images, outbox. `pricebook` writes the four pricebook.* tabs and "
-            "`financial` the four Profit Wizard tabs (accounting.invoices, "
+            "financial, dispatch, images, outbox. `pricebook` writes the four pricebook.* "
+            "tabs and `financial` the four Profit Wizard tabs (accounting.invoices, "
             "payroll.timesheets, settings.businessUnits, reporting.jobCosts); neither "
-            "is on by default. `images` writes no tab either — it re-lists the pricebook "
+            "is on by default. `dispatch` writes dispatch.nonJobAppointments for Profit "
+            "Wizard's dispatch board and runs only where a caller asks for it. `images` "
+            "writes no tab either — it re-lists the pricebook "
             "and POSTs item image BYTES to TrueQuote, bounded by the job timeout and "
             "resumed by the next run. `outbox` writes no tab at all — it drains the "
             "outbox queue of every product whose secrets are set, and it must appear in "
@@ -473,6 +475,15 @@ def _summary_line(
             # costing jobs and not, and it must not be something you have to go
             # digging for.
             message += " financial_failed=" + ",".join(sorted(summary.financial_failures))
+        if summary.dispatch_row_counts is not None:
+            message += "".join(
+                f" {_tab_key(tab)}={count}"
+                for tab, count in sorted(summary.dispatch_row_counts.items())
+            )
+        if summary.dispatch_failures:
+            message += " dispatch_failed=" + ",".join(
+                _tab_key(tab) for tab in sorted(summary.dispatch_failures)
+            )
         if summary.images is not None:
             message += _image_fields(summary.images)
 

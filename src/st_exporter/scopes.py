@@ -99,6 +99,10 @@ TAB_PERMISSIONS: dict[str, str] = {
     "settings.businessUnits": "Settings -> Business Units",
     "reporting.jobCosts": "Reporting -> Reports (report categories, reports, report data)",
     "sales.estimates": "Sales & Estimates -> Estimates",
+    "dispatch.nonJobAppointments": (
+        "Dispatch -> Non-Job Appointments (Payroll -> Timesheet Codes is optional and "
+        "only fills timesheet_code_name)"
+    ),
 }
 
 

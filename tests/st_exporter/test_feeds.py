@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from st_cli.exceptions import ConfigError
-from st_exporter.run import DEFAULT_FEEDS, EXPORT_FEEDS, IMAGES_FEED, parse_feeds
+from st_exporter.run import DEFAULT_FEEDS, DISPATCH_FEED, EXPORT_FEEDS, IMAGES_FEED, parse_feeds
 
 
 class TestParseFeeds:
@@ -81,3 +81,28 @@ class TestTheImagesFeed:
         """A contractor who mistypes it must be told the feed exists."""
         with pytest.raises(ConfigError, match="images"):
             parse_feeds("imagez")
+
+
+class TestTheDispatchFeed:
+    """`dispatch` writes `dispatch.nonJobAppointments`, and only for a connector
+    that asks for it by name."""
+
+    def test_dispatch_is_a_valid_feed(self) -> None:
+        assert parse_feeds("dispatch") == {"dispatch"}
+        assert DISPATCH_FEED == "dispatch"
+
+    def test_dispatch_is_an_export_feed(self) -> None:
+        """It writes a tab and a `_meta` row, so it must share the export lock
+        and be handed to `run_export`."""
+        assert DISPATCH_FEED in EXPORT_FEEDS
+
+    def test_dispatch_is_not_a_default_feed(self) -> None:
+        """Opt-in: a TradeRated or TrueQuote connector never runs it."""
+        assert DISPATCH_FEED not in DEFAULT_FEEDS
+
+    def test_dispatch_combines_with_the_other_feeds(self) -> None:
+        assert parse_feeds("jobs,dispatch") == {"jobs", "dispatch"}
+
+    def test_the_error_message_names_dispatch(self) -> None:
+        with pytest.raises(ConfigError, match="dispatch"):
+            parse_feeds("dispatchh")

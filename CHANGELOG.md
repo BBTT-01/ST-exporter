@@ -4,6 +4,49 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Non-job appointments for Profit Wizard's dispatch board
+
+### Added: the opt-in `dispatch` feed and its `dispatch.nonJobAppointments` tab (`dispatch.v1`)
+
+Profit Wizard's dispatch board could see a technician's jobs but not the rest of
+their calendar — lunch, training, meetings, PTO — so a technician blocked out for
+the afternoon looked free. ServiceTitan keeps those as non-job appointments, and
+they now get a tab: one row per appointment (one per occurrence of a repeating
+event), columns `st_non_job_appointment_id, st_technician_id, start, duration,
+all_day, active, remove_technician_from_capacity_planning, name,
+timesheet_code_id, timesheet_code_name`.
+
+- **Opt-in by feed name.** `dispatch` is a new `--feeds` value, in no default and
+  in no job of the example caller workflow, so TradeRated and TrueQuote
+  connectors are untouched. A connector enables it with a job asking for
+  `feeds: "dispatch"`, added in the same commit that repins to the release
+  containing this feed: an older tag rejects the unknown feed name. It shares the
+  export lock and writes its `_meta` row; every other feed's run carries that row
+  forward.
+- **Window sent server-side**: `startsOnOrAfter` UTC midnight seven days ago,
+  `startsOnOrBefore` UTC midnight fifteen days ahead, `activeOnly=true`. All three
+  were confirmed honoured on a live tenant; a misspelling is silently ignored by
+  ServiceTitan, so records outside the window are logged as a warning.
+- **`start` and `duration` verbatim.** There is no end field upstream; the end is
+  `start + duration`, a .NET TimeSpan string (`02:10:00.5000000`, all-day
+  `23:59:59`), and that arithmetic is the consumer's.
+- **`timesheet_code_id` blank for `0`**, ServiceTitan's "no code".
+  `timesheet_code_name` is resolved from `payroll/timesheet-codes` with
+  `active=Any`; a tenant without that optional permission gets every row with
+  the name blank, logged at INFO and not annotated. Both columns are in
+  `ALL_BLANK_OK`.
+- **Fails like a pricebook or financial tab.** Behind `_TabGuard`: a non-403
+  leaves the previous tab and `_meta` row, is named as `dispatch_failed=` and
+  keeps the run green. A 403 goes to the scope ledger like every tab's — quiet
+  and tab-free when never granted, red when revoked.
+- A wholly new tab, so its own version, **`dispatch.v1`**, with a fixture under
+  `contracts/fixtures/dispatch.v1/`. No released fixture moved. The fixture
+  phone-number guard now also strips TimeSpan durations, which it otherwise
+  reads as a nine-digit number.
+
+Record shape, filters and scopes confirmed read-only against a live tenant
+(`KNOWN_UNVERIFIED.md`).
+
 ## [Unreleased] · Dynamic prices on `pricebook.services`
 
 ### Added: `calculated_price`, `use_static_prices`, `is_price_locked`; services fetched with `calculatePrices=true`

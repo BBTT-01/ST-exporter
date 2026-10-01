@@ -423,6 +423,17 @@ ALL_BLANK_OK: dict[str, dict[str, str]] = {
     "payroll.timesheets": {
         "CanceledOn": "Blank unless a job was cancelled; a clean window has none.",
     },
+    "dispatch.nonJobAppointments": {
+        "timesheet_code_id": (
+            "ServiceTitan sends 0 for an appointment with no timesheet code, written "
+            "blank; most non-job appointments carry none, so a tenant can be blank on "
+            "every row."
+        ),
+        "timesheet_code_name": (
+            "Blank wherever timesheet_code_id is, and on every row of a tenant whose "
+            "app was not granted Payroll -> Timesheet Codes, which is optional."
+        ),
+    },
 }
 
 

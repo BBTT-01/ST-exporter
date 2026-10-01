@@ -715,6 +715,30 @@ class TestAFailedFeedRedsTheRun:
         assert code == 0
         assert "financial_failed=reporting.jobCosts" in capsys.readouterr().out
 
+    def test_a_failed_dispatch_tab_still_exits_zero(self, monkeypatch, capsys) -> None:
+        """A per-tab failure like pricebook's and financial's: named, not red."""
+        code = self._run(
+            monkeypatch,
+            _summary(
+                dispatch_row_counts={},
+                dispatch_failures={"dispatch.nonJobAppointments": "HTTP 500: boom"},
+            ),
+            feeds="dispatch",
+        )
+        assert code == 0
+        assert "dispatch_failed=dispatch_nonJobAppointments" in capsys.readouterr().out
+
+    def test_a_written_dispatch_tab_is_counted_in_the_run_output(self, monkeypatch, capsys) -> None:
+        code = self._run(
+            monkeypatch,
+            _summary(dispatch_row_counts={"dispatch.nonJobAppointments": 3}),
+            feeds="dispatch",
+        )
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "dispatch_nonJobAppointments=3" in out
+        assert "dispatch_failed" not in out
+
     def test_a_feed_failure_and_a_healthy_pricebook_still_reds_the_run(
         self, monkeypatch, capsys
     ) -> None:

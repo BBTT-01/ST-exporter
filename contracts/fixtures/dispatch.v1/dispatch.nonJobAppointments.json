@@ -1,0 +1,28 @@
+{
+  "feed": "dispatch",
+  "contract_version": "dispatch.v1",
+  "tab": "dispatch.nonJobAppointments",
+  "grain": "one row per non-job appointment ServiceTitan lists for the window with activeOnly=true; a repeating event is one row per occurrence; records with no id are dropped and a repeated id is written once",
+  "row_key": [
+    "st_non_job_appointment_id"
+  ],
+  "columns": [
+    "st_non_job_appointment_id",
+    "st_technician_id",
+    "start",
+    "duration",
+    "all_day",
+    "active",
+    "remove_technician_from_capacity_planning",
+    "name",
+    "timesheet_code_id",
+    "timesheet_code_name"
+  ],
+  "rows": [
+    ["801", "9", "2026-09-15T17:00:00Z", "01:00:00", "false", "true", "false", "Lunch", "", ""],
+    ["802", "10", "2026-09-16T14:30:00.123Z", "02:10:00.5000000", "false", "true", "true", "Training", "3", "TRAIN"],
+    ["803", "9", "2026-09-17T00:00:00Z", "23:59:59", "true", "true", "true", "PTO", "4", "PTO"],
+    ["804", "11", "2026-09-18T15:00:00Z", "00:45:00", "false", "true", "false", "Ride-along", "99", ""],
+    ["805", "10", "2026-09-18T18:00:00Z", "00:30:00", "", "", "", "Meeting", "", ""]
+  ]
+}

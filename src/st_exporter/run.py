@@ -20,6 +20,8 @@ from st_exporter import EXPORTER_VERSION
 from st_exporter.blank_columns import check_blank_columns
 from st_exporter.config import ExporterSettings
 from st_exporter.denormalize import apply_customer_contacts, build_job_rows, customer_ids
+from st_exporter.dispatch import CONTRACT_VERSION as DISPATCH_CONTRACT_VERSION
+from st_exporter.dispatch import NON_JOB_APPOINTMENTS_TAB, build_non_job_grid
 from st_exporter.feeds.appointments import fetch_appointments_delta
 from st_exporter.feeds.assignments import fetch_assignments_delta
 from st_exporter.feeds.contacts import (
@@ -34,6 +36,7 @@ from st_exporter.feeds.contacts import (
     group_contacts_by_customer,
 )
 from st_exporter.feeds.customers import fetch_customers_delta
+from st_exporter.feeds.dispatch import fetch_non_job_appointments
 from st_exporter.feeds.financial import (
     DEFAULT_MAX_TIMESHEET_JOBS,
     fetch_completed_job_ids,
@@ -125,15 +128,22 @@ OUTBOX_FEED = "outbox"
 # Splitting it out gives it its own timeout, its own cadence and its own lock.
 # See `run_images` for where an independent pass gets its image references.
 IMAGES_FEED = "images"
-EXPORT_FEEDS = frozenset({"jobs", "technicians", "pricebook", "financial"})
+# `dispatch` writes `dispatch.nonJobAppointments` for Profit Wizard's dispatch
+# board. An export feed like the rest — it shares the export lock and writes its
+# `_meta` row — but OPT-IN by name: only a connector whose workflow has a job
+# asking for `dispatch` ever runs it, so no TradeRated or TrueQuote connector
+# gains a request, a tab or a permission question it never asked for.
+DISPATCH_FEED = "dispatch"
+EXPORT_FEEDS = frozenset({"jobs", "technicians", "pricebook", "financial", DISPATCH_FEED})
 _VALID_FEEDS = EXPORT_FEEDS | {OUTBOX_FEED, IMAGES_FEED}
-_FEED_LIST = "jobs, technicians, pricebook, financial, images, outbox"
+_FEED_LIST = "jobs, technicians, pricebook, financial, dispatch, images, outbox"
 # Neither `pricebook` nor `financial` is a default. `pricebook` is a catalogue on a
 # much slower cadence than jobs (~5 min) and technicians (~30 min), and re-listing
 # it on every jobs run would be pure waste. `financial` is a six-hourly feed —
 # matching the cadence of the Profit Wizard cron it replaces — and its job-costing
 # half runs a ServiceTitan report, which is throttled to roughly one run per minute
 # per tenant, so putting it on the jobs cadence would throttle the tenant outright.
+# `dispatch` is not a default either: it runs only where a connector names it.
 DEFAULT_FEEDS = frozenset({"jobs", "technicians"})
 
 # The four tabs the single `pricebook` feed writes, tab name -> ServiceTitan
@@ -171,10 +181,16 @@ FINANCIAL_FEED_NAMES: tuple[str, ...] = (
     FINANCIAL_ESTIMATES_TAB,
 )
 
+#: The tab the `dispatch` feed writes. Profit Wizard's reader addresses this
+#: exact string (`lib/hosted/tabs.ts`).
+DISPATCH_FEED_NAMES: tuple[str, ...] = (NON_JOB_APPOINTMENTS_TAB,)
+
 # Every export tab this exporter can write — the unit a ServiceTitan permission is
 # granted over, and therefore the unit a 403 is classified over. `scopes` keys its
 # permission strings by these exact names; a test holds the two in step.
-EXPORT_TABS: tuple[str, ...] = ("jobs", "technicians") + PRICEBOOK_FEED_NAMES + FINANCIAL_FEED_NAMES
+EXPORT_TABS: tuple[str, ...] = (
+    ("jobs", "technicians") + PRICEBOOK_FEED_NAMES + FINANCIAL_FEED_NAMES + DISPATCH_FEED_NAMES
+)
 
 
 def parse_feeds(value: str) -> frozenset[str]:
@@ -222,6 +238,10 @@ class ExportSummary:
     # Tab name -> why it was skipped, for the financial tabs that failed. Its
     # previous contents and its `_meta` row are left untouched in the Sheet.
     financial_failures: dict[str, str] | None = None
+    # The same pair for the opt-in `dispatch` feed: None when it was not selected,
+    # and a failed tab is absent from the counts and named in the failures.
+    dispatch_row_counts: dict[str, int] | None = None
+    dispatch_failures: dict[str, str] | None = None
     # Feed name -> why it failed, for the two top-level feeds (`jobs`,
     # `technicians`). A feed named here was NOT written this run and its `_meta`
     # row — cursor included — was carried forward unchanged, so the next run
@@ -282,6 +302,9 @@ def run_export(
     ``financial.py``/``sales.py``. Its tabs are independent: one failing leaves
     the others written and keeps the failed tab's previous contents and
     `_meta` row.
+
+    ``dispatch`` writes `dispatch.nonJobAppointments` behind the same per-tab
+    guard — see ``dispatch.py`` — and runs only when a caller names it.
 
     ``client``/``export_store``/``raw_cache_store`` can be injected (used by tests
     with fixtures and an in-memory Sheets double); left as ``None`` in production,
@@ -668,14 +691,36 @@ def _run(
             if feed_name in meta_rows:
                 new_meta_rows.carry(meta_rows[feed_name])
 
+    dispatch_row_counts: dict[str, int] | None = None
+    dispatch_failures: dict[str, str] | None = None
+    if DISPATCH_FEED in feeds:
+        dispatch_row_counts, dispatch_failures = _run_dispatch_feed(
+            client,
+            export_store,
+            meta_rows=meta_rows,
+            new_meta_rows=new_meta_rows,
+            run_at=run_at,
+            today=today,
+            scopes=scopes,
+            dry_run=dry_run,
+        )
+    else:
+        # Every run that does not ask for `dispatch` — which is every run of every
+        # other feed job — rewrites `_meta` whole, so without this the tab's row
+        # would vanish from `_meta` on the next jobs run after it was written.
+        for feed_name in DISPATCH_FEED_NAMES:
+            if feed_name in meta_rows:
+                new_meta_rows.carry(meta_rows[feed_name])
+
     if dry_run:
         logger.info(
             "dry-run: would write jobs=%d technicians=%d pricebook=%s financial=%s "
-            "(nothing written)",
+            "dispatch=%s (nothing written)",
             jobs_row_count,
             technicians_row_count,
             pricebook_row_counts,
             financial_row_counts,
+            dispatch_row_counts,
         )
     else:
         # ONE write for every feed, and every feed above is guarded, so this line
@@ -731,6 +776,8 @@ def _run(
         images=image_summary,
         financial_row_counts=financial_row_counts,
         financial_failures=financial_failures,
+        dispatch_row_counts=dispatch_row_counts,
+        dispatch_failures=dispatch_failures,
         scope_not_granted=dict(scopes.not_granted),
         scope_revoked=dict(scopes.revoked),
         jobs_write_back=jobs_write_back,
@@ -1486,6 +1533,52 @@ def _run_financial_feed(
     logger.info(
         "financial (window=%dd): %s",
         window_days,
+        " ".join(f"{tab}={count}" for tab, count in sorted(guard.row_counts.items()))
+        or "nothing written",
+    )
+
+    guard.write(export_store, dry_run=dry_run)
+
+    return guard.row_counts, guard.failures
+
+
+def _run_dispatch_feed(
+    client: ServiceTitanClient,
+    export_store: SheetsPort,
+    *,
+    meta_rows: dict[str, MetaRow],
+    new_meta_rows: MetaRowSet,
+    run_at: str,
+    today: Any,
+    scopes: ScopeLedger | None = None,
+    dry_run: bool,
+) -> tuple[dict[str, int], dict[str, str]]:
+    """Write `dispatch.nonJobAppointments`; append its MetaRow if it succeeded.
+
+    One tab behind a ``_TabGuard`` rather than ``_guarded_feed``, so it fails the
+    way a pricebook or financial tab does: a non-403 leaves the previous tab and
+    `_meta` row in place, is named in the summary, and keeps the run green. A 403
+    goes to the ``ScopeLedger`` like every other tab's: quiet when never granted,
+    red when revoked.
+
+    A window-bounded full replace with no cursor, re-derived every run: the
+    window moves with the date, so membership is re-decided each time.
+    """
+    guard = _TabGuard(
+        label="dispatch",
+        contract_version=DISPATCH_CONTRACT_VERSION,
+        meta_rows=meta_rows,
+        new_meta_rows=new_meta_rows,
+        run_at=run_at,
+        scopes=scopes,
+    )
+    guard.attempt(
+        NON_JOB_APPOINTMENTS_TAB,
+        lambda: (build_non_job_grid(fetch_non_job_appointments(client, today=today)), None),
+    )
+
+    logger.info(
+        "dispatch: %s",
         " ".join(f"{tab}={count}" for tab, count in sorted(guard.row_counts.items()))
         or "nothing written",
     )

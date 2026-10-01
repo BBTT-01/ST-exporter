@@ -40,6 +40,7 @@ beside `exporter_version`.
 | `financial` | **`financial.v1`** | `accounting.invoices`, `payroll.timesheets`, `settings.businessUnits`, `reporting.jobCosts` |
 | `sales` | **`sales.v1`** | `sales.estimates` |
 | `pricebook_bom` | **`pricebook_bom.v1`** | `pricebook.serviceMaterials`, `pricebook.serviceEquipment`, `pricebook.equipmentMaterials` |
+| `dispatch` | **`dispatch.v1`** | `dispatch.nonJobAppointments` (opt-in feed, see below) |
 
 The source of truth is `src/st_exporter/contracts.py`, and
 `contracts/fixtures/manifest.json` carries the same numbers in machine-readable
@@ -172,6 +173,58 @@ consumer needs:
 - **No row key.** No sku was seen twice on one parent on a live tenant, but that
   is evidence rather than a documented rule, so a repeat is two rows. Sum
   `quantity` per `(parent_st_id, sku_id)` rather than assuming uniqueness.
+
+### Why `dispatch` has its own version, and why it is opt-in
+
+`dispatch.nonJobAppointments` is one row per ServiceTitan **non-job appointment**
+— lunch, training, a meeting, PTO — on a technician's calendar, for Profit
+Wizard's dispatch board: it is what tells "free at 2pm" apart from "busy at 2pm
+with something that is not a job". A wholly new tab, so — like `sales.estimates`
+and the bill of materials — it carries its own version, `dispatch.v1`.
+
+What a consumer needs to know about its cells:
+
+- **There is no end column, because ServiceTitan has no end field.** The end is
+  `start + duration`. `start` is ServiceTitan's string verbatim: UTC with a `Z`,
+  sometimes with milliseconds. `duration` is a .NET TimeSpan string, also
+  verbatim — `[d.]hh:mm:ss[.fffffff]`, e.g. `01:00:00` or `02:10:00.5000000` —
+  and an all-day appointment has `all_day` `true` and `duration` `23:59:59`.
+- **`timesheet_code_id` is blank for "no code".** ServiceTitan sends `0` for that,
+  and a `"0"` cell would read as a code whose id is zero.
+- **`timesheet_code_name` is optional.** It is resolved from Payroll's timesheet
+  codes, which needs a permission of its own (`Payroll -> Timesheet Codes`). A
+  tenant without it still gets every row, with this one column blank.
+- **The window is by `start`**: UTC midnight seven days ago to UTC midnight
+  fifteen days ahead, active appointments only. An appointment that started
+  before the window is absent even if its duration reaches into it.
+- **Row key `st_non_job_appointment_id`.** A repeating event arrives as one
+  record per occurrence, so one row is one occurrence.
+
+**It runs only where a connector asks for it.** Every other feed job runs on
+every connector. `dispatch` is a feed name of its own that is in no default and
+in no job of `docs/examples/connector-export.yml`, so a TradeRated or TrueQuote
+connector never fetches it and never has the tab — an absent
+`dispatch.nonJobAppointments` means "this connector did not opt in" as often as
+"the permission was never granted". A connector turns it on with a job of its
+own:
+
+```yaml
+  dispatch-feed:
+    if: >-
+      github.event.schedule == '<its cron>' || github.event.inputs.feed == 'dispatch'
+    uses: BBTT-01/ST-exporter/.github/workflows/export.yml@exporter-v<the release>
+    with:
+      feeds: "dispatch"
+    secrets:
+      # the same seven as financial-feed
+```
+
+plus that cron line under `on.schedule` and `dispatch` among the
+`workflow_dispatch` options. **Add the job in the same commit that repins every
+`uses:` line to the release that contains this feed.** An older tag's
+`export.yml` rejects the unknown feed name before the exporter starts, so a job
+added ahead of the repin fails on every run. The job shares the export lock, and
+every other feed's run carries its `_meta` row forward unchanged.
 
 ### A blank `contract_version`
 
@@ -309,6 +362,7 @@ contracts/fixtures/financial.v1/…          (timesheets, businessUnits, jobCost
 contracts/fixtures/sales.v1/sales.estimates.json
 contracts/fixtures/pricebook_bom.v1/pricebook.serviceMaterials.json
 contracts/fixtures/pricebook_bom.v1/…     (serviceEquipment, equipmentMaterials)
+contracts/fixtures/dispatch.v1/dispatch.nonJobAppointments.json
 ```
 
 **Format is JSON**, because three of the four codebases are TypeScript and one is
@@ -416,7 +470,13 @@ are one careless edit from going wrong:
 - on the bill-of-materials tabs, a **fractional `quantity`** beside a **null**
   one (blank, never `0`), an entry **dropped** for having no `skuId` and one
   dropped for not being an object, and a parent with **no id** whose links are
-  dropped with it.
+  dropped with it;
+- on `dispatch.nonJobAppointments`, a `start` **with milliseconds** beside ones
+  without, a `duration` with a **seven-digit fraction** and an all-day
+  **`23:59:59`**, a `timesheetCodeId` of **`0`** (blank) beside a code whose name
+  resolved and one whose name did **not** (id written, name blank), **absent
+  booleans** (blank, never `false`), a record **dropped** for having no id, and
+  one record returned **twice** and written once.
 
 ## How a consumer verifies itself — without vendoring a copy that can drift
 

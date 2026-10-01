@@ -120,6 +120,15 @@ class TestExemptions:
         # no tenant can fill it. Pinned so the exemption cannot quietly widen.
         assert set(ALL_BLANK_OK["settings.businessUnits"]) == {"Code"}
 
+    def test_only_the_timesheet_code_columns_are_exempt_on_the_dispatch_tab(self) -> None:
+        """Most non-job appointments carry no code, and the code names need an
+        optional permission. Every other column, `start` and `duration` above
+        all, stays reportable."""
+        assert set(ALL_BLANK_OK["dispatch.nonJobAppointments"]) == {
+            "timesheet_code_id",
+            "timesheet_code_name",
+        }
+
     def test_the_unverified_columns_are_not_exempt_anywhere(self) -> None:
         """The spellings this detector exists to catch must never be suppressed."""
         for column in ("job_number", "customer_phone", "customer_email", "st_technician_id"):

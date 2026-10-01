@@ -73,7 +73,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable
 
-from st_exporter import financial, pricebook, pricebook_bom, sales
+from st_exporter import dispatch, financial, pricebook, pricebook_bom, sales
 from st_exporter import format as tab_format
 
 #: A callable that turns a list of source records into the exact grid (header row
@@ -276,8 +276,37 @@ PRICEBOOK_BOM = FeedContract(
     ),
 )
 
+#: `dispatch.nonJobAppointments` is written only by the opt-in `dispatch` feed,
+#: so a connector that never asks for it never has the tab. A wholly new tab, so
+#: its own version.
+DISPATCH = FeedContract(
+    feed="dispatch",
+    version=dispatch.CONTRACT_VERSION,
+    tabs=(
+        TabContract(
+            name=dispatch.NON_JOB_APPOINTMENTS_TAB,
+            columns=dispatch.NON_JOB_APPOINTMENT_COLUMNS,
+            grain=(
+                "one row per non-job appointment ServiceTitan lists for the window "
+                "with activeOnly=true; a repeating event is one row per occurrence; "
+                "records with no id are dropped and a repeated id is written once"
+            ),
+            row_key=dispatch.NON_JOB_APPOINTMENT_KEY_COLUMNS,
+            build=dispatch.build_non_job_grid,
+        ),
+    ),
+)
+
 #: Every feed that writes a versioned tab, in the order they appear in `_meta`.
-FEEDS: tuple[FeedContract, ...] = (JOBS, TECHNICIANS, PRICEBOOK, FINANCIAL, SALES, PRICEBOOK_BOM)
+FEEDS: tuple[FeedContract, ...] = (
+    JOBS,
+    TECHNICIANS,
+    PRICEBOOK,
+    FINANCIAL,
+    SALES,
+    PRICEBOOK_BOM,
+    DISPATCH,
+)
 
 #: Feed name -> contract version, i.e. exactly what lands in `_meta.contract_version`.
 CONTRACT_VERSIONS: dict[str, str] = {contract.feed: contract.version for contract in FEEDS}
