@@ -99,7 +99,7 @@ def test_the_window_reaches_servicetitan_as_query_parameters(
 
     [request] = [c.request for c in respx.calls if c.request.url.path == f"/{NON_JOB_URL}"]
     assert request.url.params["startsOnOrAfter"] == "2026-09-07T00:00:00Z"
-    assert request.url.params["startsOnOrBefore"] == "2026-09-29T00:00:00Z"
+    assert request.url.params["startsOnOrBefore"] == "2026-09-30T00:00:00Z"
     assert request.url.params["activeOnly"] == "true"
 
 

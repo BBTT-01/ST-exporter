@@ -1,6 +1,8 @@
 """What a ServiceTitan **403** means for one output TAB: never bought, or taken away.
 
-Every feed job in the caller workflow runs on its schedule for every connector.
+Every feed job in the caller workflow runs on its schedule for every connector,
+except the opt-in `dispatch` feed, which runs only where a connector's workflow
+has a job naming it; there an absent tab can also mean "not opted in".
 Nothing in the YAML says which feeds a contractor bought, because the contractor
 already said so: the boxes they ticked when they created the ServiceTitan app ARE
 the statement. A repository variable repeating it was a second, hand-maintained
@@ -99,6 +101,8 @@ TAB_PERMISSIONS: dict[str, str] = {
     "settings.businessUnits": "Settings -> Business Units",
     "reporting.jobCosts": "Reporting -> Reports (report categories, reports, report data)",
     "sales.estimates": "Sales & Estimates -> Estimates",
+    # UNVERIFIED (KNOWN_UNVERIFIED.md): derived from the scope strings, not read off
+    # the Developer Portal UI.
     "dispatch.nonJobAppointments": (
         "Dispatch -> Non-Job Appointments (Payroll -> Timesheet Codes is optional and "
         "only fills timesheet_code_name)"

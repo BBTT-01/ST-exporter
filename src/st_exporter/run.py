@@ -304,7 +304,7 @@ def run_export(
     `_meta` row.
 
     ``dispatch`` writes `dispatch.nonJobAppointments` behind the same per-tab
-    guard — see ``dispatch.py`` — and runs only when a caller names it.
+    guard — see ``_run_dispatch_feed`` — and runs only when a caller names it.
 
     ``client``/``export_store``/``raw_cache_store`` can be injected (used by tests
     with fixtures and an in-memory Sheets double); left as ``None`` in production,

@@ -195,7 +195,7 @@ What a consumer needs to know about its cells:
   codes, which needs a permission of its own (`Payroll -> Timesheet Codes`). A
   tenant without it still gets every row, with this one column blank.
 - **The window is by `start`**: UTC midnight seven days ago to UTC midnight
-  fifteen days ahead, active appointments only. An appointment that started
+  sixteen days ahead, active appointments only. An appointment that started
   before the window is absent even if its duration reaches into it.
 - **Row key `st_non_job_appointment_id`.** A repeating event arrives as one
   record per occurrence, so one row is one occurrence.
@@ -306,7 +306,9 @@ These are part of the contract, not implementation detail:
 - A row with a blank key column is dropped by the exporter, not written — so
   `_meta.row_count` means what a reconciler thinks it means.
 - **An absent TAB means absent, not empty.** The same rule one level up. Every
-  feed job runs on every connector's schedule, and a tab the tenant's
+  feed job runs on every connector's schedule (except the opt-in `dispatch`
+  feed, whose tab is also absent wherever a connector never asked for it), and a
+  tab the tenant's
   ServiceTitan app was never granted is refused with a 403 and is not written at
   all: a contractor who did not buy TrueQuote has no `pricebook.*` tabs and no
   `pricebook` rows in `_meta`. Do not read that as "a catalogue with nothing in

@@ -24,7 +24,7 @@ timesheet_code_id, timesheet_code_name`.
   export lock and writes its `_meta` row; every other feed's run carries that row
   forward.
 - **Window sent server-side**: `startsOnOrAfter` UTC midnight seven days ago,
-  `startsOnOrBefore` UTC midnight fifteen days ahead, `activeOnly=true`. All three
+  `startsOnOrBefore` UTC midnight sixteen days ahead, `activeOnly=true`. All three
   were confirmed honoured on a live tenant; a misspelling is silently ignored by
   ServiceTitan, so records outside the window are logged as a warning.
 - **`start` and `duration` verbatim.** There is no end field upstream; the end is

@@ -23,13 +23,14 @@ from st_exporter.feeds.dispatch import (
     fetch_non_job_appointments,
     fetch_timesheet_code_names,
     warn_if_outside_window,
+    warn_if_repeated_ids,
     window_bounds,
 )
 from tests.st_exporter.fixtures import tenant_dispatch
 
 TODAY = date(2026, 9, 14)
 START = datetime(2026, 9, 7, tzinfo=timezone.utc)
-END = datetime(2026, 9, 29, tzinfo=timezone.utc)
+END = datetime(2026, 9, 30, tzinfo=timezone.utc)
 
 
 @pytest.fixture(autouse=True)
@@ -101,7 +102,7 @@ class TestRouting:
 
 
 class TestWindow:
-    def test_the_bounds_are_utc_midnights_seven_back_and_fifteen_ahead(self) -> None:
+    def test_the_bounds_are_utc_midnights_seven_back_and_sixteen_ahead(self) -> None:
         assert window_bounds(TODAY) == (START, END)
 
     def test_the_window_is_sent_server_side_with_the_live_verified_spellings(self) -> None:
@@ -111,7 +112,7 @@ class TestWindow:
         params = call.kwargs["params"]
         assert (START_PARAM, END_PARAM) == ("startsOnOrAfter", "startsOnOrBefore")
         assert params["startsOnOrAfter"] == "2026-09-07T00:00:00Z"
-        assert params["startsOnOrBefore"] == "2026-09-29T00:00:00Z"
+        assert params["startsOnOrBefore"] == "2026-09-30T00:00:00Z"
         assert params["activeOnly"] == "true"
         assert params["pageSize"] == 200
 
@@ -149,6 +150,22 @@ class TestTheTripwire:
     def test_an_unparseable_start_is_not_a_crash(self, caplog) -> None:
         warn_if_outside_window([{"start": "not a date"}, {"start": None}], start=START, end=END)
         assert "outside the requested window" not in caplog.text
+
+
+class TestRepeatedIds:
+    def test_distinct_ids_are_quiet(self, caplog) -> None:
+        warn_if_repeated_ids(tenant_dispatch.APPOINTMENTS)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_a_repeated_id_warns_with_the_count(self, caplog) -> None:
+        records = [{"id": 1}, {"id": 2}, {"id": 1}, {"id": 1}, {"id": None}, {}]
+        warn_if_repeated_ids(records)
+        assert "2 non-job appointment record(s) repeated an id" in caplog.text
+
+    def test_the_fetch_runs_it(self, caplog) -> None:
+        twice = [tenant_dispatch.LUNCH, tenant_dispatch.LUNCH]
+        fetch_non_job_appointments(_client(appointments=twice), today=TODAY)
+        assert "repeated an id" in caplog.text
 
 
 class TestTheCodeNames:

@@ -957,21 +957,27 @@ Confirmed 2026-10-01 by a read-only probe of a production tenant
   comes back with no error, which is why `warn_if_outside_window` checks every
   record's `start` against both ends of the window.
 - **Repeating events — CONFIRMED** one record per occurrence, with no repeat
-  fields in the response.
+  fields in the response, and **each occurrence has its own `id`**: across
+  `[-90d, +30d]` (1,513 active records, 586 of them occurrences of 73 repeating
+  series) every `id` was distinct. The tab's row key relies on this;
+  `warn_if_repeated_ids` logs if it ever stops holding.
+- **No block longer than a day — CONFIRMED on that tenant** in the same window:
+  no `duration` carried a days part and none exceeded 24 hours (longest 11h52m),
+  so multi-day time off is not one long record there. The start-only window
+  therefore loses nothing on that tenant; a tenant that does store long blocks
+  as one record would lose any that started more than seven days ago.
 - **Scopes:** `tn.dis.nonjobappointments:r` for the tab, and
   `tn.prl.timesheetcodes:r` for the optional names. A 403 on the second is logged
   at INFO and blanks `timesheet_code_name`; the tab is still written.
 
 Still unverified:
 
-- **That every occurrence of a repeating event has its own `id`.** The tab's row
-  key assumes it. A repeated `id` is written once, first kept, so if two
-  occurrences ever shared one, the second would be lost rather than duplicated.
-- **What an all-day record's `start` is relative to the tenant's timezone.** It is
-  passed through verbatim and not interpreted here, so the exporter is not wrong
-  either way, but a consumer placing it on a calendar day has to know.
-- **Whether a block longer than a day ever carries a days part** (`1.02:00:00`).
-  Passed through verbatim if it does.
+- **What an all-day record's `start` is relative to the tenant's timezone.** The
+  live tenant had no all-day records in 120 days. It is passed through verbatim
+  and not interpreted here, so the exporter is not wrong either way, but a
+  consumer placing it on a calendar day has to know.
+- **Whether any tenant's blocks carry a days part** (`1.02:00:00`). None did on
+  the probed tenant. Passed through verbatim if one does.
 - **The portal names in `TAB_PERMISSIONS`** ("Dispatch -> Non-Job Appointments",
   "Payroll -> Timesheet Codes") are derived from the scope strings, not read off
   the Developer Portal UI.

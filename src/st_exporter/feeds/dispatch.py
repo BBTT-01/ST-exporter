@@ -51,20 +51,19 @@ END_PARAM = "startsOnOrBefore"
 _PAGE_SIZE = 200
 
 
-def window_bounds(
-    today: date,
-    *,
-    lookback_days: int = DISPATCH_LOOKBACK_DAYS,
-    lookahead_days: int = DISPATCH_LOOKAHEAD_DAYS,
-) -> tuple[datetime, datetime]:
-    """UTC midnight ``lookback_days`` before ``today`` and ``lookahead_days`` after it.
+def window_bounds(today: date) -> tuple[datetime, datetime]:
+    """UTC midnight ``DISPATCH_LOOKBACK_DAYS`` before ``today``, ``DISPATCH_LOOKAHEAD_DAYS`` after.
 
     Midnights rather than "now plus or minus N days" so every run inside one UTC
     day asks for exactly the same range — the same reason
     ``feeds.financial.window_start`` uses one.
     """
-    start = datetime.combine(today - timedelta(days=lookback_days), time.min, tzinfo=timezone.utc)
-    end = datetime.combine(today + timedelta(days=lookahead_days), time.min, tzinfo=timezone.utc)
+    start = datetime.combine(
+        today - timedelta(days=DISPATCH_LOOKBACK_DAYS), time.min, tzinfo=timezone.utc
+    )
+    end = datetime.combine(
+        today + timedelta(days=DISPATCH_LOOKAHEAD_DAYS), time.min, tzinfo=timezone.utc
+    )
     return start, end
 
 
@@ -91,6 +90,7 @@ def fetch_non_job_appointments(
         )
     )
     warn_if_outside_window(records, start=start, end=end)
+    warn_if_repeated_ids(records)
     names = fetch_timesheet_code_names(client) if _any_code(records) else {}
     return [
         {
@@ -177,6 +177,33 @@ def warn_if_outside_window(
         START_PARAM,
         END_PARAM,
     )
+
+
+def warn_if_repeated_ids(records: list[dict[str, Any]]) -> None:
+    """Log loudly when one appointment ``id`` comes back more than once.
+
+    Every occurrence of a repeating event carried its own ``id`` on the live
+    tenant, which is what the tab's row key relies on. The grid keeps the first
+    record per ``id``, so if that ever stops holding the later occurrences would
+    vanish from the tab; this makes it visible instead of silent.
+    """
+    seen: set[str] = set()
+    repeated = 0
+    for record in records:
+        appointment_id = str(record.get("id") or "").strip()
+        if not appointment_id:
+            continue
+        if appointment_id in seen:
+            repeated += 1
+        seen.add(appointment_id)
+    if repeated:
+        logger.warning(
+            "dispatch: %d non-job appointment record(s) repeated an id already seen this "
+            "run; dispatch.nonJobAppointments keeps the first per id, so those rows are "
+            "not exported. Every occurrence had its own id on the live tenant; verify "
+            "whether ServiceTitan now shares ids across occurrences.",
+            repeated,
+        )
 
 
 def _any_code(records: list[dict[str, Any]]) -> bool:

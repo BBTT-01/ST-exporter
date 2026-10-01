@@ -73,11 +73,14 @@ TIMESHEET_CODE_NAME_FIELD = "timesheetCodeName"
 def build_non_job_grid(records: list[dict[str, Any]]) -> list[list[str]]:
     """Header row + one row per non-job appointment, for `dispatch.nonJobAppointments`.
 
-    Repeating events arrive from ServiceTitan as one record per occurrence, so
-    one row is one occurrence. A record with no ``id`` is dropped rather than
-    written with a blank key, and a repeated ``id`` — the same record returned on
-    two pages while the list shifted underneath the pagination — is written
-    once, first occurrence kept, so the tab's row key holds.
+    Repeating events arrive from ServiceTitan as one record per occurrence, each
+    with its own ``id`` (confirmed on a live tenant: 1,513 records, 586 of them
+    occurrences of 73 repeating series, 1,513 distinct ids), so one row is one
+    occurrence. A record with no ``id`` is dropped rather than written with a
+    blank key, and a repeated ``id`` — the same record returned on two pages
+    while the list shifted underneath the pagination — is written once, first
+    occurrence kept, so the tab's row key holds. The fetch logs a warning when
+    that happens (``feeds.dispatch.warn_if_repeated_ids``).
     """
     rows: list[list[str]] = []
     seen: set[str] = set()
