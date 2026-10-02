@@ -1162,6 +1162,38 @@ learned the hard way. The serial-request behaviour is deliberately kept — a
 live-tenant lesson outranks an example string — but it is worth re-measuring on a
 real tenant, because batching would cut the filtered fetch's request count.
 
+## `pricebook.categories` held only the top level — FIXED 2026-10-02, nesting partly assumed
+
+`src/st_exporter/pricebook.py`
+
+Rightly Garage Doors (exporter 0.2.42): of 758 active services, 728 referenced a
+category id that was not on `pricebook.categories` (e.g. `19584072`, `19584070`,
+`40078272` "Liftmaster Logic boards"), as did 29 active materials, and
+`parent_id` was blank on every row. `build_category_grid` wrote one row per
+top-level list record and ignored `subcategories`, on the assumption that every
+subcategory was also returned as a top-level record of its own. It is not. The
+grid now walks the tree and writes every node.
+
+**Confirmed on a live tenant:** the categories list does not return the deeper
+categories as top-level records. Nothing else written to the tab told a
+consumer they existed.
+
+**From the spec only:** that every missing category is reachable through
+`subcategories` on `Pricebook.V2.CategoryResponse`, that nesting can go more than
+one level deep, and that a nested node is a full `CategoryResponse` with its own
+`active` and `parentId`. The walk does not depend on the last point: a nested
+node with no `parentId` takes the id of the node it sat under, and a missing
+`active` is blank, never `true`.
+
+**Unverified, and the one that matters for "is this item's category
+inactive":** whether `active=Any` on `/categories` also returns INACTIVE
+subcategories inside `subcategories`, or filters only the top level. If nested
+inactive nodes are dropped, an item in an inactive subcategory still references
+an id absent from the tab, and a consumer has to read "unknown id" as "not
+known to be active" rather than as "active". Measure it by counting item
+`category_ids` absent from the tab on the next Rightly run: it should now be
+zero.
+
 ## `settings.businessUnits.Code` has no field behind it — CONFIRMED ABSENT 2026-09-16
 
 `src/st_exporter/financial.py`, `src/st_exporter/blank_columns.py`

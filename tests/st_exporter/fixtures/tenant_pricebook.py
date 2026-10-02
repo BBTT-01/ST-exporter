@@ -165,7 +165,7 @@ CATEGORY_10 = {
     "skuVideos": [],
     "source": "Pricebook",
     "externalId": "EXT-CAT-10",
-    # Never exported: parent_id already carries every edge in this tree.
+    # Not a column; flattened into rows. CATEGORY_11 is also top level, and wins.
     "subcategories": [{"id": 11, "name": "Doors"}],
 }
 CATEGORY_11 = {
