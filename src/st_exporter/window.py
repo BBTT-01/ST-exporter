@@ -97,3 +97,28 @@ def _parse_utc_date(iso_timestamp: str) -> date:
 #: (``cost-sync-schedule.ts``, ``maxLookbackDays = 45``); 45 is not enough for
 #: the feed as a whole because the same tabs feed the 90-day surfaces above.
 FINANCIAL_WINDOW_DAYS = 90
+
+
+# ---------------------------------------------------------------------------
+# The dispatch window — a third, separate decision from the two above
+# ---------------------------------------------------------------------------
+
+#: How far back and ahead of today the `dispatch` feed lists non-job
+#: appointments: from UTC midnight seven days ago to UTC midnight sixteen days
+#: on (``feeds.dispatch.window_bounds``). Unrelated to the jobs window above,
+#: which keeps 90 days of history for a different reader.
+#:
+#: Profit Wizard replaces the current and the next local Sunday-Saturday week from
+#: this tab, and trusts a tab up to 24 hours old. Its window can therefore end on
+#: local midnight fourteen days after the day it reads, one local day after the
+#: export ran, which in a US timezone is past UTC midnight fifteen days after the
+#: export. Sixteen keeps that whole fortnight inside the tab; seven back covers
+#: the start of the current week the same way.
+#:
+#: Measured on ``start`` only, because that is the only filter ServiceTitan
+#: offers: an appointment that began before the cutoff is absent even if its
+#: ``duration`` reaches into the window. A block longer than a week that started
+#: more than a week ago is the one shape that loses to it; none longer than a day
+#: was seen on the live tenant (see ``KNOWN_UNVERIFIED.md``).
+DISPATCH_LOOKBACK_DAYS = 7
+DISPATCH_LOOKAHEAD_DAYS = 16

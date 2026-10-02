@@ -953,6 +953,10 @@ _PHONE = re.compile(r"\+?\d[\d ().-]{5,}\d")
 #: ISO timestamps are stripped before the scan: ``2026-09-03`` is eight digits
 #: with separators and is not a phone number.
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})?)?")
+#: So are .NET TimeSpan durations: ``02:10:00.5000000`` is the seconds and a
+#: seven-digit fraction, nine digits with a dot, and not a phone number. Two
+#: colons are required, which no way of writing a phone number has.
+_TIMESPAN = re.compile(r"\b(?:\d+\.)?\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?\b")
 #: So are the sha256 digests in manifest.json and published.json — a hex digest
 #: contains long digit runs and no customer ever had one for a phone number.
 _DIGEST = re.compile(r"\b[0-9a-f]{32,}\b")
@@ -973,6 +977,11 @@ def _is_reserved_mailbox(address: str) -> bool:
     with the text of one. ``jane@notexample.com`` is a domain anybody can buy."""
     domain = address.rsplit("@", 1)[-1].lower().strip(".")
     return domain in _SAFE_EMAIL_DOMAINS
+
+
+def _not_a_phone_number(text: str) -> str:
+    """``text`` with every timestamp, TimeSpan and digest blanked before the scan."""
+    return _DIGEST.sub(" ", _TIMESPAN.sub(" ", _TIMESTAMP.sub(" ", text)))
 
 
 def _fixture_files() -> list[Path]:
@@ -1009,7 +1018,7 @@ def test_no_fixture_carries_a_routable_email_address() -> None:
 def test_no_fixture_carries_a_dialable_phone_number() -> None:
     offenders: list[str] = []
     for path in _fixture_files():
-        text = _DIGEST.sub(" ", _TIMESTAMP.sub(" ", path.read_text(encoding="utf-8")))
+        text = _not_a_phone_number(path.read_text(encoding="utf-8"))
         for candidate in _PHONE.findall(text):
             digits = re.sub(r"\D", "", candidate)
             if len(digits) < 7:
@@ -1042,6 +1051,22 @@ def test_the_phone_guard_recognises_a_number_however_it_is_punctuated(number: st
 def test_the_phone_guard_still_passes_the_fictitious_block(safe: str) -> None:
     digits = re.sub(r"\D", "", safe)
     assert _SAFE_PHONE.match(digits), safe
+
+
+@pytest.mark.parametrize(
+    "duration", ["02:10:00.5000000", "23:59:59", "1.02:00:00.1234567"], ids=lambda d: d
+)
+def test_a_timespan_duration_is_not_read_as_a_phone_number(duration: str) -> None:
+    assert not _PHONE.search(_not_a_phone_number(f'["{duration}"]')), duration
+
+
+@pytest.mark.parametrize(
+    "number",
+    ["2125551234", "(212) 555-1234", "212-555-1234", "212.555.1234", "+1 212 555 1234"],
+    ids=lambda n: n,
+)
+def test_stripping_timespans_leaves_every_phone_number_visible(number: str) -> None:
+    assert _PHONE.search(_not_a_phone_number(f'["{number}"]')), number
 
 
 @pytest.mark.parametrize(

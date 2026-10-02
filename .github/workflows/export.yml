@@ -6,7 +6,11 @@ on:
       feeds:
         description: >-
           Comma-separated feeds to run: jobs, technicians, pricebook, financial,
-          outbox.
+          dispatch, images, outbox.
+
+          `dispatch` writes `dispatch.nonJobAppointments` for Profit Wizard's
+          dispatch board. It is opt-in: it runs only in a caller job that names
+          it, so a connector that never asks for it never fetches it.
 
           `outbox` is not an export feed — it writes no tab and fetches nothing.
           It DRAINS the outbox queue of every product whose secrets this job was
@@ -231,7 +235,7 @@ jobs:
     # never block each other.
     #
     #   ...-export  every run with at least one EXPORT feed (jobs, technicians,
-    #               pricebook, financial). All of them read the whole `_meta`
+    #               pricebook, financial, dispatch). All of them read the whole `_meta`
     #               grid and write the whole `_meta` grid back — carrying over
     #               the rows for the feeds they did not run. Two such runs
     #               overlapping therefore roll each other's cursors, row counts
@@ -505,7 +509,7 @@ jobs:
           IFS=',' read -ra FEED_PARTS <<< "$FEEDS"
           for feed in "${FEED_PARTS[@]}"; do
             case "$(echo "$feed" | tr -d '[:space:]')" in
-              jobs|technicians|pricebook|financial|images|outbox) ;;
+              jobs|technicians|pricebook|financial|dispatch|images|outbox) ;;
               *) echo "::error::invalid feeds input: $FEEDS" >&2; exit 1 ;;
             esac
           done

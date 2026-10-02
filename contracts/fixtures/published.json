@@ -1,6 +1,9 @@
 {
   "_what_this_is": "sha256 of every contract fixture AS RELEASED, per contract version. A file under a version listed here may never change: bump the version instead. Written by scripts/gen_contract_fixtures.py; asserted by tests/st_exporter/test_contract_fixtures.py.",
   "versions": {
+    "dispatch.v1": {
+      "dispatch.nonJobAppointments.json": "cf54882beee949dc405b0e3640d4b092b6b0dee9e887fefed2211f24652426f0"
+    },
     "financial.v1": {
       "accounting.invoices.json": "4d6db765396e0a7aee56bcbf5a38d8e860ae088b12fb7c0850b90963b360fcf7",
       "payroll.timesheets.json": "96188cb1ce4d26e546c2a07a4f1281bfba7fc90c3ef5a33e45f7b1910de49315",

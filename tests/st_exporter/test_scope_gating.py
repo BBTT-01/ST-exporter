@@ -36,6 +36,7 @@ import respx
 from st_cli.exceptions import APIError, RateLimitError, STCLIError, TransportError
 from st_exporter.meta import MetaRow, MetaRowSet, build_meta_grid, parse_meta_grid
 from st_exporter.run import (
+    DISPATCH_FEED_NAMES,
     EXPORT_FEEDS,
     EXPORT_TABS,
     FINANCIAL_FEED_NAMES,
@@ -53,7 +54,12 @@ from st_exporter.scopes import (
 )
 from st_exporter.sheets import InMemorySheetsStore
 from tests.st_exporter.conftest import mock_auth_token
-from tests.st_exporter.fixtures import tenant_financial, tenant_pricebook, tenant_run1
+from tests.st_exporter.fixtures import (
+    tenant_dispatch,
+    tenant_financial,
+    tenant_pricebook,
+    tenant_run1,
+)
 
 FIXED_NOW = datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)
 EARLIER = "2026-09-13T12:00:00+00:00"
@@ -95,6 +101,7 @@ TAB_FIRST_CALL = {
     "settings.businessUnits": f"settings/v2/tenant/{TENANT_ID}/business-units",
     "reporting.jobCosts": f"reporting/v2/tenant/{TENANT_ID}/report-categories",
     "sales.estimates": f"sales/v2/tenant/{TENANT_ID}/estimates",
+    "dispatch.nonJobAppointments": f"dispatch/v2/tenant/{TENANT_ID}/non-job-appointments",
 }
 
 #: Which feed has to be selected for a tab to be attempted at all.
@@ -103,6 +110,7 @@ TAB_FEED = {
     "technicians": "technicians",
     **{tab: "pricebook" for tab in PRICEBOOK_FEED_NAMES},
     **{tab: "financial" for tab in FINANCIAL_FEED_NAMES},
+    **{tab: "dispatch" for tab in DISPATCH_FEED_NAMES},
 }
 
 #: Every tab a feed writes.
@@ -111,6 +119,7 @@ FEED_TABS = {
     "technicians": ("technicians",),
     "pricebook": PRICEBOOK_FEED_NAMES,
     "financial": FINANCIAL_FEED_NAMES,
+    "dispatch": DISPATCH_FEED_NAMES,
 }
 
 #: The tab each multi-tab feed attempts LAST. 403ing the first tab of a feed is
@@ -130,6 +139,7 @@ def _register_tenant(api_base: str) -> None:
     )
     tenant_pricebook.register(api_base)
     tenant_financial.register(api_base)
+    tenant_dispatch.register(api_base)
 
 
 def _seeded_store(*feeds: str) -> InMemorySheetsStore:

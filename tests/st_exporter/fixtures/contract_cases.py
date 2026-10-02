@@ -24,9 +24,15 @@ from __future__ import annotations
 from typing import Any
 
 from st_exporter.denormalize import build_job_rows
+from st_exporter.dispatch import TIMESHEET_CODE_NAME_FIELD
 from st_exporter.feeds.pricebook import apply_category_names, category_name_index
 from st_exporter.feeds.raw_cache import RawCache
-from tests.st_exporter.fixtures import tenant_financial, tenant_pricebook, tenant_run1
+from tests.st_exporter.fixtures import (
+    tenant_dispatch,
+    tenant_financial,
+    tenant_pricebook,
+    tenant_run1,
+)
 
 # Fixed dates, never "today": a fixture regenerated next March must be
 # byte-identical to this one, or the suite cries drift at a calendar.
@@ -349,6 +355,40 @@ _SERVICE_4_LINKED = {
 _SERVICE_NO_ID_LINKED = {"code": "SVC-NO-ID", "serviceMaterials": [{"skuId": 202, "quantity": 1}]}
 
 
+# --- dispatch -------------------------------------------------------------------
+#
+# Records as ``feeds.dispatch.fetch_non_job_appointments`` hands them to the
+# builder: ServiceTitan's record with the resolved timesheet code name stamped on.
+
+
+def _with_code_name(record: dict[str, Any], name: str | None) -> dict[str, Any]:
+    return {**record, TIMESHEET_CODE_NAME_FIELD: name}
+
+
+#: A code id that resolved to nothing (deleted, or the codes list was refused):
+#: the id is still written, the name is blank.
+_NON_JOB_UNRESOLVED_CODE = {
+    **tenant_dispatch.LUNCH,
+    "id": 804,
+    "technicianId": 11,
+    "start": "2026-09-18T15:00:00Z",
+    "name": "Ride-along",
+    "duration": "00:45:00",
+    "timesheetCodeId": 99,
+}
+#: Flags absent and a null code id: every one blank, never a guessed `false`/`0`.
+_NON_JOB_FLAGS_ABSENT = {
+    "id": 805,
+    "technicianId": 10,
+    "start": "2026-09-18T18:00:00Z",
+    "name": "Meeting",
+    "duration": "00:30:00",
+    "timesheetCodeId": None,
+}
+#: No id: dropped rather than written with a blank key.
+_NON_JOB_NO_ID = {**tenant_dispatch.LUNCH, "id": None, "name": "Dropped"}
+
+
 def _report_rows() -> list[dict[str, Any]]:
     """The Job Costing Summary report's rows, keyed by its own field names.
 
@@ -408,6 +448,16 @@ SOURCE_RECORDS: dict[str, list[dict[str, Any]]] = {
         _SERVICE_4_LINKED,
     ],
     "pricebook.equipmentMaterials": [tenant_pricebook.EQUIPMENT_1],
+    "dispatch.nonJobAppointments": [
+        _with_code_name(tenant_dispatch.LUNCH, None),
+        _with_code_name(tenant_dispatch.TRAINING, "TRAIN"),
+        _with_code_name(tenant_dispatch.PTO_ALL_DAY, "PTO"),
+        _with_code_name(_NON_JOB_UNRESOLVED_CODE, None),
+        _NON_JOB_FLAGS_ABSENT,
+        _with_code_name(_NON_JOB_NO_ID, None),
+        # The same record again, as a page boundary can return it: written once.
+        _with_code_name(tenant_dispatch.LUNCH, None),
+    ],
 }
 
 SOURCE_RECORDS["jobs"] = job_rows()

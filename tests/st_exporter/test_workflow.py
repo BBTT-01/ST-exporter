@@ -58,7 +58,7 @@ def test_the_feeds_validator_accepts_every_feed_the_exporter_does(workflow_text:
     """The workflow validates `feeds` before `st-export` does. If it rejected a
     feed, the job asking for it would fail before Python ran — that is how the
     one job allowed to drain, or the one allowed to upload images, stops."""
-    assert "jobs|technicians|pricebook|financial|images|outbox)" in workflow_text
+    assert "jobs|technicians|pricebook|financial|dispatch|images|outbox)" in workflow_text
 
 
 def test_the_meta_free_feeds_take_their_own_locks(workflow_text: str) -> None:

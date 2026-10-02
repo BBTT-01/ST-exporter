@@ -928,6 +928,63 @@ consumer, which is the same reason `cost` and `hours` are blank-when-null here.
   written by a real run. The first run on a Profit Wizard connector is what
   confirms the tabs end to end.
 
+## Dispatch non-job appointments — shape and filters CONFIRMED on a live tenant
+
+`src/st_exporter/dispatch.py`, `src/st_exporter/feeds/dispatch.py`
+
+Confirmed 2026-10-01 by a read-only probe of a production tenant
+(`dispatch/v2/tenant/{t}/non-job-appointments`, list and single GET, and
+`payroll/v2/tenant/{t}/timesheet-codes`):
+
+- **The record keys — CONFIRMED**, identical on the list and the single GET:
+  `id, technicianId, start, name, duration, timesheetCodeId, summary,
+  clearDispatchBoard, clearTechnicianView, removeTechnicianFromCapacityPlanning,
+  allDay, showOnTechnicianSchedule, active, createdOn, modifiedOn, createdById`.
+  There is **no `end` field**; the end is `start + duration`, left to the consumer.
+- **`start` — CONFIRMED** always UTC with a `Z`, sometimes with milliseconds
+  (`.fff`). Written verbatim.
+- **`duration` — CONFIRMED** a .NET TimeSpan string: `01:00:00`,
+  `02:10:00.5000000`; all-day records carry `23:59:59`. Written verbatim.
+- **`timesheetCodeId` `0` means no code — CONFIRMED**, so `timesheet_code_id` is
+  blank for it.
+- **The timesheet-code record — CONFIRMED** keys `id, code, description, type,
+  applicableEmployeeType, rateInfo, createdOn, modifiedOn, active`; the exporter
+  reads `id` and `code`. **`active=Any` is honoured** (15 codes against 13 by
+  default), so a retired code still names its appointments.
+- **Filters honoured — CONFIRMED:** `startsOnOrAfter`, `startsOnOrBefore`, and
+  `activeOnly=true`, which drops exactly the `active=false` rows. **Silently
+  IGNORED:** `startsBefore` and `active=True`. Ignored means the whole history
+  comes back with no error, which is why `warn_if_outside_window` checks every
+  record's `start` against both ends of the window.
+- **Repeating events — CONFIRMED** one record per occurrence, with no repeat
+  fields in the response, and **each occurrence has its own `id`**: across
+  `[-90d, +30d]` (1,513 active records, 586 of them occurrences of 73 repeating
+  series) every `id` was distinct. The tab's row key relies on this;
+  `warn_if_repeated_ids` logs if it ever stops holding.
+- **No block longer than a day — CONFIRMED on that tenant** in the same window:
+  no `duration` carried a days part and none exceeded 24 hours (longest 11h52m),
+  so multi-day time off is not one long record there. The start-only window
+  therefore loses nothing on that tenant; a tenant that does store long blocks
+  as one record would lose any that started more than seven days ago.
+- **Scopes:** `tn.dis.nonjobappointments:r` for the tab, and
+  `tn.prl.timesheetcodes:r` for the optional names. A 403 on the second is logged
+  at INFO and blanks `timesheet_code_name`; the tab is still written.
+
+Still unverified:
+
+- **What an all-day record's `start` is relative to the tenant's timezone.** The
+  live tenant had no all-day records in 120 days. It is passed through verbatim
+  and not interpreted here, so the exporter is not wrong either way, but a
+  consumer placing it on a calendar day has to know.
+- **Whether any tenant's blocks carry a days part** (`1.02:00:00`). None did on
+  the probed tenant. Passed through verbatim if one does.
+- **The portal names in `TAB_PERMISSIONS`** ("Dispatch -> Non-Job Appointments",
+  "Payroll -> Timesheet Codes") are derived from the scope strings, not read off
+  the Developer Portal UI.
+- **Not yet seen from a hosted tenant.** The tab has never been written by a real
+  run. The first `dispatch` run on a Profit Wizard connector confirms it end to
+  end.
+
 ## Pricebook image upload — what could not be confirmed without a live TrueQuote
 
 `src/st_exporter/images/`
