@@ -450,10 +450,49 @@ def test_an_item_with_no_st_id_is_neither_written_nor_counted(
 
     assert [row[0] for row in export_store.tabs["pricebook.services"][1:]] == ["1"]
     assert summary.pricebook_row_counts["pricebook.services"] == 1
-    assert summary.pricebook_row_counts["pricebook.categories"] == 1
+    assert [row[0] for row in export_store.tabs["pricebook.categories"][1:]] == ["10", "11"]
+    assert summary.pricebook_row_counts["pricebook.categories"] == 2
     # The count in `_meta` is what was actually written, not what was fetched.
     meta = parse_meta_grid(export_store.tabs["_meta"])
     assert meta["pricebook.services"].row_count == 1
+
+
+@respx.mock
+def test_nested_categories_reach_the_tab_with_their_parents(st_settings, exporter_settings) -> None:
+    mock_auth_token(st_settings.auth_url)
+    tenant_pricebook.register(
+        st_settings.api_base,
+        categories=[
+            {
+                "id": 20,
+                "name": "Openers",
+                "active": False,
+                "parentId": None,
+                "subcategories": [
+                    {
+                        "id": 21,
+                        "name": "Liftmaster",
+                        "active": True,
+                        "parentId": 20,
+                        "subcategories": [
+                            {"id": 22, "name": "Logic boards", "active": True, "parentId": 21}
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+    export_store = InMemorySheetsStore()
+
+    summary = _run(st_settings, exporter_settings, export_store)
+
+    rows = _rows(export_store.tabs["pricebook.categories"])
+    assert [(r["st_id"], r["parent_id"], r["active"]) for r in rows] == [
+        ("20", "", "false"),
+        ("21", "20", "true"),
+        ("22", "21", "true"),
+    ]
+    assert summary.pricebook_row_counts["pricebook.categories"] == 3
 
 
 # --- the image lane is a SIDE lane -------------------------------------------

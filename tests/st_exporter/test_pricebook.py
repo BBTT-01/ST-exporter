@@ -408,8 +408,8 @@ class TestCategoryFullPayload:
         row = build_category_row({"id": 10, "name": "Doors", "skuImages": ["a.jpg", None, "b.jpg"]})
         assert row["sku_image_refs"] == "a.jpg,b.jpg"
 
-    def test_the_recursive_subcategory_tree_is_not_exported(self) -> None:
-        # parent_id already carries every edge in it, one row at a time.
+    def test_the_recursive_subcategory_tree_is_not_a_column(self) -> None:
+        # It is flattened into rows by build_category_grid instead.
         row = build_category_row(
             {"id": 10, "name": "Doors", "subcategories": [{"id": 11, "name": "Steel"}]}
         )
@@ -465,6 +465,99 @@ class TestCategoryRows:
         row = dict(zip(CATEGORY_COLUMNS, grid[1]))
         assert row["parent_id"] == "10"
         assert row["active"] == "false"
+
+
+class TestCategoryTreeIsFlattened:
+    """ServiceTitan returns only top-level categories; the rest are nested.
+
+    Rightly Garage Doors (exporter 0.2.42): 728 of 758 active services sat in
+    categories that never reached the tab, because only the top level was read.
+    """
+
+    @staticmethod
+    def _rows(records: list[dict]) -> dict[str, dict[str, str]]:
+        grid = build_category_grid(records)
+        return {row[0]: dict(zip(CATEGORY_COLUMNS, row)) for row in grid[1:]}
+
+    def test_every_depth_is_a_row_with_its_parent(self) -> None:
+        rows = self._rows(
+            [
+                {
+                    "id": 1,
+                    "name": "Openers",
+                    "active": True,
+                    "subcategories": [
+                        {
+                            "id": 2,
+                            "name": "Liftmaster",
+                            "active": True,
+                            "subcategories": [
+                                {"id": 3, "name": "Logic boards", "active": True},
+                            ],
+                        },
+                    ],
+                }
+            ]
+        )
+        assert list(rows) == ["1", "2", "3"]
+        assert rows["1"]["parent_id"] == ""
+        assert rows["2"]["parent_id"] == "1"
+        assert rows["3"]["parent_id"] == "2"
+        assert rows["3"]["name"] == "Logic boards"
+
+    def test_each_node_keeps_its_own_active(self) -> None:
+        rows = self._rows(
+            [
+                {
+                    "id": 1,
+                    "name": "Retired",
+                    "active": False,
+                    "subcategories": [{"id": 2, "name": "Still on", "active": True}],
+                }
+            ]
+        )
+        assert rows["1"]["active"] == "false"
+        assert rows["2"]["active"] == "true"
+
+    def test_a_child_s_own_parent_id_wins_over_where_it_was_nested(self) -> None:
+        rows = self._rows(
+            [{"id": 1, "name": "A", "subcategories": [{"id": 2, "name": "B", "parentId": 9}]}]
+        )
+        assert rows["2"]["parent_id"] == "9"
+
+    def test_a_category_both_nested_and_top_level_is_written_once(self) -> None:
+        grid = build_category_grid(
+            [
+                {"id": 1, "name": "A", "subcategories": [{"id": 2, "name": "nested copy"}]},
+                {"id": 2, "name": "B", "active": True, "parentId": 1, "position": 4},
+            ]
+        )
+        assert [row[0] for row in grid[1:]] == ["1", "2"]
+        row = dict(zip(CATEGORY_COLUMNS, grid[2]))
+        assert row["name"] == "B"
+        assert row["position"] == "4"
+        assert row["parent_id"] == "1"
+
+    def test_a_repeated_nested_id_is_written_once(self) -> None:
+        grid = build_category_grid(
+            [
+                {"id": 1, "name": "A", "subcategories": [{"id": 3, "name": "first"}]},
+                {"id": 2, "name": "B", "subcategories": [{"id": 3, "name": "second"}]},
+            ]
+        )
+        assert [row[0] for row in grid[1:]] == ["1", "2", "3"]
+        assert dict(zip(CATEGORY_COLUMNS, grid[3]))["name"] == "first"
+
+    def test_an_id_less_node_is_dropped_but_its_children_are_not(self) -> None:
+        rows = self._rows(
+            [{"name": "no id", "subcategories": [{"id": 5, "name": "C", "parentId": 4}]}]
+        )
+        assert list(rows) == ["5"]
+        assert rows["5"]["parent_id"] == "4"
+
+    def test_non_list_subcategories_are_ignored(self) -> None:
+        rows = self._rows([{"id": 1, "name": "A", "subcategories": None}])
+        assert list(rows) == ["1"]
 
 
 class TestTheKeyColumnIsNeverBlank:

@@ -123,7 +123,7 @@ honestly is worse than no column at all:
 | `externalData` | An arbitrary key/value bag any other integration can write to this tenant's SKUs — the one field here that could plausibly hold a token. The Export Store is not the place to find that out. |
 | `serviceMaterials`, `serviceEquipment`, `equipmentMaterials` | A bill of materials, `{skuId, quantity}` per entry. A CSV of sku ids would look like a usable BOM with every quantity silently dropped, so it is not a column here: it has its own tabs at its own grain, under `pricebook_bom.v1` (see "Why the bill of materials has its own version"). |
 | `recommendations`, `upgrades` | Cross-sell links; same objection, no costing value. |
-| `subcategories` | A recursive tree. `parent_id` already carries every edge in it, one row at a time. |
+| `subcategories` | A recursive tree, flattened into rows rather than a column: every node at every depth is its own `pricebook.categories` row, with `parent_id` carrying the edge. ServiceTitan returns only the top level as list records, so exporters up to 0.2.43 left the deeper categories out of the tab entirely. |
 
 **One column set across three tabs.** `pricebook.services`, `pricebook.equipment`
 and `pricebook.materials` share a single header — the UNION of the three

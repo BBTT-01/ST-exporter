@@ -69,8 +69,13 @@ a cell that cannot carry the fact honestly is worse than an absent column:
   (``pricebook_bom.py``, `pricebook_bom.v1`).
 - ``recommendations`` / ``upgrades`` — cross-sell links, same objection, no costing
   value.
-- ``subcategories`` on the category tab — a recursive tree. ``parent_id`` already
-  carries every edge in it, one row at a time.
+- ``subcategories`` on the category tab — a recursive tree. It is not a column
+  because it is flattened into ROWS instead: ServiceTitan's categories list
+  returns only the top level, with every deeper category reachable only through
+  its parent's ``subcategories``, so :func:`build_category_grid` walks the tree
+  and writes one row per node at every depth, its ``parent_id`` carrying the
+  edge. Reading the top level alone exported 0 of the categories 728 of 758
+  active services sat in (Rightly Garage Doors, exporter 0.2.42).
 
 ``services``, ``equipment`` and ``materials`` share one shape and therefore one
 code path: the tab name carries the meaning, the parser does not have to. That
@@ -178,10 +183,35 @@ def build_item_grid(records: list[dict[str, Any]]) -> list[list[str]]:
 def build_category_grid(records: list[dict[str, Any]]) -> list[list[str]]:
     """Header row + one row per category with an ``st_id``, for `pricebook.categories`.
 
-    Same non-empty-key rule as :func:`build_item_grid`.
+    Every node of the ``subcategories`` tree is a row, at any depth, with its own
+    ``active``. A consumer deciding whether an item sits in an inactive category
+    walks ``parent_id`` upward, so a missing node is a broken walk, not a detail.
+
+    ``parent_id`` is the node's own ``parentId`` when it carries one, otherwise
+    the id of the node it was nested under. The walk is breadth-first and the
+    first row for an id wins, so a category returned both at the top level and
+    nested under its parent is written once, from the top-level record. Same
+    non-empty-key rule as :func:`build_item_grid`; an id-less node is not
+    written, but its children still are.
     """
-    rows = [build_category_row(r) for r in records]
-    return [list(CATEGORY_COLUMNS)] + [format_category_row(row) for row in rows if row["st_id"]]
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    pending: list[tuple[Any, str]] = [(record, "") for record in records or []]
+    while pending:
+        record, nested_under = pending.pop(0)
+        if not isinstance(record, dict):
+            continue
+        row = build_category_row(record)
+        if not row["parent_id"]:
+            row["parent_id"] = nested_under
+        identifier = row["st_id"].strip()
+        if identifier and identifier not in seen:
+            seen.add(identifier)
+            rows.append(row)
+        children = record.get("subcategories")
+        if isinstance(children, list):
+            pending.extend((child, identifier) for child in children)
+    return [list(CATEGORY_COLUMNS)] + [format_category_row(row) for row in rows]
 
 
 def build_item_row(record: dict[str, Any]) -> dict[str, str]:

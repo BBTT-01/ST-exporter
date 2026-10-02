@@ -4,6 +4,33 @@ All notable changes to `st-cli` (the `st` CLI and `st-mcp` MCP server) are
 documented here. Format follows [Keep a Changelog](https://keepachangelog.com/);
 this project aims for [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] · Nested pricebook categories reach `pricebook.categories`
+
+### Fixed: the category tab held only top-level categories, with `parent_id` blank on every row
+
+ServiceTitan's categories list returns only the top level, with every deeper
+category nested inside its parent's `subcategories`. The grid wrote the top
+level and threw the tree away, on the wrong assumption that each subcategory
+also arrived as a top-level record. On Rightly Garage Doors (0.2.42), 728 of
+758 active services and 29 active materials referenced a category that was not
+on the tab, so Profit Wizard could not walk `parent_id` to tell whether an item
+sat in an inactive category.
+
+* `build_category_grid` walks `subcategories` breadth-first and writes one row
+  per category at every depth, each with its own `active`.
+* `parent_id` is the node's own `parentId` when present, otherwise the id of
+  the node it was nested under.
+* One row per id, first wins: a category returned both top level and nested is
+  written once, from the top-level record. An id-less node is still dropped,
+  but its children are not.
+* **No version bump.** Columns, order and the published grain ("one row per
+  pricebook category; parent_id is blank at the top level") are unchanged; the
+  tab now holds what that grain always promised. `pricebook.v2`'s released
+  fixtures are byte-identical. Expect more rows on any tenant with nested
+  categories.
+* Whether `active=Any` also returns inactive NESTED categories is unverified
+  (`KNOWN_UNVERIFIED.md`).
+
 ## [Unreleased] · Non-job appointments for Profit Wizard's dispatch board
 
 ### Added: the opt-in `dispatch` feed and its `dispatch.nonJobAppointments` tab (`dispatch.v1`)
