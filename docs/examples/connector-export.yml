@@ -419,11 +419,13 @@ jobs:
       #
       # The names on the LEFT belong to the reusable workflow and can only be
       # renamed by ST-exporter, in a new tag. The names on the RIGHT are this
-      # repository's own secrets. `PLATFORM_*` is the reviews platform's pair,
-      # named neutrally because it predates there being more than one product;
-      # the two newer pairs have to name their product to stay distinguishable.
-      TRADERATED_MACHINE_TOKEN: ${{ secrets.PLATFORM_MACHINE_TOKEN }}
-      TRADERATED_OUTBOX_BASE_URL: ${{ secrets.PLATFORM_OUTBOX_URL }}
+      # repository's own secrets, and each one names its product. The
+      # TradeRated pair is `TRADERATED_*` because that is what TradeRated's
+      # provisioner (`provision-hosted-connector`) writes into a new repo. It was
+      # once `PLATFORM_*`, which no provisioned repo ever held: the drain got
+      # empty strings and drained nothing, on green runs.
+      TRADERATED_MACHINE_TOKEN: ${{ secrets.TRADERATED_MACHINE_TOKEN }}
+      TRADERATED_OUTBOX_BASE_URL: ${{ secrets.TRADERATED_OUTBOX_URL }}
       TRUEQUOTE_MACHINE_TOKEN: ${{ secrets.TRUEQUOTE_MACHINE_TOKEN }}
       TRUEQUOTE_OUTBOX_URL: ${{ secrets.TRUEQUOTE_OUTBOX_URL }}
       PROFITWIZARD_MACHINE_TOKEN: ${{ secrets.PROFITWIZARD_MACHINE_TOKEN }}
