@@ -304,6 +304,20 @@ def test_the_drain_forwards_every_product_lane(caller: dict[Any, Any]) -> None:
         assert {f"{prefix}_OUTBOX_URL", f"{prefix}_OUTBOX_BASE_URL"} & held, prefix
 
 
+def test_the_drain_reads_the_secret_names_traderated_provisions(caller: dict[Any, Any]) -> None:
+    """The RIGHT-hand names are the contract with TradeRated's provisioner.
+
+    `provision-hosted-connector` writes `TRADERATED_MACHINE_TOKEN` and
+    `TRADERATED_OUTBOX_URL` into every repo it creates. This file once read
+    `PLATFORM_*` instead, so a freshly provisioned connector's drain got empty
+    strings, built no TradeRated lane and drained nothing — on green runs.
+    """
+    held = caller["jobs"][DRAIN_JOB]["secrets"]
+    assert held["TRADERATED_MACHINE_TOKEN"] == "${{ secrets.TRADERATED_MACHINE_TOKEN }}"
+    assert held["TRADERATED_OUTBOX_BASE_URL"] == "${{ secrets.TRADERATED_OUTBOX_URL }}"
+    assert "secrets.PLATFORM_" not in CALLER.read_text()
+
+
 def test_the_cadences_are_the_ones_the_products_were_sold_on(caller: dict[Any, Any]) -> None:
     expected = {
         "jobs-feed": "*/5 * * * *",
